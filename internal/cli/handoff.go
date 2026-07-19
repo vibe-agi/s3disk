@@ -196,14 +196,10 @@ func writeHandoff(path string, value handoff) error {
 	if path == "" {
 		return fmt.Errorf("s3disk: handoff output path is required")
 	}
-	if _, err := value.decode(time.Now()); err != nil {
+	encoded, err := encodeHandoff(value)
+	if err != nil {
 		return err
 	}
-	encoded, err := json.Marshal(value)
-	if err != nil || int64(len(encoded)+1) > maximumHandoffBytes {
-		return ErrInvalidHandoff
-	}
-	encoded = append(encoded, '\n')
 	absolute, err := resolveHandoffPath(path)
 	if err != nil {
 		return fmt.Errorf("s3disk: unsafe handoff output path: %w", err)
@@ -216,47 +212,78 @@ func writeHandoff(path string, value handoff) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("s3disk: inspect handoff output: %w", err)
 	}
-	file, err := os.OpenFile(absolute, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		return ErrHandoffExists
+	return writeHandoffBytes(absolute, encoded, installHandoffNoReplace)
+}
+
+func encodeHandoff(value handoff) ([]byte, error) {
+	if _, err := value.decode(time.Now()); err != nil {
+		return nil, err
 	}
+	encoded, err := json.Marshal(value)
+	if err != nil || int64(len(encoded)+1) > maximumHandoffBytes {
+		return nil, ErrInvalidHandoff
+	}
+	return append(encoded, '\n'), nil
+}
+
+type handoffInstaller func(temporary, destination string) error
+
+// writeHandoffBytes writes and syncs the complete secret into a private
+// temporary file before atomically installing the final pathname. A crash
+// before installation can leave, at worst, a private temporary file; it can
+// never expose a partial handoff at the path given to B.
+func writeHandoffBytes(absolute string, encoded []byte, install handoffInstaller) error {
+	if len(encoded) == 0 || int64(len(encoded)) > maximumHandoffBytes || install == nil {
+		return ErrInvalidHandoff
+	}
+	directory := filepath.Dir(absolute)
+	file, err := os.CreateTemp(directory, ".s3disk-handoff-*")
 	if err != nil {
-		return fmt.Errorf("s3disk: create handoff output: %w", err)
+		return fmt.Errorf("s3disk: create staged handoff: %w", err)
 	}
+	temporary := file.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporary)
+		}
+	}()
 	created, statErr := file.Stat()
 	if statErr != nil || !created.Mode().IsRegular() {
 		_ = file.Close()
-		removeSameFile(absolute, created)
-		return fmt.Errorf("s3disk: created handoff output is not a regular file")
+		return fmt.Errorf("s3disk: staged handoff is not a regular file")
 	}
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		removeSameFile(absolute, created)
-		return fmt.Errorf("s3disk: set handoff permissions: %w", err)
+		return fmt.Errorf("s3disk: set staged handoff permissions: %w", err)
 	}
 	// Validate the already-open descriptor, its current pathname, owner, ACL,
 	// exact mode, and parent hierarchy before any bearer or encryption key bytes
-	// cross the filesystem boundary.
-	if err := s3disk.ValidatePrivateSecretFile(absolute, file); err != nil {
+	// cross the filesystem boundary. The temporary file is in the already
+	// resolved final directory, so the atomic install cannot cross filesystems.
+	if err := s3disk.ValidatePrivateSecretFile(temporary, file); err != nil {
 		_ = file.Close()
-		removeSameFile(absolute, created)
-		return fmt.Errorf("s3disk: protect handoff output: %w", err)
+		return fmt.Errorf("s3disk: protect staged handoff: %w", err)
 	}
 	if err := writeAll(file, encoded); err != nil {
 		_ = file.Close()
-		removeSameFile(absolute, created)
-		return fmt.Errorf("s3disk: write handoff: %w", err)
+		return fmt.Errorf("s3disk: write staged handoff: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		removeSameFile(absolute, created)
-		return fmt.Errorf("s3disk: sync handoff: %w", err)
+		return fmt.Errorf("s3disk: sync staged handoff: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		removeSameFile(absolute, created)
-		return fmt.Errorf("s3disk: close handoff: %w", err)
+		return fmt.Errorf("s3disk: close staged handoff: %w", err)
 	}
-	if err := syncHandoffDirectory(filepath.Dir(absolute)); err != nil {
+	if err := install(temporary, absolute); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return ErrHandoffExists
+		}
+		return fmt.Errorf("s3disk: atomically install handoff: %w", err)
+	}
+	removeTemporary = false
+	if err := syncHandoffDirectory(directory); err != nil {
 		return fmt.Errorf("s3disk: sync handoff directory: %w", err)
 	}
 	return nil

@@ -112,6 +112,72 @@ func TestHandoffNeverOverwrites(t *testing.T) {
 	}
 }
 
+func TestHandoffFinalPathIsInvisibleUntilAtomicInstall(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "share.handoff")
+	encoded, err := encodeHandoff(newTestHandoff(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStop := errors.New("stop before atomic install")
+	installCalled := false
+	err = writeHandoffBytes(path, encoded, func(temporary, destination string) error {
+		installCalled = true
+		if destination != path {
+			t.Fatalf("install destination = %q, want %q", destination, path)
+		}
+		if _, statErr := os.Lstat(destination); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("final handoff became visible before install: %v", statErr)
+		}
+		staged, readErr := os.ReadFile(temporary)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(staged, encoded) {
+			t.Fatal("staged handoff is not the complete canonical handoff")
+		}
+		info, statErr := os.Stat(temporary)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			t.Fatalf("staged handoff mode = %#o, want 0600", info.Mode().Perm())
+		}
+		return wantStop
+	})
+	if !installCalled {
+		t.Fatal("atomic installer was not called")
+	}
+	if !errors.Is(err, wantStop) {
+		t.Fatalf("error = %v, want injected stop", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final handoff exists after pre-install failure: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(directory, ".s3disk-handoff-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("staged handoff was not cleaned up: %v", matches)
+	}
+}
+
+func TestHandoffAtomicInstallLeavesNoTemporarySecret(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "share.handoff")
+	if err := writeHandoff(path, newTestHandoff(t)); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(directory, ".s3disk-handoff-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary handoff secrets remain: %v", matches)
+	}
+}
+
 func TestHandoffRejectsSymlinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation normally requires additional Windows privilege")
