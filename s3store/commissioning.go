@@ -41,8 +41,9 @@ const (
 )
 
 // S3CommissioningScope describes the finite population sampled by a report.
-// A successful run is evidence for one configured Store and one invocation;
-// it is not a proof about every gateway, network schedule, or future state.
+// A successful run is evidence for one configured Store or Store pair and one
+// invocation; it is not a proof about every gateway, network schedule, or
+// future state.
 type S3CommissioningScope string
 
 const S3CommissioningSingleProcessDualFiniteProbe S3CommissioningScope = "single_process_dual_finite_probe"
@@ -71,7 +72,10 @@ const (
 //
 // DeploymentFingerprint, EvidenceID, and ImplementationVersion follow the
 // same syntax as s3disk.StoreCompatibilityProbeOptions. They are unverified
-// caller declarations and must contain no credentials or secrets.
+// caller declarations and must contain no credentials or secrets. For split
+// commissioning, the deployment inventory hashed into DeploymentFingerprint
+// should cover both principal/policy configurations, the bucket, both routes,
+// region/addressing/TLS settings, and the implementation build.
 type S3CommissioningProbeOptions struct {
 	RepositoryPrefix      string
 	PresignedGet          PresignedGetCompatibilityProbeOptions
@@ -133,17 +137,20 @@ func (options S3CommissioningProbeOptions) GoString() string { return options.St
 // declarations. It is audit metadata, not an authenticated attestation.
 // Predictable prefixes may still be susceptible to offline dictionary guesses.
 type S3CommissioningEvidence struct {
-	SchemaVersion                   int       `json:"schema_version"`
-	StartedAt                       time.Time `json:"started_at"`
-	DurationNanoseconds             int64     `json:"duration_nanoseconds"`
-	RunID                           string    `json:"run_id,omitempty"`
-	RepositoryPrefixFingerprint     string    `json:"repository_prefix_fingerprint,omitempty"`
-	PresignedPrefixFingerprint      string    `json:"presigned_prefix_fingerprint,omitempty"`
-	PresignedPrefixDerived          bool      `json:"presigned_prefix_derived"`
-	PresignedPrefixRepositoryScoped bool      `json:"presigned_prefix_repository_scoped"`
-	DeploymentFingerprint           string    `json:"deployment_fingerprint,omitempty"`
-	EvidenceID                      string    `json:"evidence_id,omitempty"`
-	ImplementationVersion           string    `json:"implementation_version,omitempty"`
+	SchemaVersion                           int                                         `json:"schema_version"`
+	StartedAt                               time.Time                                   `json:"started_at"`
+	DurationNanoseconds                     int64                                       `json:"duration_nanoseconds"`
+	RunID                                   string                                      `json:"run_id,omitempty"`
+	RepositoryPrefixFingerprint             string                                      `json:"repository_prefix_fingerprint,omitempty"`
+	PresignedPrefixFingerprint              string                                      `json:"presigned_prefix_fingerprint,omitempty"`
+	PresignedPrefixDerived                  bool                                        `json:"presigned_prefix_derived"`
+	PresignedPrefixRepositoryScoped         bool                                        `json:"presigned_prefix_repository_scoped"`
+	DeploymentFingerprint                   string                                      `json:"deployment_fingerprint,omitempty"`
+	EvidenceID                              string                                      `json:"evidence_id,omitempty"`
+	ImplementationVersion                   string                                      `json:"implementation_version,omitempty"`
+	PresigningTopology                      PresignedGetCompatibilityPresigningTopology `json:"presigning_topology,omitempty"`
+	PresigningStoreInputDistinct            bool                                        `json:"presigning_store_input_distinct"`
+	CrossConfigurationCanaryBindingObserved bool                                        `json:"cross_configuration_canary_binding_observed"`
 	// FullyBound reports syntactic completeness only; it is not authentication.
 	FullyBound bool `json:"fully_bound"`
 }
@@ -330,14 +337,40 @@ func (store *Store) ProbeCommissioning(
 	ctx context.Context,
 	options S3CommissioningProbeOptions,
 ) (report S3CommissioningReport, resultErr error) {
+	return store.probeCommissioning(ctx, store, options, false)
+}
+
+// ProbeCommissioningWithPresigningStore runs the writable Store contract with
+// the receiver and the anonymous exact-GET contract with a separately
+// constructed presigning Store. Credentialed canary operations and cleanup use
+// only the receiver; the presigning Store is used only to create GET bearers.
+// The method rejects the same Store, a shared SDK client, or different bucket
+// names before S3 I/O.
+func (store *Store) ProbeCommissioningWithPresigningStore(
+	ctx context.Context,
+	presigningStore *Store,
+	options S3CommissioningProbeOptions,
+) (S3CommissioningReport, error) {
+	return store.probeCommissioning(ctx, presigningStore, options, true)
+}
+
+func (store *Store) probeCommissioning(
+	ctx context.Context,
+	presigningStore *Store,
+	options S3CommissioningProbeOptions,
+	requireSeparateStore bool,
+) (report S3CommissioningReport, resultErr error) {
 	started := time.Now()
-	report = newS3CommissioningReport(started)
+	presigningEvidence := newPresignedGetCompatibilityEvidence(store, presigningStore)
+	report = newS3CommissioningReport(started, presigningEvidence)
 	defer func() {
 		duration := time.Since(started)
 		if duration < 0 {
 			duration = 0
 		}
 		report.Evidence.DurationNanoseconds = duration.Nanoseconds()
+		report.Evidence.CrossConfigurationCanaryBindingObserved =
+			report.PresignedGet.Evidence.CrossConfigurationCanaryBindingObserved
 		report.Cleanup = summarizeS3CommissioningCleanup(report.WritableStore.Cleanup, report.PresignedGet.Cleanup)
 	}()
 	runID, randomErr := newS3CommissioningRunID()
@@ -352,10 +385,10 @@ func (store *Store) ProbeCommissioning(
 			report, fmt.Errorf("%w: commissioning context is nil", s3disk.ErrStoreMisconfigured), nil, nil,
 		)
 	}
-	if store == nil || store.client == nil || store.sdkClient == nil || store.bucket == "" {
+	if err := validatePresignedGetStorePair(store, presigningStore, requireSeparateStore); err != nil {
 		report.Status = S3CommissioningConfigurationError
 		return report, newS3CommissioningReportError(
-			report, fmt.Errorf("%w: S3 store is not configured", s3disk.ErrStoreMisconfigured), nil, nil,
+			report, err, nil, nil,
 		)
 	}
 	if len(options.PresignedGet.TLSRootCAPEM) > maximumPresignedGetProbeTLSRootCAPEMBytes {
@@ -383,14 +416,14 @@ func (store *Store) ProbeCommissioning(
 			nil, nil,
 		)
 	}
-	normalized, validationErr := normalizeS3CommissioningProbeOptions(store, &options, strings.Trim(options.RepositoryPrefix, "/"))
+	normalized, validationErr := normalizeS3CommissioningProbeOptions(presigningStore, &options, strings.Trim(options.RepositoryPrefix, "/"))
 	if validationErr != nil {
 		report.Status = S3CommissioningConfigurationError
 		return report, newS3CommissioningReportError(
 			report, fmt.Errorf("%w: commissioning options are invalid: %w", s3disk.ErrStoreMisconfigured, validationErr), nil, nil,
 		)
 	}
-	report.Evidence = newS3CommissioningEvidence(options, normalized, runID, started)
+	report.Evidence = newS3CommissioningEvidence(options, normalized, presigningEvidence, runID, started)
 
 	probeCtx, cancel := s3CommissioningProbeContext(ctx, options.TotalTimeout)
 	defer cancel()
@@ -413,7 +446,9 @@ func (store *Store) ProbeCommissioning(
 
 	var overallErr, presignedErr error
 	if err := probeCtx.Err(); err == nil {
-		report.PresignedGet, presignedErr = store.ProbePresignedGetCompatibilityWithOptions(probeCtx, options.PresignedGet)
+		report.PresignedGet, presignedErr = store.probePresignedGetCompatibility(
+			probeCtx, presigningStore, options.PresignedGet, requireSeparateStore,
+		)
 		report.PresignedGetOutcome = presignedS3CommissioningStageOutcome(report.PresignedGet, presignedErr)
 	} else {
 		overallErr = err
@@ -435,19 +470,24 @@ func (store *Store) ProbeCommissioning(
 	return report, newS3CommissioningReportError(report, overallErr, writableErr, presignedErr)
 }
 
-func newS3CommissioningReport(started time.Time) S3CommissioningReport {
+func newS3CommissioningReport(
+	started time.Time,
+	presigningEvidence PresignedGetCompatibilityEvidence,
+) S3CommissioningReport {
 	report := S3CommissioningReport{
 		SchemaVersion: S3CommissioningReportSchemaVersion,
 		Scope:         S3CommissioningSingleProcessDualFiniteProbe,
 		Evidence: S3CommissioningEvidence{
-			SchemaVersion: S3CommissioningReportSchemaVersion,
-			StartedAt:     started.UTC(),
+			SchemaVersion:                S3CommissioningReportSchemaVersion,
+			StartedAt:                    started.UTC(),
+			PresigningTopology:           presigningEvidence.PresigningTopology,
+			PresigningStoreInputDistinct: presigningEvidence.PresigningStoreInputDistinct,
 		},
 		Status:               S3CommissioningIndeterminate,
 		WritableStoreOutcome: S3CommissioningStageNotRun,
 		PresignedGetOutcome:  S3CommissioningStageNotRun,
 		WritableStore:        newS3CommissioningWritableStoreReport(started),
-		PresignedGet:         newPresignedGetCompatibilityReport(),
+		PresignedGet:         newPresignedGetCompatibilityReport(presigningEvidence),
 	}
 	report.Cleanup = summarizeS3CommissioningCleanup(report.WritableStore.Cleanup, report.PresignedGet.Cleanup)
 	return report
@@ -549,6 +589,7 @@ func normalizeS3CommissioningProbeOptions(
 func newS3CommissioningEvidence(
 	options S3CommissioningProbeOptions,
 	normalized normalizedS3CommissioningProbeOptions,
+	presigningEvidence PresignedGetCompatibilityEvidence,
 	runID string,
 	started time.Time,
 ) S3CommissioningEvidence {
@@ -563,6 +604,8 @@ func newS3CommissioningEvidence(
 		DeploymentFingerprint:           options.DeploymentFingerprint,
 		EvidenceID:                      options.EvidenceID,
 		ImplementationVersion:           options.ImplementationVersion,
+		PresigningTopology:              presigningEvidence.PresigningTopology,
+		PresigningStoreInputDistinct:    presigningEvidence.PresigningStoreInputDistinct,
 	}
 	evidence.FullyBound = evidence.RunID != "" &&
 		evidence.RepositoryPrefixFingerprint != "" &&

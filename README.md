@@ -727,10 +727,12 @@ implement conditional `PUT` using `If-None-Match: *` and `If-Match: <ETag>`, as
 well as conditional `GET`. “S3 compatible” alone is not sufficient evidence.
 `Version.ETag` is the sole compare-and-swap token; an optional S3 Version ID is
 reported only for diagnostics because `PutObject` cannot condition on it.
-For the built-in S3 adapter, prefer `Store.ProbeCommissioning` during
-provisioning for every supported vendor/version and endpoint mode. Its combined
-envelope preserves both the 31-check writable Store result and the 14-check
-credential-free presigned-GET result. The nested structured reports distinguish
+For the built-in S3 adapter, prefer
+`Store.ProbeCommissioningWithPresigningStore` during production provisioning
+for every supported vendor/version and endpoint mode; use
+`Store.ProbeCommissioning` only when intentionally commissioning one identity.
+The combined envelope preserves both the 31-check writable Store result and the
+14-check credential-free presigned-GET result. The nested structured reports distinguish
 a proven semantic incompatibility from configuration or permission errors and
 an indeterminate timeout, throttle, 5xx, or transport failure. The lower-level
 `Repository.ProbeStoreCompatibilityWithOptions`,
@@ -760,7 +762,8 @@ valid version token. Named retryable 409 responses such as
 indeterminate, rather than being reported as provider incompatibility.
 
 ```go
-report, err := store.ProbeCommissioning(ctx,
+report, err := writerStore.ProbeCommissioningWithPresigningStore(ctx,
+	presigningStore,
 	s3store.S3CommissioningProbeOptions{
 		RepositoryPrefix:      "private/customer/commissioning",
 		DeploymentFingerprint: deploymentFingerprint, // canonical non-secret config SHA-256
@@ -783,7 +786,7 @@ log.Printf("S3 commissioning schema=%d scope=%s passed; cleanup_attention=%t",
 	report.SchemaVersion, report.Scope, report.Cleanup.AttentionRequired)
 ```
 
-The combined API adds UTC start time, cleanup-inclusive duration, a random run
+The combined APIs add UTC start time, cleanup-inclusive duration, a random run
 ID, two domain-separated prefix fingerprints, and validated caller binding
 fields to the JSON envelope. It never serializes either raw prefix. When the
 presigned prefix is omitted it is derived inside the normalized repository
@@ -840,12 +843,25 @@ a broader or differently routed identity is not evidence that the production
 path works. Content hashing detects corruption; signed references and signed
 root bundles authenticate the selected commit. See [Security](SECURITY.md).
 
-The combined probe uses that one configured Store identity for canary writes,
-credentialed read-backs, cleanup, and GET presigning. It does not exercise or
-certify a split between the production writer and a separately scoped
-GetObject-only signing principal. That least-privilege topology still requires
-an independent IAM/routing review and a split-identity commissioning harness,
-which is a documented release blocker.
+`Store.ProbeCommissioning` keeps the convenient same-Store path. For the
+recommended least-privilege topology, use
+`Store.ProbeCommissioningWithPresigningStore`: the receiver performs every
+canary write, credentialed read-back, CAS, and cleanup, while the separately
+constructed Store is used only to freeze credentials and issue exact GET
+bearers. A successful split report records `presigning_topology=separate_store`
+and `cross_configuration_canary_binding_observed=true`. The MinIO gate runs
+this path with a writer principal and a second principal whose policy contains
+only `s3:GetObject`, while separately confirming that PUT, DELETE, and LIST are
+denied.
+
+Those fields prove only what this finite call observed. Separate Go Store
+instances are not proof of separate IAM identities, and matching canary bytes
+and versions across two routes do not authenticate the provider's complete
+bucket/origin configuration. Commercial certification still requires an
+independently archived IAM/BPA/routing inventory and provider-specific policy
+evidence. The current `s3disk s3 doctor` command deliberately remains the
+same-Store commissioning path; use the split library API or a controlled
+certification harness for the two-principal topology.
 
 The presigned-path report is finite evidence, not a provider certification or
 mathematical proof. It samples unsigned public-policy access, exact signed GET
@@ -864,6 +880,9 @@ TLS roots remain mandatory for every HTTPS B-side Reader and probe. See
 checks and limitations.
 
 ## Development checks
+
+The MinIO suite requires Docker Compose v2 and `jq`; Linux FUSE coverage also
+requires `/dev/fuse` and `fusermount3`.
 
 ```sh
 go test ./...

@@ -61,24 +61,30 @@ const (
 // provider behavior.
 type PresignedGetCompatibilityScope string
 
-const PresignedGetCompatibilitySingleEndpointFiniteProbe PresignedGetCompatibilityScope = "single_endpoint_finite_probe"
+const (
+	PresignedGetCompatibilitySingleEndpointFiniteProbe PresignedGetCompatibilityScope = "single_endpoint_finite_probe"
+	// PresignedGetCompatibilityCrossConfigurationFiniteProbe samples writer
+	// and bearer routes supplied by two separately constructed Store values.
+	PresignedGetCompatibilityCrossConfigurationFiniteProbe PresignedGetCompatibilityScope = "cross_configuration_finite_probe"
+)
 
 // PresignedGetCompatibilityLimitation is an explicit boundary on what a pass
 // establishes. These values remain present even on a successful report.
 type PresignedGetCompatibilityLimitation string
 
 const (
-	PresignedGetCompatibilityLimitationFutureStatesNotProven                   PresignedGetCompatibilityLimitation = "future_provider_and_network_states_not_proven"
-	PresignedGetCompatibilityLimitationExpiryNotSampled                        PresignedGetCompatibilityLimitation = "post_expiry_rejection_not_sampled"
-	PresignedGetCompatibilityLimitationOtherMethodsNotSampled                  PresignedGetCompatibilityLimitation = "other_http_methods_and_transient_side_effects_not_sampled"
-	PresignedGetCompatibilityLimitationSystemTrustNetworkIO                    PresignedGetCompatibilityLimitation = "dangerous_system_trust_may_perform_non_s3_network_io"
-	PresignedGetCompatibilityLimitationArbitraryQueryBindingNotProven          PresignedGetCompatibilityLimitation = "arbitrary_query_and_historical_version_binding_not_proven"
-	PresignedGetCompatibilityLimitationHEADAndBodylessStatusWireBodyNotVisible PresignedGetCompatibilityLimitation = "head_and_bodyless_status_wire_body_not_observable_with_net_http"
-	PresignedGetCompatibilityLimitationDiscardedWireMetadataAndExtraBytes      PresignedGetCompatibilityLimitation = "discarded_wire_metadata_and_extra_bytes_not_observable_with_net_http"
-	PresignedGetCompatibilityLimitationBucketPublicAccessPolicyNotFullyProven  PresignedGetCompatibilityLimitation = "bucket_public_access_policy_not_fully_proven"
-	PresignedGetCompatibilityLimitationPUTPayloadVariantsBeyondNamedSamples    PresignedGetCompatibilityLimitation = "put_payload_variants_beyond_named_samples_not_proven"
-	PresignedGetCompatibilityLimitationArbitraryUnsignedHeaderOverrideBinding  PresignedGetCompatibilityLimitation = "arbitrary_unsigned_header_override_binding_not_proven"
-	PresignedGetCompatibilityLimitationBucketAndOriginBindingNotSampled        PresignedGetCompatibilityLimitation = "bucket_and_origin_binding_not_sampled"
+	PresignedGetCompatibilityLimitationFutureStatesNotProven                     PresignedGetCompatibilityLimitation = "future_provider_and_network_states_not_proven"
+	PresignedGetCompatibilityLimitationExpiryNotSampled                          PresignedGetCompatibilityLimitation = "post_expiry_rejection_not_sampled"
+	PresignedGetCompatibilityLimitationOtherMethodsNotSampled                    PresignedGetCompatibilityLimitation = "other_http_methods_and_transient_side_effects_not_sampled"
+	PresignedGetCompatibilityLimitationSystemTrustNetworkIO                      PresignedGetCompatibilityLimitation = "dangerous_system_trust_may_perform_non_s3_network_io"
+	PresignedGetCompatibilityLimitationArbitraryQueryBindingNotProven            PresignedGetCompatibilityLimitation = "arbitrary_query_and_historical_version_binding_not_proven"
+	PresignedGetCompatibilityLimitationHEADAndBodylessStatusWireBodyNotVisible   PresignedGetCompatibilityLimitation = "head_and_bodyless_status_wire_body_not_observable_with_net_http"
+	PresignedGetCompatibilityLimitationDiscardedWireMetadataAndExtraBytes        PresignedGetCompatibilityLimitation = "discarded_wire_metadata_and_extra_bytes_not_observable_with_net_http"
+	PresignedGetCompatibilityLimitationBucketPublicAccessPolicyNotFullyProven    PresignedGetCompatibilityLimitation = "bucket_public_access_policy_not_fully_proven"
+	PresignedGetCompatibilityLimitationPUTPayloadVariantsBeyondNamedSamples      PresignedGetCompatibilityLimitation = "put_payload_variants_beyond_named_samples_not_proven"
+	PresignedGetCompatibilityLimitationArbitraryUnsignedHeaderOverrideBinding    PresignedGetCompatibilityLimitation = "arbitrary_unsigned_header_override_binding_not_proven"
+	PresignedGetCompatibilityLimitationBucketAndOriginBindingNotSampled          PresignedGetCompatibilityLimitation = "bucket_and_origin_binding_not_sampled"
+	PresignedGetCompatibilityLimitationCrossConfigurationBindingNotAuthenticated PresignedGetCompatibilityLimitation = "cross_configuration_bucket_origin_route_and_identity_not_authenticated"
 	// Deprecated: use PresignedGetCompatibilityLimitationArbitraryQueryBindingNotProven.
 	PresignedGetCompatibilityLimitationQueryBindingNotSampled = PresignedGetCompatibilityLimitationArbitraryQueryBindingNotProven
 	// Deprecated: use PresignedGetCompatibilityLimitationHEADAndBodylessStatusWireBodyNotVisible.
@@ -227,11 +233,37 @@ func (cleanup PresignedGetCompatibilityCleanupReport) String() string {
 
 func (cleanup PresignedGetCompatibilityCleanupReport) GoString() string { return cleanup.String() }
 
+// PresignedGetCompatibilityPresigningTopology records whether the writer and
+// exact-GET presigner were configured through the same Store instance or two
+// separate Store instances. Separate instances do not by themselves prove
+// distinct IAM principals or least-privilege policies.
+type PresignedGetCompatibilityPresigningTopology string
+
+const (
+	PresignedGetCompatibilitySameStore     PresignedGetCompatibilityPresigningTopology = "same_store"
+	PresignedGetCompatibilitySeparateStore PresignedGetCompatibilityPresigningTopology = "separate_store"
+)
+
+// PresignedGetCompatibilityEvidence describes the Store inputs sampled by the
+// finite probe. CrossConfigurationCanaryBindingObserved is true only when a
+// split-store probe completes all checks: the writer then created, replaced,
+// and read back the canaries while bearers issued by the separate presigning
+// Store observed the exact bytes and versions. Cleanup remains separate
+// operational evidence. This is still not an authenticated statement about
+// credential identity or IAM policy.
+type PresignedGetCompatibilityEvidence struct {
+	PresigningTopology                      PresignedGetCompatibilityPresigningTopology `json:"presigning_topology,omitempty"`
+	PresigningStoreInputDistinct            bool                                        `json:"presigning_store_input_distinct"`
+	CrossConfigurationCanaryBindingObserved bool                                        `json:"cross_configuration_canary_binding_observed"`
+}
+
 // PresignedGetCompatibilityReport is a fail-fast commissioning result for the
 // no-credential reader path. Compatible only means all finite checks passed at
-// the sampled endpoint during this invocation.
+// the sampled endpoint configuration or configuration pair during this
+// invocation.
 type PresignedGetCompatibilityReport struct {
 	Scope          PresignedGetCompatibilityScope         `json:"scope"`
+	Evidence       PresignedGetCompatibilityEvidence      `json:"evidence"`
 	Status         PresignedGetCompatibilityStatus        `json:"status"`
 	Compatible     bool                                   `json:"compatible"`
 	Complete       bool                                   `json:"complete"`
@@ -294,6 +326,26 @@ func (store *Store) ProbePresignedGetCompatibility(ctx context.Context) (Presign
 	return store.ProbePresignedGetCompatibilityWithOptions(ctx, PresignedGetCompatibilityProbeOptions{})
 }
 
+// ProbePresignedGetCompatibilityWithPresigningStore runs the finite anonymous
+// GET probe with separate writer and presigning Store instances. The receiver
+// performs every credentialed canary operation and cleanup. presigningStore is
+// used only to freeze credentials and create exact-key GET bearers; its
+// credentialed data-plane client is never called.
+//
+// The two Stores must be independently constructed, use different SDK client
+// instances, and name the same bucket. Their endpoints may differ so an A-side
+// private route and the B-side public bearer route can be commissioned
+// together. A successful report samples their current cross-route canary
+// binding, but cannot prove distinct credential identities or least-privilege
+// IAM policy.
+func (store *Store) ProbePresignedGetCompatibilityWithPresigningStore(
+	ctx context.Context,
+	presigningStore *Store,
+	options PresignedGetCompatibilityProbeOptions,
+) (PresignedGetCompatibilityReport, error) {
+	return store.probePresignedGetCompatibility(ctx, presigningStore, options, true)
+}
+
 // ProbePresignedGetCompatibilityWithOptions verifies the runtime assumptions
 // required by a credential-free reader: anonymous exact-key presigned GET,
 // replacement visibility through one fixed URL, dynamic If-None-Match, one
@@ -311,7 +363,17 @@ func (store *Store) ProbePresignedGetCompatibilityWithOptions(
 	ctx context.Context,
 	options PresignedGetCompatibilityProbeOptions,
 ) (report PresignedGetCompatibilityReport, resultErr error) {
-	report = newPresignedGetCompatibilityReport()
+	return store.probePresignedGetCompatibility(ctx, store, options, false)
+}
+
+func (store *Store) probePresignedGetCompatibility(
+	ctx context.Context,
+	presigningStore *Store,
+	options PresignedGetCompatibilityProbeOptions,
+	requireSeparateStore bool,
+) (report PresignedGetCompatibilityReport, resultErr error) {
+	evidence := newPresignedGetCompatibilityEvidence(store, presigningStore)
+	report = newPresignedGetCompatibilityReport(evidence)
 	recorder := presignedGetCompatibilityRecorder{report: &report}
 	if ctx == nil || interfaceIsNil(ctx) {
 		return report, recorder.problem(
@@ -333,15 +395,15 @@ func (store *Store) ProbePresignedGetCompatibilityWithOptions(
 	if normalized.DangerouslyAllowSystemTrustStore {
 		report.Limitations = append(report.Limitations, PresignedGetCompatibilityLimitationSystemTrustNetworkIO)
 	}
-	if store == nil || store.client == nil || store.sdkClient == nil || store.bucket == "" {
+	if err := validatePresignedGetStorePair(store, presigningStore, requireSeparateStore); err != nil {
 		return report, recorder.problem(
 			PresignedGetCompatibilityCheckConfiguration,
 			PresignedGetCompatibilityConfigurationError,
 			PresignedGetCompatibilityReasonInvalidConfiguration,
-			"S3 store is not configured", s3disk.ErrStoreMisconfigured,
+			"writer and presigning S3 Store configuration is invalid", err,
 		)
 	}
-	if store.presignedHTTPS && len(options.TLSRootCAPEM) == 0 && !normalized.DangerouslyAllowSystemTrustStore {
+	if presigningStore.presignedHTTPS && len(options.TLSRootCAPEM) == 0 && !normalized.DangerouslyAllowSystemTrustStore {
 		return report, recorder.problem(
 			PresignedGetCompatibilityCheckConfiguration,
 			PresignedGetCompatibilityConfigurationError,
@@ -408,7 +470,7 @@ func (store *Store) ProbePresignedGetCompatibilityWithOptions(
 	recorder.pass(PresignedGetCompatibilityCheckProbeObjectCreate, "created two isolated random exact-key probe objects")
 
 	fullExpiry := time.Now().Add(normalized.CapabilityLifetime)
-	session, err := store.NewPresignSession(probeCtx, fullExpiry)
+	session, err := presigningStore.NewPresignSession(probeCtx, fullExpiry)
 	if err != nil {
 		status, reason := presignedGetFailureClassification(err)
 		return report, recorder.problem(
@@ -1530,7 +1592,29 @@ func (store *Store) ProbePresignedGetCompatibilityWithOptions(
 	report.Status = PresignedGetCompatibilityPassed
 	report.Compatible = true
 	report.Complete = true
+	if report.Evidence.PresigningTopology == PresignedGetCompatibilitySeparateStore {
+		report.Evidence.CrossConfigurationCanaryBindingObserved = true
+	}
 	return report, nil
+}
+
+func validatePresignedGetStorePair(writer, presigningStore *Store, requireSeparateStore bool) error {
+	if writer == nil || writer.client == nil || writer.sdkClient == nil || writer.bucket == "" {
+		return fmt.Errorf("%w: writer S3 Store is not configured", s3disk.ErrStoreMisconfigured)
+	}
+	if presigningStore == nil || presigningStore.client == nil || presigningStore.sdkClient == nil || presigningStore.bucket == "" {
+		return fmt.Errorf("%w: presigning S3 Store is not configured", s3disk.ErrStoreMisconfigured)
+	}
+	if writer.bucket != presigningStore.bucket {
+		return fmt.Errorf("%w: writer and presigning S3 Stores name different buckets", s3disk.ErrStoreMisconfigured)
+	}
+	if requireSeparateStore && writer == presigningStore {
+		return fmt.Errorf("%w: split commissioning requires separate Store instances", s3disk.ErrStoreMisconfigured)
+	}
+	if requireSeparateStore && writer.sdkClient == presigningStore.sdkClient {
+		return fmt.Errorf("%w: split commissioning requires independent SDK clients", s3disk.ErrStoreMisconfigured)
+	}
+	return nil
 }
 
 type normalizedPresignedGetProbeOptions struct {
@@ -2578,9 +2662,30 @@ type presignedGetCompatibilityRecorder struct {
 	report *PresignedGetCompatibilityReport
 }
 
-func newPresignedGetCompatibilityReport() PresignedGetCompatibilityReport {
+func newPresignedGetCompatibilityEvidence(writer, presigningStore *Store) PresignedGetCompatibilityEvidence {
+	evidence := PresignedGetCompatibilityEvidence{}
+	switch {
+	case writer == nil || presigningStore == nil:
+		return evidence
+	case writer == presigningStore:
+		evidence.PresigningTopology = PresignedGetCompatibilitySameStore
+	default:
+		evidence.PresigningTopology = PresignedGetCompatibilitySeparateStore
+		evidence.PresigningStoreInputDistinct = true
+	}
+	return evidence
+}
+
+func newPresignedGetCompatibilityReport(evidence PresignedGetCompatibilityEvidence) PresignedGetCompatibilityReport {
+	scope := PresignedGetCompatibilitySingleEndpointFiniteProbe
+	bindingLimitation := PresignedGetCompatibilityLimitationBucketAndOriginBindingNotSampled
+	if evidence.PresigningTopology == PresignedGetCompatibilitySeparateStore {
+		scope = PresignedGetCompatibilityCrossConfigurationFiniteProbe
+		bindingLimitation = PresignedGetCompatibilityLimitationCrossConfigurationBindingNotAuthenticated
+	}
 	return PresignedGetCompatibilityReport{
-		Scope:          PresignedGetCompatibilitySingleEndpointFiniteProbe,
+		Scope:          scope,
+		Evidence:       evidence,
 		Status:         PresignedGetCompatibilityIndeterminate,
 		RequiredChecks: PresignedGetCompatibilityRequiredChecks,
 		Checks:         make([]PresignedGetCompatibilityCheck, 0, PresignedGetCompatibilityRequiredChecks),
@@ -2594,7 +2699,7 @@ func newPresignedGetCompatibilityReport() PresignedGetCompatibilityReport {
 			PresignedGetCompatibilityLimitationBucketPublicAccessPolicyNotFullyProven,
 			PresignedGetCompatibilityLimitationPUTPayloadVariantsBeyondNamedSamples,
 			PresignedGetCompatibilityLimitationArbitraryUnsignedHeaderOverrideBinding,
-			PresignedGetCompatibilityLimitationBucketAndOriginBindingNotSampled,
+			bindingLimitation,
 		},
 		Cleanup: PresignedGetCompatibilityCleanupReport{Status: PresignedGetCompatibilityCleanupNotAttempted},
 	}

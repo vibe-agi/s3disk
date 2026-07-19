@@ -17,10 +17,13 @@ esac
 
 project_name="s3disk-test-$$"
 cleanup() {
-  docker compose --project-name "$project_name" -f "$compose_file" \
-    down --volumes --remove-orphans >/dev/null 2>&1 || true
+  if ! docker compose --project-name "$project_name" -f "$compose_file" \
+    down --volumes --remove-orphans >/dev/null 2>&1
+  then
+    echo "warning: could not remove the MinIO test project $project_name" >&2
+  fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT HUP INT TERM
 
 docker compose --project-name "$project_name" -f "$compose_file" up --detach
 port_binding=$(docker compose --project-name "$project_name" \
@@ -32,6 +35,61 @@ case "$minio_port" in
     exit 1
     ;;
 esac
+
+command -v jq >/dev/null 2>&1 || {
+  echo "jq is required to provision the split-identity MinIO policy" >&2
+  exit 1
+}
+minio_container=$(docker compose --project-name "$project_name" \
+  -f "$compose_file" ps -q minio)
+[ -n "$minio_container" ] || {
+  echo "could not resolve the MinIO test container" >&2
+  exit 1
+}
+ready_attempt=0
+until docker exec "$minio_container" mc alias set s3disk-local \
+  http://127.0.0.1:9000 s3disk s3disk-secret >/dev/null 2>&1
+do
+  ready_attempt=$((ready_attempt + 1))
+  [ "$ready_attempt" -lt 30 ] || {
+    echo "MinIO did not become ready for split-identity provisioning" >&2
+    exit 1
+  }
+  sleep 1
+done
+
+split_bucket="s3disk-split-$project_name"
+split_signer_access_key="s3disksigner$$"
+split_signer_secret_key="s3disk-signer-secret-$$"
+split_policy_name="s3disk-split-get-$$"
+docker exec "$minio_container" mc mb --ignore-existing \
+  "s3disk-local/$split_bucket" >/dev/null
+split_policy_json=$(jq -cn --arg bucket "$split_bucket" '{
+  Version: "2012-10-17",
+  Statement: [{
+    Effect: "Allow",
+    Action: ["s3:GetObject"],
+    Resource: [("arn:aws:s3:::" + $bucket + "/*")]
+  }]
+}')
+docker exec \
+  --env "S3DISK_SPLIT_POLICY_JSON=$split_policy_json" \
+  --env "S3DISK_SPLIT_POLICY_NAME=$split_policy_name" \
+  --env "S3DISK_SPLIT_SIGNER_ACCESS_KEY=$split_signer_access_key" \
+  --env "S3DISK_SPLIT_SIGNER_SECRET_KEY=$split_signer_secret_key" \
+  "$minio_container" /bin/sh -c '
+    set -eu
+    umask 077
+    policy_file=/tmp/s3disk-split-get-policy.json
+    cleanup_policy() { rm -f -- "$policy_file"; }
+    trap cleanup_policy EXIT INT TERM
+    printf "%s\n" "$S3DISK_SPLIT_POLICY_JSON" >"$policy_file"
+    mc admin policy create s3disk-local "$S3DISK_SPLIT_POLICY_NAME" "$policy_file" >/dev/null
+    mc admin user add s3disk-local "$S3DISK_SPLIT_SIGNER_ACCESS_KEY" \
+      "$S3DISK_SPLIT_SIGNER_SECRET_KEY" >/dev/null
+    mc admin policy attach s3disk-local "$S3DISK_SPLIT_POLICY_NAME" \
+      --user "$S3DISK_SPLIT_SIGNER_ACCESS_KEY" >/dev/null
+  '
 
 S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
 S3DISK_TEST_S3_ACCESS_KEY=s3disk \
@@ -47,6 +105,15 @@ S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
 S3DISK_TEST_S3_ACCESS_KEY=s3disk \
 S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
 ./scripts/run-required-go-test.sh ./s3store TestMinIOS3Commissioning 90s integration
+
+S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
+S3DISK_TEST_S3_ACCESS_KEY=s3disk \
+S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
+S3DISK_TEST_S3_SPLIT_BUCKET="$split_bucket" \
+S3DISK_TEST_S3_SIGNER_ACCESS_KEY="$split_signer_access_key" \
+S3DISK_TEST_S3_SIGNER_SECRET_KEY="$split_signer_secret_key" \
+./scripts/run-required-go-test.sh ./s3store \
+  TestMinIOSplitWriterPresignerCommissioning 90s integration
 
 S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
 S3DISK_TEST_S3_ACCESS_KEY=s3disk \

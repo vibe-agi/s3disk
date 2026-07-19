@@ -79,8 +79,9 @@ false evidence against a provider. See
 [S3 backend commissioning](S3_COMPATIBILITY.md).
 
 For archived commercial evidence from the built-in S3 adapter, use
-`s3store.Store.ProbeCommissioning`; its parent envelope retains both this
-31-check writable report and the 14-check credential-free presigned-GET report.
+`s3store.Store.ProbeCommissioningWithPresigningStore`; its parent envelope
+retains both this 31-check writable report and the 14-check credential-free
+presigned-GET report while recording the split Store topology.
 `Repository.ProbeStoreCompatibilityWithOptions` remains the focused writable
 sub-probe for custom Store adapters and fault isolation. Both forms add
 validated caller deployment/build identifiers and redacted timing/prefix

@@ -176,6 +176,11 @@ func TestRunDoctorCommissioningRejectsTamperedPassingEnvelope(t *testing.T) {
 			report.Evidence.RepositoryPrefixFingerprint = strings.Repeat("0", 64)
 		}},
 		{name: "combined scope", mutate: func(report *s3store.S3CommissioningReport) { report.Scope = "other" }},
+		{name: "combined presigning topology", mutate: func(report *s3store.S3CommissioningReport) {
+			report.Evidence.PresigningTopology = s3store.PresignedGetCompatibilitySeparateStore
+			report.Evidence.PresigningStoreInputDistinct = true
+			report.Evidence.CrossConfigurationCanaryBindingObserved = true
+		}},
 		{name: "writable contract", mutate: func(report *s3store.S3CommissioningReport) { report.WritableStore.ContractVersion++ }},
 		{name: "writable required checks", mutate: func(report *s3store.S3CommissioningReport) { report.WritableStore.RequiredChecks-- }},
 		{name: "writable check count", mutate: func(report *s3store.S3CommissioningReport) {
@@ -194,6 +199,11 @@ func TestRunDoctorCommissioningRejectsTamperedPassingEnvelope(t *testing.T) {
 			report.WritableStore.Evidence.ImplementationVersion = "other"
 		}},
 		{name: "presigned scope", mutate: func(report *s3store.S3CommissioningReport) { report.PresignedGet.Scope = "other" }},
+		{name: "presigned topology", mutate: func(report *s3store.S3CommissioningReport) {
+			report.PresignedGet.Evidence.PresigningTopology = s3store.PresignedGetCompatibilitySeparateStore
+			report.PresignedGet.Evidence.PresigningStoreInputDistinct = true
+			report.PresignedGet.Evidence.CrossConfigurationCanaryBindingObserved = true
+		}},
 		{name: "presigned required checks", mutate: func(report *s3store.S3CommissioningReport) { report.PresignedGet.RequiredChecks-- }},
 		{name: "presigned check count", mutate: func(report *s3store.S3CommissioningReport) {
 			report.PresignedGet.Checks = report.PresignedGet.Checks[:len(report.PresignedGet.Checks)-1]
@@ -206,6 +216,17 @@ func TestRunDoctorCommissioningRejectsTamperedPassingEnvelope(t *testing.T) {
 		}},
 		{name: "failed presigned check", mutate: func(report *s3store.S3CommissioningReport) {
 			report.PresignedGet.Checks[0].Status = s3store.PresignedGetCompatibilityIndeterminate
+		}},
+		{name: "missing presigned limitation", mutate: func(report *s3store.S3CommissioningReport) {
+			report.PresignedGet.Limitations = report.PresignedGet.Limitations[:len(report.PresignedGet.Limitations)-1]
+		}},
+		{name: "duplicate presigned limitation", mutate: func(report *s3store.S3CommissioningReport) {
+			report.PresignedGet.Limitations[len(report.PresignedGet.Limitations)-1] =
+				report.PresignedGet.Limitations[0]
+		}},
+		{name: "cross configuration limitation", mutate: func(report *s3store.S3CommissioningReport) {
+			report.PresignedGet.Limitations[len(report.PresignedGet.Limitations)-1] =
+				s3store.PresignedGetCompatibilityLimitationCrossConfigurationBindingNotAuthenticated
 		}},
 		{name: "cleanup status summary", mutate: func(report *s3store.S3CommissioningReport) {
 			report.Cleanup.WritableStoreStatus = s3disk.StoreCompatibilityCleanupFailed
@@ -238,6 +259,40 @@ func TestRunDoctorCommissioningRejectsTamperedPassingEnvelope(t *testing.T) {
 			var stdout bytes.Buffer
 			if err := runDoctorCommissioning(context.Background(), probe, options, nil, &stdout); err == nil {
 				t.Fatal("tampered passing report was accepted")
+			}
+			assertOneDoctorJSONReport(t, stdout.Bytes(), s3store.S3CommissioningPassed)
+		})
+	}
+}
+
+func TestRunDoctorCommissioningRejectsTamperedSystemTrustLimitations(t *testing.T) {
+	options := DoctorOptions{DangerouslyAllowSystemTrust: true}
+	tests := []struct {
+		name   string
+		mutate func(*s3store.S3CommissioningReport)
+	}{
+		{name: "missing system trust limitation", mutate: func(report *s3store.S3CommissioningReport) {
+			report.PresignedGet.Limitations = report.PresignedGet.Limitations[:len(report.PresignedGet.Limitations)-1]
+		}},
+		{name: "system trust limitation out of order", mutate: func(report *s3store.S3CommissioningReport) {
+			last := len(report.PresignedGet.Limitations) - 1
+			report.PresignedGet.Limitations[last-1], report.PresignedGet.Limitations[last] =
+				report.PresignedGet.Limitations[last], report.PresignedGet.Limitations[last-1]
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			probe := doctorCommissioningProbeFunc(func(
+				context.Context,
+				s3store.S3CommissioningProbeOptions,
+			) (s3store.S3CommissioningReport, error) {
+				report := passingDoctorCommissioningReport(options, false)
+				test.mutate(&report)
+				return report, nil
+			})
+			var stdout bytes.Buffer
+			if err := runDoctorCommissioning(context.Background(), probe, options, nil, &stdout); err == nil {
+				t.Fatal("tampered system-trust limitations were accepted")
 			}
 			assertOneDoctorJSONReport(t, stdout.Bytes(), s3store.S3CommissioningPassed)
 		})
@@ -288,6 +343,24 @@ func passingDoctorCommissioningReport(options DoctorOptions, attentionRequired b
 			Status: s3store.PresignedGetCompatibilityPassed,
 		}
 	}
+	presignedLimitations := []s3store.PresignedGetCompatibilityLimitation{
+		s3store.PresignedGetCompatibilityLimitationFutureStatesNotProven,
+		s3store.PresignedGetCompatibilityLimitationExpiryNotSampled,
+		s3store.PresignedGetCompatibilityLimitationOtherMethodsNotSampled,
+		s3store.PresignedGetCompatibilityLimitationArbitraryQueryBindingNotProven,
+		s3store.PresignedGetCompatibilityLimitationHEADAndBodylessStatusWireBodyNotVisible,
+		s3store.PresignedGetCompatibilityLimitationDiscardedWireMetadataAndExtraBytes,
+		s3store.PresignedGetCompatibilityLimitationBucketPublicAccessPolicyNotFullyProven,
+		s3store.PresignedGetCompatibilityLimitationPUTPayloadVariantsBeyondNamedSamples,
+		s3store.PresignedGetCompatibilityLimitationArbitraryUnsignedHeaderOverrideBinding,
+		s3store.PresignedGetCompatibilityLimitationBucketAndOriginBindingNotSampled,
+	}
+	if options.DangerouslyAllowSystemTrust {
+		presignedLimitations = append(
+			presignedLimitations,
+			s3store.PresignedGetCompatibilityLimitationSystemTrustNetworkIO,
+		)
+	}
 	writableCleanup := s3disk.StoreCompatibilityCleanupReport{
 		Status: s3disk.StoreCompatibilityCleanupSucceeded,
 	}
@@ -318,6 +391,7 @@ func passingDoctorCommissioningReport(options DoctorOptions, attentionRequired b
 			PresignedPrefixDerived: true, PresignedPrefixRepositoryScoped: true,
 			DeploymentFingerprint: options.DeploymentFingerprint, EvidenceID: options.EvidenceID,
 			ImplementationVersion: options.ImplementationVersion, FullyBound: fullyBound,
+			PresigningTopology: s3store.PresignedGetCompatibilitySameStore,
 		},
 		Status:               s3store.S3CommissioningPassed,
 		Compatible:           true,
@@ -340,10 +414,14 @@ func passingDoctorCommissioningReport(options DoctorOptions, attentionRequired b
 			Checks: writableChecks, Cleanup: writableCleanup,
 		},
 		PresignedGet: s3store.PresignedGetCompatibilityReport{
-			Scope:  s3store.PresignedGetCompatibilitySingleEndpointFiniteProbe,
+			Scope: s3store.PresignedGetCompatibilitySingleEndpointFiniteProbe,
+			Evidence: s3store.PresignedGetCompatibilityEvidence{
+				PresigningTopology: s3store.PresignedGetCompatibilitySameStore,
+			},
 			Status: s3store.PresignedGetCompatibilityPassed, Compatible: true, Complete: true,
 			RequiredChecks: s3store.PresignedGetCompatibilityRequiredChecks,
 			Checks:         presignedChecks,
+			Limitations:    presignedLimitations,
 			Cleanup:        presignedCleanup,
 		},
 		Cleanup: cleanup,

@@ -123,15 +123,20 @@ ready.
 
 <!-- RELEASE-BLOCKER: split-writer-presigner-commissioning -->
 
-- `Store.ProbeCommissioning` currently uses one configured `Store` identity for
-  writable canary operations, credentialed read-backs, cleanup, and GET
-  presigning. It therefore samples both semantic contracts at one endpoint but
-  cannot certify a production split between a writer and a separately scoped
-  GetObject-only signing principal; that signer cannot run the probe's canary
-  PUT/DELETE operations. A split-identity probe or independent harness, plus
-  archived IAM and routing evidence that both identities resolve to the same
-  bucket/origin, is required before claiming that least-privilege topology is
-  commercially certified.
+- `Store.ProbeCommissioningWithPresigningStore` now runs writable canary
+  operations, credentialed read-backs, CAS, and cleanup only through the writer
+  while a separately constructed Store creates the exact GET bearers. It
+  rejects the same Store, a shared SDK client, and different bucket names before
+  I/O; a full pass records cross-configuration canary binding. The pinned MinIO
+  gate passes with a second principal whose policy contains only
+  `s3:GetObject`, and independently samples PUT, DELETE, and LIST denial. This
+  closes the missing library API and local split-harness portion. The release
+  blocker remains until each production provider deployment archives an
+  independently reviewed IAM/BPA/routing inventory, negative-authority
+  evidence, and a split report proving the exact production writer and signer
+  routes observed the same canaries. Separate Store instances are not proof of
+  separate credential identities or complete least-privilege policy. The CLI
+  doctor still emits only same-Store commissioning reports.
 
 <!-- RELEASE-BLOCKER: s3-only-share-scale -->
 
@@ -250,12 +255,11 @@ accept or resolve each one explicitly.
   downgrade. Third-party enumeration covers both `CGO_ENABLED=0` and `1` for
   every declared build target so native cgo-only imports cannot silently bypass
   the attribution inventory.
-- Run `s3store.Store.ProbeCommissioning` with the exact production endpoint,
+- Run `s3store.Store.ProbeCommissioningWithPresigningStore` with the exact
+  production writer and bearer endpoint configurations,
   bucket, prefix, addressing, TLS, and gateway route for every advertised
-  backend/version/endpoint mode, using a dedicated commissioning identity that
-  can execute both phases, then run the longer failure suite. This envelope is
-  not evidence that separate production writer and signer identities were both
-  exercised. Require one combined envelope containing
+  backend/version/endpoint mode, then run the longer failure suite. Require one
+  combined envelope containing
   the current 31 writable and 14 presigned checks, explicit stage outcomes, and
   both cleanup results. The presigned prefix is derived inside the normalized
   repository prefix by default; explicit prefixes must remain in that namespace,
@@ -267,7 +271,12 @@ accept or resolve each one explicitly.
   recomputed both prefix fingerprints and those bindings, then tamper-evidently
   sealed the complete envelope. The run ID, timestamps, and hashes are not
   signatures and do not discover credential identity or server version.
-  Archive the JSON-safe report and treat `configuration_error`,
+  Require `presigning_topology=separate_store`,
+  `presigning_store_input_distinct=true`, and
+  `cross_configuration_canary_binding_observed=true` in both aggregate and
+  nested evidence. These fields prove Store input topology and finite canary
+  observations, not credential identity. Archive the JSON-safe report and
+  treat `configuration_error`,
   `permission_denied`, or `indeterminate` as “not certified,” not as proof of
   provider incompatibility. Cleanup does not change `Compatible` or a stage
   outcome, but `cleanup.attention_required` still requires the approved
@@ -301,10 +310,11 @@ accept or resolve each one explicitly.
 - Fail the commercial backend gate unless the presigning credential is a
   separately reviewed `GetObject`-only principal restricted to the one
   commissioned bucket/key scope and the exact production origin. It must have
-  no PUT, DELETE, LIST, or bucket-administration authority. The library cannot
-  derive this fact from a bearer URL or prove that the writer and signer target
-  the same bucket/origin. The current combined probe also cannot exercise this
-  split identity; retain the blocker above until a separate harness or API does.
+  no PUT, DELETE, LIST, or bucket-administration authority. The split library
+  call samples current cross-route object equivalence but cannot derive the IAM
+  fact from a bearer URL or authenticate the provider's bucket/origin mapping.
+  Retain the blocker above until independent production IAM and routing
+  evidence is archived with the split report.
 - Fail the gate without an archived BPA/IAM/public-access review covering the
   bucket, access points, ACLs, principal and resource policies, gateway/origin
   rules, and provider equivalents. Unsigned canary GET/PUT/DELETE denial is a

@@ -32,9 +32,11 @@ dates in customer-facing terms.
 - Keep the commissioned bucket private. Block Public Access (BPA), bucket and
   access-point policies, ACLs, IAM permissions, gateway/origin rules, and any
   provider equivalents must deny anonymous access except through the exact
-  presigned operation. Prefer the combined `s3store.Store.ProbeCommissioning`
-  envelope so the 31-check writable and 14-check credential-free paths retain
-  one run identity and separate stage outcomes. The anonymous compatibility
+  presigned operation. Prefer the combined split
+  `s3store.Store.ProbeCommissioningWithPresigningStore` envelope for production
+  certification so the 31-check writable and 14-check credential-free paths
+  retain one run identity, separate stage outcomes, and explicit Store
+  topology. The anonymous compatibility
   phase samples unsigned GET, PUT, and DELETE denial only against its two random
   canaries and selected origin; it cannot audit the complete policy graph or
   every alternate endpoint. The report is unsigned caller-produced evidence,
@@ -103,7 +105,10 @@ dates in customer-facing terms.
   backend this is a hard gate: the signing principal must be restricted to
   `GetObject` for the one commissioned bucket (and required key scope), with no
   write, delete, list, or bucket-administration authority. The library cannot
-  discover or prove that IAM fact from a presigned URL.
+  discover or prove that IAM fact from a presigned URL. Commission the pair
+  with `Store.ProbeCommissioningWithPresigningStore`; a successful
+  `cross_configuration_canary_binding_observed` is a finite route/data-plane
+  sample, not authenticated IAM evidence.
 - The `strict-share-isolation-v1` client-encryption profile uses one fresh
   random 256-bit key per share. Domain-separated HKDF-SHA256 derives independent
   encryption/index masters. Each message uses a fresh random 16-byte HKDF salt
@@ -263,12 +268,16 @@ dates in customer-facing terms.
   supported, a separate raw-wire HTTP/1.1 and HTTP/2 certification harness must
   test those cases; a passing library probe is not a confidentiality proof or
   a GA/support declaration.
-- The combined commissioning probe uses one configured A-side `Store` identity
-  for canary writes, credentialed read-backs, cleanup, and GET presigning. It
-  does not prove that a distinct production writer and GetObject-only signing
-  principal share the same bucket, origin, or route. A commercial deployment
-  requiring that split needs independent IAM/routing evidence and a
-  split-identity harness; the current combined report cannot replace it.
+- `Store.ProbeCommissioningWithPresigningStore` keeps all canary writes,
+  credentialed read-backs, CAS, and cleanup on the writer and uses the second
+  Store only to create fixed-context exact GET bearers. It rejects the same
+  Store, a shared SDK client, and different bucket names before S3 I/O. A full
+  split pass observes the exact canary bytes and versions across both configured
+  routes, but does not prove that the credentials are distinct or that either
+  effective IAM policy has no authority outside the samples. Commercial use
+  still needs independent IAM/BPA/routing evidence and provider-specific
+  negative-policy certification. The CLI doctor currently exercises only the
+  same-Store form.
 - Consumers retain a last-known-good snapshot during transient failures. A
   network partition prevents any unconditional guarantee of freshness.
 

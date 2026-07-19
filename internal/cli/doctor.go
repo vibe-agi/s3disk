@@ -129,6 +129,8 @@ func doctorCommissioningReportPassed(report s3store.S3CommissioningReport, optio
 			doctorCommissioningPresignedPrefixDomain, presignedPrefix,
 		) &&
 		evidence.PresignedPrefixDerived && evidence.PresignedPrefixRepositoryScoped &&
+		evidence.PresigningTopology == s3store.PresignedGetCompatibilitySameStore &&
+		!evidence.PresigningStoreInputDistinct && !evidence.CrossConfigurationCanaryBindingObserved &&
 		evidence.DeploymentFingerprint == options.DeploymentFingerprint &&
 		evidence.EvidenceID == options.EvidenceID &&
 		evidence.ImplementationVersion == options.ImplementationVersion &&
@@ -151,9 +153,13 @@ func doctorCommissioningReportPassed(report s3store.S3CommissioningReport, optio
 		writableEvidence.FullyBound == bindingsComplete &&
 		doctorWritableChecksPassed(report.WritableStore) &&
 		report.PresignedGet.Scope == s3store.PresignedGetCompatibilitySingleEndpointFiniteProbe &&
+		report.PresignedGet.Evidence.PresigningTopology == s3store.PresignedGetCompatibilitySameStore &&
+		!report.PresignedGet.Evidence.PresigningStoreInputDistinct &&
+		!report.PresignedGet.Evidence.CrossConfigurationCanaryBindingObserved &&
 		report.PresignedGet.Status == s3store.PresignedGetCompatibilityPassed &&
 		report.PresignedGet.Compatible && report.PresignedGet.Complete &&
 		doctorPresignedChecksPassed(report.PresignedGet) &&
+		doctorPresignedLimitationsPassed(report.PresignedGet, options.DangerouslyAllowSystemTrust) &&
 		doctorCleanupSummaryConsistent(report)
 }
 
@@ -205,6 +211,36 @@ func doctorPresignedChecksPassed(report s3store.PresignedGetCompatibilityReport)
 		delete(expected, check.ID)
 	}
 	return len(expected) == 0
+}
+
+func doctorPresignedLimitationsPassed(
+	report s3store.PresignedGetCompatibilityReport,
+	dangerouslyAllowSystemTrust bool,
+) bool {
+	expected := []s3store.PresignedGetCompatibilityLimitation{
+		s3store.PresignedGetCompatibilityLimitationFutureStatesNotProven,
+		s3store.PresignedGetCompatibilityLimitationExpiryNotSampled,
+		s3store.PresignedGetCompatibilityLimitationOtherMethodsNotSampled,
+		s3store.PresignedGetCompatibilityLimitationArbitraryQueryBindingNotProven,
+		s3store.PresignedGetCompatibilityLimitationHEADAndBodylessStatusWireBodyNotVisible,
+		s3store.PresignedGetCompatibilityLimitationDiscardedWireMetadataAndExtraBytes,
+		s3store.PresignedGetCompatibilityLimitationBucketPublicAccessPolicyNotFullyProven,
+		s3store.PresignedGetCompatibilityLimitationPUTPayloadVariantsBeyondNamedSamples,
+		s3store.PresignedGetCompatibilityLimitationArbitraryUnsignedHeaderOverrideBinding,
+		s3store.PresignedGetCompatibilityLimitationBucketAndOriginBindingNotSampled,
+	}
+	if dangerouslyAllowSystemTrust {
+		expected = append(expected, s3store.PresignedGetCompatibilityLimitationSystemTrustNetworkIO)
+	}
+	if len(report.Limitations) != len(expected) {
+		return false
+	}
+	for index, limitation := range expected {
+		if report.Limitations[index] != limitation {
+			return false
+		}
+	}
+	return true
 }
 
 func doctorWritableRequiredCheckIDs() []s3disk.StoreCompatibilityCheckID {

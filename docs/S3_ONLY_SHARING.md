@@ -304,7 +304,8 @@ deliberately direct and rejects forward proxies, custom dialers, and alternate-
 protocol transports:
 
 ```go
-report, err := store.ProbeCommissioning(ctx,
+report, err := writerStore.ProbeCommissioningWithPresigningStore(ctx,
+	presigningStore,
 	s3store.S3CommissioningProbeOptions{
 		RepositoryPrefix:      "private/commissioning",
 		DeploymentFingerprint: deploymentFingerprint,
@@ -334,11 +335,16 @@ verdict. Prefix fingerprints, run identity, timestamps, and caller declarations
 bind audit metadata but do not sign it; an independent controller must verify
 and seal the complete report.
 
-The combined call uses one configured `Store` identity for canary writes,
-credentialed read-backs, cleanup, and GET presigning. It therefore does not
-exercise a production split between the writer and a separate GetObject-only
-signer. That least-privilege topology requires independent IAM/routing evidence
-and a split-identity commissioning harness before commercial certification.
+The default combined call uses one configured Store. The split form,
+`Store.ProbeCommissioningWithPresigningStore`, keeps every canary mutation,
+credentialed read-back, and cleanup on the writer while using the second Store
+only for exact GET presigning. A successful split run records a separate-Store
+topology and cross-configuration canary binding. The MinIO integration test
+uses a distinct `GetObject`-only user and verifies PUT, DELETE, and LIST denial.
+This finite evidence does not prove credential identity or the complete IAM,
+BPA, bucket, origin, and routing graph, so commercial certification still
+requires an independent provider review and archived policy evidence. The CLI
+doctor currently runs the same-Store form.
 
 The writable phase checks conditional create/replacement, concurrency,
 visibility, ETags, conditional GET, bounded reads, and adapter ownership. The
@@ -356,8 +362,10 @@ bearer (raw URL, signature, capability-header values, and an absent foreign
 path/key). Informational 1xx or encoded negative responses cannot pass.
 
 These are named samples, not proof of arbitrary query, header, method, payload,
-historical-version, public-policy, bucket, or origin binding. A distinct host is
-not fabricated from a same-origin two-canary probe. Go's HTTP client also cannot
+historical-version, public-policy, bucket, or origin binding. The same-Store
+form does not fabricate a distinct host. The split form samples two configured
+routes against the same exact canaries but does not authenticate their
+provider-side mapping or credential identities. Go's HTTP client also cannot
 expose illegal bodies on HEAD/bodyless statuses, chunk extensions, or bytes
 beyond declared framing. The report retains all of those limitations, plus
 post-expiry and future provider/network states. Stable check IDs and redacted

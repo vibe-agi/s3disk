@@ -84,6 +84,13 @@ func TestProbeCommissioningBothPhasesPass(t *testing.T) {
 		report.WritableStoreOutcome != S3CommissioningStagePassed || report.PresignedGetOutcome != S3CommissioningStagePassed {
 		t.Fatalf("aggregate report = %+v", report)
 	}
+	if report.Evidence.PresigningTopology != PresignedGetCompatibilitySameStore ||
+		report.Evidence.PresigningStoreInputDistinct || report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		report.PresignedGet.Evidence.PresigningTopology != PresignedGetCompatibilitySameStore ||
+		report.PresignedGet.Evidence.PresigningStoreInputDistinct ||
+		report.PresignedGet.Evidence.CrossConfigurationCanaryBindingObserved {
+		t.Fatalf("same-store commissioning evidence = %+v / %+v", report.Evidence, report.PresignedGet.Evidence)
+	}
 	if report.WritableStore.Status != s3disk.StoreCompatibilityPassed || !report.WritableStore.Compatible ||
 		!report.WritableStore.Complete || report.WritableStore.RequiredChecks != 31 || len(report.WritableStore.Checks) != 31 {
 		t.Fatalf("writable report = %+v", report.WritableStore)
@@ -117,6 +124,118 @@ func TestProbeCommissioningBothPhasesPass(t *testing.T) {
 	}
 
 	assertS3CommissioningDiagnosticsRedacted(t, report, nil, options, server.URL)
+}
+
+func TestProbeCommissioningWithSeparatePresigningStore(t *testing.T) {
+	t.Parallel()
+	const (
+		signerAccess = "COMMISSIONING-SIGNER-ACCESS-DO-NOT-LOG"
+		signerSecret = "commissioning-signer-secret-do-not-log"
+		signerToken  = "commissioning-signer-token-do-not-log"
+	)
+	var writerRequests, signerBearerRequests, wrongIdentityRequests atomic.Int64
+	_, server, writerStore, options := newCommissioningTestRig(t, func(*presignedGetProbeTestService) commissioningTestRequestHook {
+		return func(_ http.ResponseWriter, request *http.Request) bool {
+			if credential := request.URL.Query().Get("X-Amz-Credential"); credential != "" {
+				if strings.HasPrefix(credential, signerAccess+"/") {
+					signerBearerRequests.Add(1)
+				} else {
+					wrongIdentityRequests.Add(1)
+				}
+			}
+			if authorization := request.Header.Get("Authorization"); authorization != "" {
+				if strings.Contains(authorization, "Credential="+commissioningTestAccessKey+"/") {
+					writerRequests.Add(1)
+				} else {
+					wrongIdentityRequests.Add(1)
+				}
+			}
+			return false
+		}
+	})
+	signerTransport := &countingRejectingPresignedGetRoundTripper{}
+	presigningStore, err := New(context.Background(), Config{
+		Bucket: "probe-bucket", Region: "us-east-1", Endpoint: server.URL, UsePathStyle: true,
+		HTTPClient: &http.Client{Transport: signerTransport}, RetryMaxAttempts: 1, OperationTimeout: 2 * time.Second,
+		CredentialsProvider: CredentialsProviderFunc(func(context.Context) (Credentials, error) {
+			return Credentials{AccessKeyID: signerAccess, SecretAccessKey: signerSecret, SessionToken: signerToken}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := writerStore.ProbeCommissioningWithPresigningStore(context.Background(), presigningStore, options)
+	if err != nil {
+		t.Fatalf("split commissioning: %v; report=%s", err, report)
+	}
+	if report.Status != S3CommissioningPassed || !report.Compatible || !report.Complete ||
+		report.WritableStoreOutcome != S3CommissioningStagePassed ||
+		report.PresignedGetOutcome != S3CommissioningStagePassed ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySeparateStore ||
+		!report.Evidence.PresigningStoreInputDistinct ||
+		!report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		report.PresignedGet.Scope != PresignedGetCompatibilityCrossConfigurationFiniteProbe ||
+		report.PresignedGet.Evidence.PresigningTopology != PresignedGetCompatibilitySeparateStore ||
+		!report.PresignedGet.Evidence.PresigningStoreInputDistinct ||
+		!report.PresignedGet.Evidence.CrossConfigurationCanaryBindingObserved {
+		t.Fatalf("split commissioning report = %+v", report)
+	}
+	if signerTransport.calls.Load() != 0 {
+		t.Fatalf("presigning Store data-plane calls = %d, want 0", signerTransport.calls.Load())
+	}
+	if writerRequests.Load() == 0 || signerBearerRequests.Load() == 0 || wrongIdentityRequests.Load() != 0 {
+		t.Fatalf("request identities: writer=%d signer-bearer=%d wrong=%d",
+			writerRequests.Load(), signerBearerRequests.Load(), wrongIdentityRequests.Load())
+	}
+	assertS3CommissioningDiagnosticsRedacted(t, report, nil, options, server.URL)
+	for _, diagnostic := range []string{report.String(), fmt.Sprintf("%+v", report), fmt.Sprintf("%#v", report)} {
+		assertS3CommissioningTextRedacted(t, diagnostic, signerAccess, signerSecret, signerToken)
+	}
+}
+
+func TestProbeCommissioningWithPresigningStoreRejectsSameStoreBeforeIO(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int64
+	_, _, store, options := newCommissioningTestRig(t, func(*presignedGetProbeTestService) commissioningTestRequestHook {
+		return func(_ http.ResponseWriter, _ *http.Request) bool {
+			requests.Add(1)
+			return false
+		}
+	})
+	report, err := store.ProbeCommissioningWithPresigningStore(context.Background(), store, options)
+	if !errors.Is(err, s3disk.ErrStoreMisconfigured) || report.Status != S3CommissioningConfigurationError ||
+		report.WritableStoreOutcome != S3CommissioningStageNotRun || report.PresignedGetOutcome != S3CommissioningStageNotRun ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySameStore ||
+		report.Evidence.PresigningStoreInputDistinct || report.Evidence.CrossConfigurationCanaryBindingObserved {
+		t.Fatalf("same Store split commissioning: report=%+v err=%v", report, err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("same Store split commissioning performed %d S3 requests", requests.Load())
+	}
+}
+
+func TestProbeCommissioningWithPresigningStoreCleanupRemainsOperationalEvidence(t *testing.T) {
+	t.Parallel()
+	service, server, writerStore, options := newCommissioningTestRig(t, nil)
+	service.mu.Lock()
+	service.failDelete = true
+	service.mu.Unlock()
+	presigningStore := newPresignedGetProbeTestStore(t, server, "separate-signer", "signer-secret", "")
+
+	report, err := writerStore.ProbeCommissioningWithPresigningStore(
+		context.Background(), presigningStore, options,
+	)
+	if err != nil || report.Status != S3CommissioningPassed || !report.Compatible || !report.Complete ||
+		!report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		!report.PresignedGet.Evidence.CrossConfigurationCanaryBindingObserved {
+		t.Fatalf("split cleanup rewrote compatibility: report=%+v err=%v", report, err)
+	}
+	if report.WritableStore.Cleanup.Status != s3disk.StoreCompatibilityCleanupFailed ||
+		report.PresignedGet.Cleanup.Status != PresignedGetCompatibilityCleanupFailed ||
+		!report.Cleanup.CurrentObjectsMayRemain || !report.Cleanup.AttentionRequired {
+		t.Fatalf("split cleanup evidence = %+v", report.Cleanup)
+	}
 }
 
 func TestProbeCommissioningCleanupDoesNotChangeVerdict(t *testing.T) {
@@ -630,8 +749,8 @@ func TestS3CommissioningAliasesAndFingerprintDomains(t *testing.T) {
 		t.Fatalf("HTTP client snapshot aliases caller state: client=%+v transport=%+v", cloned.PresignedGet.HTTPClient, clonedTransport)
 	}
 
-	first := newS3CommissioningReport(time.Unix(1, 0))
-	second := newS3CommissioningReport(time.Unix(2, 0))
+	first := newS3CommissioningReport(time.Unix(1, 0), PresignedGetCompatibilityEvidence{})
+	second := newS3CommissioningReport(time.Unix(2, 0), PresignedGetCompatibilityEvidence{})
 	first.PresignedGet.Limitations[0] = "mutated"
 	if second.PresignedGet.Limitations[0] == "mutated" {
 		t.Fatal("independent reports alias limitation slices")
@@ -639,7 +758,7 @@ func TestS3CommissioningAliasesAndFingerprintDomains(t *testing.T) {
 
 	writableCause := errors.New("writable")
 	presignedCause := errors.New("presigned")
-	errorReport := newS3CommissioningReport(time.Unix(3, 0))
+	errorReport := newS3CommissioningReport(time.Unix(3, 0), PresignedGetCompatibilityEvidence{})
 	errorReport.WritableStoreOutcome = S3CommissioningStageFailed
 	errorReport.PresignedGetOutcome = S3CommissioningStageFailed
 	aggregate := newS3CommissioningReportError(errorReport, nil, writableCause, presignedCause).(*S3CommissioningError)
@@ -662,7 +781,7 @@ func TestS3CommissioningErrorDiagnosticsAreRedactedButUnwrap(t *testing.T) {
 		secret: "https://access.example.invalid/private?X-Amz-Credential=ACCESS&X-Amz-Signature=SIGNED-SECRET",
 		target: s3disk.ErrStoreUnavailable,
 	}
-	report := newS3CommissioningReport(time.Unix(4, 0))
+	report := newS3CommissioningReport(time.Unix(4, 0), PresignedGetCompatibilityEvidence{})
 	report.WritableStoreOutcome = S3CommissioningStageFailed
 	err := newS3CommissioningReportError(report, nil, rawCause, nil)
 	if !errors.Is(err, s3disk.ErrStoreUnavailable) {

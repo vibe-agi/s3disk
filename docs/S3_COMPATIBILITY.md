@@ -11,7 +11,8 @@ verified inventory; s3disk does not discover or authenticate them.
 ## Preferred combined API
 
 ```go
-report, err := store.ProbeCommissioning(ctx,
+report, err := writerStore.ProbeCommissioningWithPresigningStore(ctx,
+	presigningStore,
 	s3store.S3CommissioningProbeOptions{
 		RepositoryPrefix: "private/customer/commissioning",
 		// SHA-256 of the release controller's canonical, non-secret inventory
@@ -38,23 +39,35 @@ case s3store.S3CommissioningIndeterminate:
 }
 ```
 
-`Store.ProbeCommissioning` is the preferred entry point for the built-in S3
-adapter. It runs the current 31-check writable Store contract and the 14-check
-credential-free presigned-GET contract under one parent context and retains
-both nested reports in one schema-versioned envelope. A failed writable phase
-does not suppress the presigned phase while the shared context remains live.
-Each phase has an explicit `passed`, `failed`, or `not_run` outcome; `Complete`
-means both nested check sets completed and does not imply that they passed.
-`Compatible` is true only when both stages pass.
+The combined APIs are the preferred entry points for the built-in S3 adapter.
+Use `ProbeCommissioningWithPresigningStore` for the production two-principal
+topology; `ProbeCommissioning` is its same-Store convenience form. Both run the
+current 31-check writable Store contract and 14-check credential-free
+presigned-GET contract under one parent context and retain both nested reports
+in one schema-versioned envelope. A failed writable phase does not suppress the
+presigned phase while the shared context remains live. Each phase has an
+explicit `passed`, `failed`, or `not_run` outcome; `Complete` means both nested
+check sets completed and does not imply that they passed. `Compatible` is true
+only when both stages pass.
 
-Both stages currently use the same configured `Store` and credential provider.
-The presigned phase uses that identity to create, read back, and clean up its
-canaries as well as to construct the GET signing session. Consequently, the
-combined envelope is not evidence that a production writer and a separate
-GetObject-only signing principal were both exercised; a GetObject-only
-principal cannot perform the canary PUT/DELETE operations. Commercial use of
-that least-privilege split remains gated on an independent IAM/routing review
-and a split-identity probe or harness.
+`Store.ProbeCommissioning` uses one configured Store for both stages.
+`Store.ProbeCommissioningWithPresigningStore` accepts a separately constructed
+Store for exact GET signing: the receiver alone performs writable canary
+operations, credentialed read-backs, CAS, and cleanup; the second Store is used
+only to freeze its credentials and create bearer URLs. The split call rejects
+the same Store pointer, a shared SDK client, or a different bucket name before
+S3 I/O. Writer and public bearer endpoints may differ, allowing a private
+A-side route and B's public route to be sampled together.
+
+The report distinguishes `same_store` from `separate_store`. In a successful
+split run, `cross_configuration_canary_binding_observed=true` means all 14
+presigned checks observed the exact canaries created and replaced through the
+writer configuration. It does not authenticate the two credential identities,
+prove their complete effective IAM policies, or establish future route
+equivalence. The MinIO integration gate provisions a distinct `GetObject`-only
+user and separately confirms PUT, DELETE, and LIST denial; production
+certification still needs archived provider IAM/BPA/routing evidence. The CLI
+doctor intentionally emits only same-Store reports today.
 
 The aggregate cleanup summary records each nested cleanup status plus whether
 current objects or historical versions may remain. Cleanup failure is an
@@ -361,8 +374,9 @@ hooks are stripped from anonymous requests. Response header count, byte bounds,
 single ETag, and optional Version ID rules match `presignedshare.Reader`.
 A-side cleanup has a separate finite deadline and is reported independently.
 
-A passing result is scoped as `single_endpoint_finite_probe`. With explicit TLS
-roots it retains ten default limitations. These include
+A same-Store result is scoped as `single_endpoint_finite_probe`; a split result
+uses `cross_configuration_finite_probe`. With explicit TLS roots either form
+retains ten default limitations. These include
 `future_provider_and_network_states_not_proven` and
 `post_expiry_rejection_not_sampled`: waiting out a production share lifetime is
 not appropriate inside a bounded commissioning call. It also retains
@@ -372,8 +386,13 @@ not appropriate inside a bounded commissioning call. It also retains
 `discarded_wire_metadata_and_extra_bytes_not_observable_with_net_http`,
 `bucket_public_access_policy_not_fully_proven`,
 `put_payload_variants_beyond_named_samples_not_proven`,
-`arbitrary_unsigned_header_override_binding_not_proven`, and
-`bucket_and_origin_binding_not_sampled`. The expiry-query sample does not prove
+`arbitrary_unsigned_header_override_binding_not_proven`, and, for the
+same-Store form, `bucket_and_origin_binding_not_sampled`. A split report instead
+uses
+`cross_configuration_bucket_origin_route_and_identity_not_authenticated`: it
+observes that both configured routes agree on the exact current canaries, but
+does not authenticate the provider mapping or credential identities. The
+expiry-query sample does not prove
 that every added query such as `versionId` is bound. The eleven override-header
 samples do not prove arbitrary header names or values, and deliberately do not
 invent a second host/origin. The zero-byte and nonce-bearing PUTs do not prove

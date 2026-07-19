@@ -53,7 +53,10 @@ func TestProbePresignedGetCompatibilityAnonymousOnlyS3Semantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProbePresignedGetCompatibilityWithOptions: %v", err)
 	}
-	if report.Status != PresignedGetCompatibilityPassed || !report.Compatible || !report.Complete ||
+	if report.Scope != PresignedGetCompatibilitySingleEndpointFiniteProbe ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySameStore ||
+		report.Evidence.PresigningStoreInputDistinct || report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		report.Status != PresignedGetCompatibilityPassed || !report.Compatible || !report.Complete ||
 		report.RequiredChecks != PresignedGetCompatibilityRequiredChecks || len(report.Checks) != PresignedGetCompatibilityRequiredChecks {
 		t.Fatalf("report = %+v", report)
 	}
@@ -138,6 +141,267 @@ func TestProbePresignedGetCompatibilityAnonymousOnlyS3Semantics(t *testing.T) {
 	}
 	for _, diagnostic := range diagnostics {
 		assertPresignedGetProbeDiagnosticRedacted(t, diagnostic)
+	}
+}
+
+func TestProbePresignedGetCompatibilityWithSeparatePresigningStore(t *testing.T) {
+	t.Parallel()
+	const (
+		writerAccess = "WRITER-ACCESS-DO-NOT-LOG"
+		writerSecret = "writer-secret-do-not-log"
+		signerAccess = "SIGNER-ACCESS-DO-NOT-LOG"
+		signerSecret = "signer-secret-do-not-log"
+		signerToken  = "signer-token-do-not-log"
+	)
+	service := newPresignedGetProbeTestService(t)
+	var writerRequests, signerBearerRequests, wrongIdentityRequests atomic.Int64
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if credential := request.URL.Query().Get("X-Amz-Credential"); credential != "" {
+			if strings.HasPrefix(credential, signerAccess+"/") {
+				signerBearerRequests.Add(1)
+			} else {
+				wrongIdentityRequests.Add(1)
+			}
+		}
+		if authorization := request.Header.Get("Authorization"); authorization != "" {
+			if strings.Contains(authorization, "Credential="+writerAccess+"/") {
+				writerRequests.Add(1)
+			} else {
+				wrongIdentityRequests.Add(1)
+			}
+		}
+		service.ServeHTTP(writer, request)
+	})
+	writerServer := httptest.NewServer(handler)
+	t.Cleanup(writerServer.Close)
+	presigningServer := httptest.NewServer(handler)
+	t.Cleanup(presigningServer.Close)
+
+	writerStore := newPresignedGetProbeTestStore(t, writerServer, writerAccess, writerSecret, "")
+	signerTransport := &countingRejectingPresignedGetRoundTripper{}
+	presigningStore, err := New(context.Background(), Config{
+		Bucket: "probe-bucket", Region: "us-east-1", Endpoint: presigningServer.URL, UsePathStyle: true,
+		HTTPClient: &http.Client{Transport: signerTransport}, OperationTimeout: 2 * time.Second,
+		CredentialsProvider: CredentialsProviderFunc(func(context.Context) (Credentials, error) {
+			return Credentials{AccessKeyID: signerAccess, SecretAccessKey: signerSecret, SessionToken: signerToken}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := writerStore.ProbePresignedGetCompatibilityWithPresigningStore(
+		context.Background(), presigningStore, PresignedGetCompatibilityProbeOptions{
+			ObjectKeyPrefix: "private/probes", TotalTimeout: 5 * time.Second,
+			CapabilityLifetime: time.Minute, CleanupTimeout: time.Second,
+		},
+	)
+	if err != nil {
+		t.Fatalf("split presigned GET compatibility: %v", err)
+	}
+	if report.Scope != PresignedGetCompatibilityCrossConfigurationFiniteProbe ||
+		report.Status != PresignedGetCompatibilityPassed || !report.Compatible || !report.Complete ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySeparateStore ||
+		!report.Evidence.PresigningStoreInputDistinct ||
+		!report.Evidence.CrossConfigurationCanaryBindingObserved {
+		t.Fatalf("split report = %+v", report)
+	}
+	if len(report.Limitations) != 10 ||
+		report.Limitations[9] != PresignedGetCompatibilityLimitationCrossConfigurationBindingNotAuthenticated {
+		t.Fatalf("split limitations = %v", report.Limitations)
+	}
+	if report.Cleanup.Status != PresignedGetCompatibilityCleanupSucceeded {
+		t.Fatalf("split cleanup = %+v", report.Cleanup)
+	}
+	if signerTransport.calls.Load() != 0 {
+		t.Fatalf("presigning Store data-plane calls = %d, want 0", signerTransport.calls.Load())
+	}
+	if writerRequests.Load() == 0 || signerBearerRequests.Load() == 0 || wrongIdentityRequests.Load() != 0 {
+		t.Fatalf("request identities: writer=%d signer-bearer=%d wrong=%d",
+			writerRequests.Load(), signerBearerRequests.Load(), wrongIdentityRequests.Load())
+	}
+
+	encoded, marshalErr := json.Marshal(report)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	for _, diagnostic := range []string{string(encoded), report.String(), fmt.Sprintf("%+v", report), fmt.Sprintf("%#v", report)} {
+		for _, secret := range []string{
+			writerAccess, writerSecret, signerAccess, signerSecret, signerToken,
+			writerServer.URL, presigningServer.URL, "probe-bucket", "private/probes", "X-Amz-Credential", "X-Amz-Signature",
+		} {
+			if strings.Contains(diagnostic, secret) {
+				t.Fatalf("split diagnostic leaked %q: %s", secret, diagnostic)
+			}
+		}
+	}
+}
+
+func TestProbePresignedGetCompatibilityWithPresigningStoreRejectsInvalidPairsBeforeIO(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int64
+	service := newPresignedGetProbeTestService(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		service.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(server.Close)
+	writerStore := newPresignedGetProbeTestStore(t, server, "writer", "writer-secret", "")
+	validSigner := newPresignedGetProbeTestStore(t, server, "signer", "signer-secret", "")
+	sharedSDKClient := *writerStore
+	differentBucket := *validSigner
+	differentBucket.bucket = "different-bucket"
+	var nilWriter *Store
+
+	tests := []struct {
+		name         string
+		writer       *Store
+		signer       *Store
+		wantScope    PresignedGetCompatibilityScope
+		wantTopology PresignedGetCompatibilityPresigningTopology
+		wantDistinct bool
+	}{
+		{name: "nil writer", writer: nilWriter, signer: validSigner, wantScope: PresignedGetCompatibilitySingleEndpointFiniteProbe},
+		{name: "nil signer", writer: writerStore, signer: nil, wantScope: PresignedGetCompatibilitySingleEndpointFiniteProbe},
+		{name: "same Store", writer: writerStore, signer: writerStore, wantScope: PresignedGetCompatibilitySingleEndpointFiniteProbe, wantTopology: PresignedGetCompatibilitySameStore},
+		{name: "shared SDK client", writer: writerStore, signer: &sharedSDKClient, wantScope: PresignedGetCompatibilityCrossConfigurationFiniteProbe, wantTopology: PresignedGetCompatibilitySeparateStore, wantDistinct: true},
+		{name: "different bucket", writer: writerStore, signer: &differentBucket, wantScope: PresignedGetCompatibilityCrossConfigurationFiniteProbe, wantTopology: PresignedGetCompatibilitySeparateStore, wantDistinct: true},
+		{name: "unconfigured signer", writer: writerStore, signer: &Store{}, wantScope: PresignedGetCompatibilityCrossConfigurationFiniteProbe, wantTopology: PresignedGetCompatibilitySeparateStore, wantDistinct: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			report, err := test.writer.ProbePresignedGetCompatibilityWithPresigningStore(
+				context.Background(), test.signer, shortPresignedGetProbeOptions(server.Client()),
+			)
+			if !errors.Is(err, s3disk.ErrStoreMisconfigured) ||
+				report.Status != PresignedGetCompatibilityConfigurationError || report.Compatible || report.Complete ||
+				report.Scope != test.wantScope || report.Evidence.PresigningTopology != test.wantTopology ||
+				report.Evidence.PresigningStoreInputDistinct != test.wantDistinct ||
+				report.Evidence.CrossConfigurationCanaryBindingObserved ||
+				report.Cleanup.Status != PresignedGetCompatibilityCleanupNotAttempted ||
+				len(report.Checks) != 1 || report.Checks[0].ID != PresignedGetCompatibilityCheckConfiguration {
+				t.Fatalf("invalid pair: report=%+v err=%v", report, err)
+			}
+			if requests.Load() != 0 {
+				t.Fatalf("invalid pair performed %d S3 requests", requests.Load())
+			}
+		})
+	}
+}
+
+func TestProbePresignedGetCompatibilityWithPresigningStoreUsesSignerTLSRequirementBeforeIO(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int64
+	service := newPresignedGetProbeTestService(t)
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		service.ServeHTTP(writer, request)
+	})
+	writerServer := httptest.NewServer(handler)
+	t.Cleanup(writerServer.Close)
+	presigningServer := httptest.NewTLSServer(handler)
+	t.Cleanup(presigningServer.Close)
+	writerStore := newPresignedGetProbeTestStore(t, writerServer, "writer", "writer-secret", "")
+	presigningStore, err := New(context.Background(), Config{
+		Bucket: "probe-bucket", Region: "us-east-1", Endpoint: presigningServer.URL, UsePathStyle: true,
+		HTTPClient: presigningServer.Client(), OperationTimeout: 2 * time.Second,
+		CredentialsProvider: CredentialsProviderFunc(func(context.Context) (Credentials, error) {
+			return Credentials{AccessKeyID: "signer", SecretAccessKey: "signer-secret"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, probeErr := writerStore.ProbePresignedGetCompatibilityWithPresigningStore(
+		context.Background(), presigningStore, shortPresignedGetProbeOptions(nil),
+	)
+	if probeErr == nil || report.Status != PresignedGetCompatibilityConfigurationError ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySeparateStore ||
+		!report.Evidence.PresigningStoreInputDistinct || report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		report.Cleanup.Status != PresignedGetCompatibilityCleanupNotAttempted {
+		t.Fatalf("signer TLS requirement: report=%+v err=%v", report, probeErr)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("missing signer TLS roots performed %d S3 requests", requests.Load())
+	}
+}
+
+func TestProbePresignedGetCompatibilityWithPresigningStoreCredentialFailureCleansAndRedacts(t *testing.T) {
+	t.Parallel()
+	const hostileCredentialError = "SIGNER-CREDENTIAL-PROVIDER-SECRET-DO-NOT-LOG"
+	service := newPresignedGetProbeTestService(t)
+	server := httptest.NewServer(service)
+	t.Cleanup(server.Close)
+	writerStore := newPresignedGetProbeTestStore(t, server, "writer", "writer-secret", "")
+	signerTransport := &countingRejectingPresignedGetRoundTripper{}
+	presigningStore, err := New(context.Background(), Config{
+		Bucket: "probe-bucket", Region: "us-east-1", Endpoint: server.URL, UsePathStyle: true,
+		HTTPClient: &http.Client{Transport: signerTransport}, OperationTimeout: 2 * time.Second,
+		CredentialsProvider: CredentialsProviderFunc(func(context.Context) (Credentials, error) {
+			return Credentials{}, errors.New(hostileCredentialError)
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, probeErr := writerStore.ProbePresignedGetCompatibilityWithPresigningStore(
+		context.Background(), presigningStore, shortPresignedGetProbeOptions(nil),
+	)
+	if !errors.Is(probeErr, s3disk.ErrAccessDenied) ||
+		report.Status != PresignedGetCompatibilityPermissionDenied || report.Compatible || report.Complete ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySeparateStore ||
+		!report.Evidence.PresigningStoreInputDistinct || report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		len(report.Checks) != 3 || report.Checks[2].ID != PresignedGetCompatibilityCheckExactGetPresign ||
+		report.Cleanup.Status != PresignedGetCompatibilityCleanupSucceeded {
+		t.Fatalf("signer credential failure: report=%+v err=%v", report, probeErr)
+	}
+	if signerTransport.calls.Load() != 0 {
+		t.Fatalf("presigning Store data-plane calls = %d, want 0", signerTransport.calls.Load())
+	}
+	service.mu.Lock()
+	remaining := len(service.objects)
+	service.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("writer cleanup left %d canaries", remaining)
+	}
+	for _, diagnostic := range []string{report.String(), probeErr.Error(), fmt.Sprintf("%+v", report), fmt.Sprintf("%#v", probeErr)} {
+		for _, secret := range []string{hostileCredentialError, server.URL, "probe-bucket", "private/probes"} {
+			if strings.Contains(diagnostic, secret) {
+				t.Fatalf("credential failure diagnostic leaked %q: %s", secret, diagnostic)
+			}
+		}
+	}
+}
+
+func TestProbePresignedGetCompatibilityWithPresigningStoreDetectsDifferentDataOrigin(t *testing.T) {
+	t.Parallel()
+	writerService := newPresignedGetProbeTestService(t)
+	writerServer := httptest.NewServer(writerService)
+	t.Cleanup(writerServer.Close)
+	presigningService := newPresignedGetProbeTestService(t)
+	presigningServer := httptest.NewServer(presigningService)
+	t.Cleanup(presigningServer.Close)
+	writerStore := newPresignedGetProbeTestStore(t, writerServer, "writer", "writer-secret", "")
+	presigningStore := newPresignedGetProbeTestStore(t, presigningServer, "signer", "signer-secret", "")
+
+	report, err := writerStore.ProbePresignedGetCompatibilityWithPresigningStore(
+		context.Background(), presigningStore, shortPresignedGetProbeOptions(nil),
+	)
+	if !errors.Is(err, s3disk.ErrStoreIncompatible) ||
+		report.Status != PresignedGetCompatibilityIncompatible || report.Compatible || report.Complete ||
+		report.Evidence.PresigningTopology != PresignedGetCompatibilitySeparateStore ||
+		!report.Evidence.PresigningStoreInputDistinct || report.Evidence.CrossConfigurationCanaryBindingObserved ||
+		len(report.Checks) != 5 || report.Checks[4].ID != PresignedGetCompatibilityCheckInitialGet ||
+		report.Cleanup.Status != PresignedGetCompatibilityCleanupSucceeded {
+		t.Fatalf("different data origin: report=%+v err=%v", report, err)
+	}
+	writerService.mu.Lock()
+	writerRemaining := len(writerService.objects)
+	writerService.mu.Unlock()
+	if writerRemaining != 0 {
+		t.Fatalf("writer cleanup left %d canaries", writerRemaining)
 	}
 }
 
@@ -1497,6 +1761,15 @@ type leakingPresignedGetRoundTripper struct{ err error }
 
 func (transport leakingPresignedGetRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, transport.err
+}
+
+type countingRejectingPresignedGetRoundTripper struct {
+	calls atomic.Int64
+}
+
+func (transport *countingRejectingPresignedGetRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	transport.calls.Add(1)
+	return nil, errors.New("unexpected presigning Store data-plane request")
 }
 
 type presignedGetProbeTestObject struct {
