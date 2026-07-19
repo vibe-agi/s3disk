@@ -2,6 +2,7 @@ package s3disk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -19,7 +20,13 @@ const (
 	// all pre-release refinements remain version 1. Increment only after a
 	// released contract requires an incompatible successor.
 	StoreCompatibilityContractVersion = 1
-	compatibilityRequiredChecks       = 31
+
+	// StoreCompatibilityRequiredChecks is the number of required checks in the
+	// current compatibility contract. It lets aggregate report constructors
+	// emit a valid not-run envelope without duplicating this package's contract.
+	StoreCompatibilityRequiredChecks = 31
+
+	compatibilityRequiredChecks = StoreCompatibilityRequiredChecks
 )
 
 // StoreCompatibilityScope states what population a probe sampled. A passed
@@ -108,6 +115,12 @@ type StoreCompatibilityCheck struct {
 	Cause   error                     `json:"-"`
 }
 
+func (check StoreCompatibilityCheck) String() string {
+	return storeCompatibilityJSONDiagnostic("StoreCompatibilityCheck", check)
+}
+
+func (check StoreCompatibilityCheck) GoString() string { return check.String() }
+
 // StoreCompatibilityCleanupStatus reports only probe-key cleanup. Cleanup is
 // not part of the publication protocol and cannot make an otherwise compatible
 // store incompatible.
@@ -158,6 +171,12 @@ type StoreCompatibilityCleanupReport struct {
 	Cause                       error                           `json:"-"`
 }
 
+func (cleanup StoreCompatibilityCleanupReport) String() string {
+	return storeCompatibilityJSONDiagnostic("StoreCompatibilityCleanupReport", cleanup)
+}
+
+func (cleanup StoreCompatibilityCleanupReport) GoString() string { return cleanup.String() }
+
 // StoreCompatibilityReport is a fail-fast commissioning result. Evidence is
 // redacted audit metadata, not a signature or a verified provider identity.
 // Complete is true when all RequiredChecks ran, even if the final check failed.
@@ -176,10 +195,18 @@ type StoreCompatibilityReport struct {
 	Cleanup         StoreCompatibilityCleanupReport `json:"cleanup"`
 }
 
+func (report StoreCompatibilityReport) String() string {
+	return storeCompatibilityJSONDiagnostic("StoreCompatibilityReport", report)
+}
+
+func (report StoreCompatibilityReport) GoString() string { return report.String() }
+
 // StoreCompatibilityError identifies the exact failed or inconclusive check.
 // For an incompatible result it matches ErrStoreIncompatible. It always
 // unwraps Cause, allowing callers to distinguish context cancellation,
-// permissions, throttling, and provider-specific errors.
+// permissions, throttling, and provider-specific errors. Ordinary formatting
+// and JSON redact Cause because SDK errors may contain endpoints or signed
+// request material; callers must apply the same care when traversing Unwrap.
 type StoreCompatibilityError struct {
 	CheckID StoreCompatibilityCheckID
 	Status  StoreCompatibilityStatus
@@ -193,6 +220,39 @@ func (err *StoreCompatibilityError) Error() string {
 	if err == nil {
 		return "<nil>"
 	}
+	return storeCompatibilityErrorMessage(*err)
+}
+
+// String also protects copied StoreCompatibilityError values, which do not
+// implement error because Error has a pointer receiver.
+func (err StoreCompatibilityError) String() string {
+	return storeCompatibilityErrorMessage(err)
+}
+
+func (err StoreCompatibilityError) GoString() string { return err.String() }
+
+// MarshalJSON retains only stable, redacted classifications. Cause remains
+// available in process through Unwrap but may implement json.Marshaler itself
+// or otherwise contain credential-bearing provider diagnostics.
+func (err StoreCompatibilityError) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		CheckID      StoreCompatibilityCheckID `json:"check_id"`
+		Status       StoreCompatibilityStatus  `json:"status"`
+		Reason       StoreCompatibilityReason  `json:"reason,omitempty"`
+		Detail       string                    `json:"detail,omitempty"`
+		Hint         string                    `json:"hint,omitempty"`
+		CausePresent bool                      `json:"cause_present"`
+	}{
+		CheckID:      err.CheckID,
+		Status:       err.Status,
+		Reason:       err.Reason,
+		Detail:       err.Detail,
+		Hint:         err.Hint,
+		CausePresent: err.Cause != nil,
+	})
+}
+
+func storeCompatibilityErrorMessage(err StoreCompatibilityError) string {
 	message := fmt.Sprintf("s3disk: compatibility check %q %s", err.CheckID, err.Status)
 	if err.Reason != "" {
 		message += " (" + string(err.Reason) + ")"
@@ -201,7 +261,7 @@ func (err *StoreCompatibilityError) Error() string {
 		message += ": " + err.Detail
 	}
 	if err.Cause != nil {
-		message += ": " + err.Cause.Error()
+		message += ": cause redacted"
 	}
 	return message
 }
@@ -215,6 +275,14 @@ func (err *StoreCompatibilityError) Unwrap() error {
 
 func (err *StoreCompatibilityError) Is(target error) bool {
 	return err != nil && target == ErrStoreIncompatible && err.Status == StoreCompatibilityIncompatible
+}
+
+func storeCompatibilityJSONDiagnostic(name string, value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "s3disk." + name + "{redacted}"
+	}
+	return "s3disk." + name + "(" + string(encoded) + ")"
 }
 
 type compatibilityRecorder struct {

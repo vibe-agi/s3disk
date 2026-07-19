@@ -13,10 +13,135 @@ import (
 	"github.com/vibe-agi/s3disk/memstore"
 )
 
+type reportHostileCause struct {
+	diagnostic string
+}
+
+func (cause *reportHostileCause) Error() string { return cause.diagnostic }
+
+func (cause *reportHostileCause) Unwrap() error { return s3disk.ErrStoreUnavailable }
+
+func (cause *reportHostileCause) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Diagnostic string `json:"diagnostic"`
+	}{Diagnostic: cause.diagnostic})
+}
+
 func TestPreReleaseCompatibilityContractRemainsVersionOne(t *testing.T) {
 	t.Parallel()
 	if s3disk.StoreCompatibilityContractVersion != 1 {
 		t.Fatalf("pre-release compatibility contract version = %d, want 1; refine v1 until the first public release", s3disk.StoreCompatibilityContractVersion)
+	}
+	if s3disk.StoreCompatibilityRequiredChecks != 31 {
+		t.Fatalf("required compatibility checks = %d, want 31", s3disk.StoreCompatibilityRequiredChecks)
+	}
+}
+
+func TestStoreCompatibilityDiagnosticsRedactHostileCauses(t *testing.T) {
+	t.Parallel()
+	const (
+		hostileEndpoint  = "https://secret-endpoint.example.invalid/private-object"
+		hostileAccessKey = "HOSTILE-ACCESS-KEY-DO-NOT-LOG"
+		hostileSignature = "HOSTILE-SIGNATURE-DO-NOT-LOG"
+		hostileSecret    = "HOSTILE-SDK-SECRET-DO-NOT-LOG"
+	)
+	hostileDiagnostic := hostileEndpoint +
+		"?X-Amz-Credential=" + hostileAccessKey +
+		"&X-Amz-Signature=" + hostileSignature +
+		"&secret=" + hostileSecret
+	cause := &reportHostileCause{diagnostic: hostileDiagnostic}
+	check := s3disk.StoreCompatibilityCheck{
+		ID:      s3disk.StoreCompatibilityCheckMissingObjectMapping,
+		Status:  s3disk.StoreCompatibilityIndeterminate,
+		Reason:  s3disk.StoreCompatibilityReasonStoreUnavailable,
+		Summary: "verify missing-object behavior",
+		Detail:  "provider operation failed",
+		Hint:    "retry against the commissioned endpoint",
+		Cause:   cause,
+	}
+	cleanup := s3disk.StoreCompatibilityCleanupReport{
+		Status:                  s3disk.StoreCompatibilityCleanupFailed,
+		Reason:                  s3disk.StoreCompatibilityCleanupReasonStoreUnavailable,
+		Detail:                  "cleanup could not be verified",
+		Attempted:               1,
+		Failed:                  1,
+		VerificationFailures:    1,
+		CurrentObjectsMayRemain: true,
+		Cause:                   cause,
+	}
+	report := s3disk.StoreCompatibilityReport{
+		ContractVersion: s3disk.StoreCompatibilityContractVersion,
+		Scope:           s3disk.StoreCompatibilitySingleClientFiniteProbe,
+		Status:          s3disk.StoreCompatibilityIndeterminate,
+		RequiredChecks:  s3disk.StoreCompatibilityRequiredChecks,
+		Checks:          []s3disk.StoreCompatibilityCheck{check},
+		Cleanup:         cleanup,
+	}
+	compatibilityErr := &s3disk.StoreCompatibilityError{
+		CheckID: check.ID,
+		Status:  check.Status,
+		Reason:  check.Reason,
+		Detail:  check.Detail,
+		Hint:    check.Hint,
+		Cause:   cause,
+	}
+
+	values := []any{
+		check, &check,
+		cleanup, &cleanup,
+		report, &report,
+		compatibilityErr, *compatibilityErr,
+	}
+	for _, value := range values {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", value, err)
+		}
+		for _, diagnostic := range []string{
+			fmt.Sprintf("%v", value),
+			fmt.Sprintf("%+v", value),
+			fmt.Sprintf("%#v", value),
+			string(encoded),
+		} {
+			for _, secret := range []string{
+				hostileEndpoint,
+				hostileAccessKey,
+				hostileSignature,
+				hostileSecret,
+				"X-Amz-Credential",
+				"X-Amz-Signature",
+			} {
+				if strings.Contains(diagnostic, secret) {
+					t.Fatalf("%T diagnostic leaked %q: %s", value, secret, diagnostic)
+				}
+			}
+		}
+	}
+
+	if !strings.Contains(compatibilityErr.Error(), "cause redacted") ||
+		!strings.Contains(fmt.Sprintf("%#v", compatibilityErr), "cause redacted") {
+		t.Fatalf("compatibility error did not disclose that its cause was redacted: %v", compatibilityErr)
+	}
+	encodedError, err := json.Marshal(compatibilityErr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stable := range []string{
+		`"check_id":"missing-object-error-mapping"`,
+		`"status":"indeterminate"`,
+		`"reason":"store_unavailable"`,
+		`"cause_present":true`,
+	} {
+		if !strings.Contains(string(encodedError), stable) {
+			t.Fatalf("compatibility error JSON omitted stable field %s: %s", stable, encodedError)
+		}
+	}
+	if !errors.Is(compatibilityErr, cause) || !errors.Is(compatibilityErr, s3disk.ErrStoreUnavailable) {
+		t.Fatalf("redaction broke errors.Is traversal: %v", compatibilityErr)
+	}
+	var retained *reportHostileCause
+	if !errors.As(compatibilityErr, &retained) || retained != cause {
+		t.Fatalf("redaction broke errors.As traversal: got %p, want %p", retained, cause)
 	}
 }
 
@@ -31,6 +156,9 @@ func TestStoreCompatibilityReportSuccessAndCleanup(t *testing.T) {
 	}
 	if report.ContractVersion != s3disk.StoreCompatibilityContractVersion {
 		t.Fatalf("ContractVersion = %d, want %d", report.ContractVersion, s3disk.StoreCompatibilityContractVersion)
+	}
+	if report.RequiredChecks != s3disk.StoreCompatibilityRequiredChecks {
+		t.Fatalf("RequiredChecks = %d, want exported contract value %d", report.RequiredChecks, s3disk.StoreCompatibilityRequiredChecks)
 	}
 	if report.Scope != s3disk.StoreCompatibilitySingleClientFiniteProbe {
 		t.Fatalf("Scope = %q, want single-client finite probe", report.Scope)
