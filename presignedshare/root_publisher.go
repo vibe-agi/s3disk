@@ -335,13 +335,19 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 		return publisher.publishRecoverable(ctx, closure, allowCreate)
 	}
 
-	var hadAmbiguousWrite bool
+	var ambiguousWriteClass error
 	for attempt := 0; attempt < publisher.maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
+			}
 			return RootPublication{}, err
 		}
 		currentObject, currentBundle, found, err := publisher.load(ctx)
 		if err != nil {
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
+			}
 			return RootPublication{}, err
 		}
 		if !found && !allowCreate {
@@ -398,16 +404,20 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 		} else {
 			version, err = publisher.store.PutIfAbsent(ctx, publisher.rootKey, target)
 		}
-		if err == nil {
-			if err := validateRootVersion(version); err != nil {
-				return RootPublication{}, err
-			}
+		writeErr := err
+		if writeErr == nil {
+			writeErr = validateRootVersion(version)
+		}
+		if writeErr == nil {
 			return RootPublication{Revision: revision, Snapshot: closure.Snapshot, Version: version, Updated: true}, nil
 		}
-		if errors.Is(err, s3disk.ErrPrecondition) {
+		if errors.Is(writeErr, s3disk.ErrPrecondition) {
 			continue
 		}
-		hadAmbiguousWrite = true
+		// Even an err=nil response is ambiguous when its Version is invalid: the
+		// conditional write may already be current. Retain only the bounded Store
+		// classification and immediately reconcile through an authenticated GET.
+		ambiguousWriteClass = errors.Join(ambiguousWriteClass, safeRootStoreError(writeErr))
 		observed, _, observedFound, observeErr := publisher.load(ctx)
 		if observeErr == nil && observedFound {
 			if bytes.Equal(observed.Data, target) {
@@ -421,13 +431,13 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 			// CAS loop from that exact observation.
 			continue
 		}
-		if observeErr != nil && (errors.Is(observeErr, context.Canceled) || errors.Is(observeErr, context.DeadlineExceeded)) {
-			return RootPublication{}, fmt.Errorf("%w: reconciliation canceled: %w", ErrRootPublishIndeterminate, observeErr)
+		if observeErr != nil {
+			return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, observeErr)
 		}
-		return RootPublication{}, ErrRootPublishIndeterminate
+		return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass)
 	}
-	if hadAmbiguousWrite {
-		return RootPublication{}, ErrRootPublishIndeterminate
+	if ambiguousWriteClass != nil {
+		return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass)
 	}
 	return RootPublication{}, ErrRootPublishConflict
 }
@@ -488,6 +498,7 @@ func safeRootStoreError(err error) error {
 		context.Canceled, context.DeadlineExceeded, s3disk.ErrObjectNotFound,
 		s3disk.ErrNotModified, s3disk.ErrPrecondition, s3disk.ErrAccessDenied,
 		s3disk.ErrRateLimited, s3disk.ErrStoreUnavailable, s3disk.ErrStoreMisconfigured,
+		s3disk.ErrBucketNotFound,
 		s3disk.ErrStoreIncompatible, s3disk.ErrStoreOperationUnsupported,
 		s3disk.ErrResourceLimit, s3disk.ErrCorruptObject,
 	} {
@@ -496,4 +507,17 @@ func safeRootStoreError(err error) error {
 		}
 	}
 	return s3disk.ErrStoreUnavailable
+}
+
+// rootPublishIndeterminateError joins only already-sanitized write
+// classifications with trusted reconciliation errors. In particular, callers
+// must never pass a provider's raw conditional-write error as a cause.
+func rootPublishIndeterminateError(ambiguousWriteClass error, causes ...error) error {
+	joined := make([]error, 0, 2+len(causes))
+	joined = append(joined, ErrRootPublishIndeterminate)
+	if ambiguousWriteClass != nil {
+		joined = append(joined, ambiguousWriteClass)
+	}
+	joined = append(joined, causes...)
+	return errors.Join(joined...)
 }

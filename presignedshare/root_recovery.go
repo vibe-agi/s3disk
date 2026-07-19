@@ -901,12 +901,18 @@ func (publisher *RootPublisher) recoverPending(ctx context.Context) (RootRecover
 
 	hadPending := recovery.record.Pending != nil
 	var writeAttempts int
-	var hadAmbiguousWrite bool
+	var ambiguousWriteClass error
 	for {
 		if err := ctx.Err(); err != nil {
+			if ambiguousWriteClass != nil {
+				return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
+			}
 			return RootRecoveryResult{}, err
 		}
 		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			if ambiguousWriteClass != nil {
+				return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, s3disk.ErrAccessDenied)
+			}
 			return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
 		}
 
@@ -943,15 +949,15 @@ func (publisher *RootPublisher) recoverPending(ctx context.Context) (RootRecover
 		pending := *recovery.record.Pending
 		observed, found, err := publisher.loadRootForRecovery(ctx)
 		if err != nil {
-			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, err)
+			return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
 		}
 		if err := ctx.Err(); err != nil {
 			observed.clear()
-			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, err)
+			return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
 		}
 		if !publisher.rootCapability.expiresAt.After(time.Now()) {
 			observed.clear()
-			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, s3disk.ErrAccessDenied)
+			return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, s3disk.ErrAccessDenied)
 		}
 		if found && bytes.Equal(observed.raw, recovery.target) {
 			anchored, err := publisher.anchorRootObservation(ctx, recovery, observed)
@@ -1030,15 +1036,21 @@ func (publisher *RootPublisher) recoverPending(ctx context.Context) (RootRecover
 		}
 
 		if writeAttempts >= publisher.maxAttempts {
-			if hadAmbiguousWrite {
-				return RootRecoveryResult{}, ErrRootPublishIndeterminate
+			if ambiguousWriteClass != nil {
+				return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass)
 			}
 			return RootRecoveryResult{}, ErrRootPublishConflict
 		}
 		if err := ctx.Err(); err != nil {
+			if ambiguousWriteClass != nil {
+				return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
+			}
 			return RootRecoveryResult{}, err
 		}
 		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			if ambiguousWriteClass != nil {
+				return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, s3disk.ErrAccessDenied)
+			}
 			return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
 		}
 		writeAttempts++
@@ -1048,10 +1060,11 @@ func (publisher *RootPublisher) recoverPending(ctx context.Context) (RootRecover
 		} else {
 			version, err = publisher.store.CompareAndSwap(ctx, publisher.rootKey, pending.expectedVersion(), recovery.target)
 		}
-		if err == nil {
-			if err := validateRootVersion(version); err != nil {
-				return RootRecoveryResult{}, err
-			}
+		writeErr := err
+		if writeErr == nil {
+			writeErr = validateRootVersion(version)
+		}
+		if writeErr == nil {
 			applied := rootRecoveryObserved{
 				version: version, bundle: targetBundle, logicalDigest: pending.LogicalTargetDigest,
 			}
@@ -1063,15 +1076,15 @@ func (publisher *RootPublisher) recoverPending(ctx context.Context) (RootRecover
 			replaceLoadedRootRecovery(&recovery, anchored)
 			return result, nil
 		}
-		if errors.Is(err, s3disk.ErrPrecondition) {
+		if errors.Is(writeErr, s3disk.ErrPrecondition) {
 			continue
 		}
-		hadAmbiguousWrite = true
-		if errors.Is(err, context.Canceled) {
-			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, context.Canceled)
+		ambiguousWriteClass = errors.Join(ambiguousWriteClass, safeRootStoreError(writeErr))
+		if errors.Is(writeErr, context.Canceled) {
+			return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, context.Canceled)
 		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, context.DeadlineExceeded)
+		if errors.Is(writeErr, context.DeadlineExceeded) {
+			return RootRecoveryResult{}, rootPublishIndeterminateError(ambiguousWriteClass, context.DeadlineExceeded)
 		}
 	}
 }
@@ -1110,12 +1123,18 @@ func (publisher *RootPublisher) publishRecoverable(
 	defer func() { recovery.clear() }()
 
 	var writeAttempts int
-	var hadAmbiguousWrite bool
+	var ambiguousWriteClass error
 	for {
 		if err := ctx.Err(); err != nil {
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
+			}
 			return RootPublication{}, err
 		}
 		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, s3disk.ErrAccessDenied)
+			}
 			return RootPublication{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
 		}
 
@@ -1221,7 +1240,7 @@ func (publisher *RootPublisher) publishRecoverable(
 		pending := recovery.record.Pending
 		observed, found, err := publisher.loadRootForRecovery(ctx)
 		if err != nil {
-			return RootPublication{}, errors.Join(ErrRootPublishIndeterminate, err)
+			return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
 		}
 		if found && bytes.Equal(observed.raw, recovery.target) {
 			anchored, err := publisher.anchorRootObservation(ctx, recovery, observed)
@@ -1341,15 +1360,21 @@ func (publisher *RootPublisher) publishRecoverable(
 		}
 
 		if writeAttempts >= publisher.maxAttempts {
-			if hadAmbiguousWrite {
-				return RootPublication{}, ErrRootPublishIndeterminate
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass)
 			}
 			return RootPublication{}, ErrRootPublishConflict
 		}
 		if err := ctx.Err(); err != nil {
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, err)
+			}
 			return RootPublication{}, err
 		}
 		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			if ambiguousWriteClass != nil {
+				return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, s3disk.ErrAccessDenied)
+			}
 			return RootPublication{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
 		}
 		writeAttempts++
@@ -1359,10 +1384,11 @@ func (publisher *RootPublisher) publishRecoverable(
 		} else {
 			version, err = publisher.store.CompareAndSwap(ctx, publisher.rootKey, pending.expectedVersion(), recovery.target)
 		}
-		if err == nil {
-			if err := validateRootVersion(version); err != nil {
-				return RootPublication{}, err
-			}
+		writeErr := err
+		if writeErr == nil {
+			writeErr = validateRootVersion(version)
+		}
+		if writeErr == nil {
 			applied := rootRecoveryObserved{
 				version: version, bundle: targetBundle, logicalDigest: pending.LogicalTargetDigest,
 			}
@@ -1376,15 +1402,15 @@ func (publisher *RootPublisher) publishRecoverable(
 				Version: version, Updated: true,
 			}, nil
 		}
-		if errors.Is(err, s3disk.ErrPrecondition) {
+		if errors.Is(writeErr, s3disk.ErrPrecondition) {
 			continue
 		}
-		hadAmbiguousWrite = true
-		if errors.Is(err, context.Canceled) {
-			return RootPublication{}, errors.Join(ErrRootPublishIndeterminate, context.Canceled)
+		ambiguousWriteClass = errors.Join(ambiguousWriteClass, safeRootStoreError(writeErr))
+		if errors.Is(writeErr, context.Canceled) {
+			return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, context.Canceled)
 		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return RootPublication{}, errors.Join(ErrRootPublishIndeterminate, context.DeadlineExceeded)
+		if errors.Is(writeErr, context.DeadlineExceeded) {
+			return RootPublication{}, rootPublishIndeterminateError(ambiguousWriteClass, context.DeadlineExceeded)
 		}
 	}
 }

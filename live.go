@@ -16,17 +16,32 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const maxWatchDirectories = 100_000
+const (
+	maxWatchDirectories                       = 100_000
+	defaultAfterPublishedRetryInterval        = time.Second
+	defaultAfterPublishedRetryMaximumInterval = 30 * time.Second
+)
 
 // WatchOptions controls Publisher.Watch.
 type WatchOptions struct {
 	Debounce          time.Duration
 	ReconcileInterval time.Duration
+	// AfterPublishedRetryInterval and AfterPublishedRetryMaxInterval bound an
+	// independent exponential retry loop for a failed AfterPublished call. This
+	// exact-snapshot retry does not wait for another filesystem event or the full
+	// reconciliation ticker. Zero values select one second and 30 seconds.
+	AfterPublishedRetryInterval    time.Duration
+	AfterPublishedRetryMaxInterval time.Duration
+	// AfterPublishedRetryBackoffFactor defaults to 2 and is limited to [1, 10].
+	AfterPublishedRetryBackoffFactor float64
+	// AfterPublishedRetryJitterFraction defaults to 0.10 and is limited to 1.
+	// A negative value disables jitter for deterministic tests.
+	AfterPublishedRetryJitterFraction float64
 	// AfterPublished is called synchronously after the repository publication
 	// succeeds, but before Watch accepts that generation and calls OnPublished.
 	// Returning an error rejects only the watch acknowledgement: the repository
-	// publication remains committed, OnError reports the failure, and a later
-	// reconciliation retries AfterPublished for the same generation.
+	// publication remains committed, OnError reports the failure, and the
+	// independent bounded retry loop retries the exact same generation.
 	//
 	// AfterPublished runs in the publication worker while OnPublished and OnError
 	// run in the watch loop. A later generation's hook can therefore overlap an
@@ -35,6 +50,42 @@ type WatchOptions struct {
 	AfterPublished func(ctx context.Context, snapshot Snapshot) error
 	OnPublished    func(Snapshot)
 	OnError        func(error)
+}
+
+// Validate checks WatchOptions without creating a filesystem watcher. Zero
+// values select defaults; a negative ReconcileInterval disables the periodic
+// full-tree fallback, but never disables exact AfterPublished retries.
+func (options WatchOptions) Validate() error {
+	if options.Debounce < 0 {
+		return fmt.Errorf("s3disk: debounce must not be negative")
+	}
+	interval := options.AfterPublishedRetryInterval
+	if interval == 0 {
+		interval = defaultAfterPublishedRetryInterval
+	}
+	maximum := options.AfterPublishedRetryMaxInterval
+	if maximum == 0 {
+		maximum = defaultAfterPublishedRetryMaximumInterval
+	}
+	factor := options.AfterPublishedRetryBackoffFactor
+	if factor == 0 {
+		factor = 2
+	}
+	if interval < 0 {
+		return fmt.Errorf("s3disk: AfterPublished retry interval must be positive")
+	}
+	if maximum < interval {
+		return fmt.Errorf("s3disk: maximum AfterPublished retry interval must be at least the base interval")
+	}
+	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 1 || factor > 10 {
+		return fmt.Errorf("s3disk: AfterPublished retry backoff factor must be finite and between 1 and 10")
+	}
+	if math.IsNaN(options.AfterPublishedRetryJitterFraction) ||
+		math.IsInf(options.AfterPublishedRetryJitterFraction, 0) ||
+		options.AfterPublishedRetryJitterFraction > 1 {
+		return fmt.Errorf("s3disk: AfterPublished retry jitter fraction must be finite and at most 1")
+	}
+	return nil
 }
 
 // Watch recursively observes a source tree, coalesces bursts, and publishes
@@ -91,14 +142,29 @@ func (publisher *Publisher) watch(
 	if publish == nil {
 		return fmt.Errorf("s3disk: watch publisher is not configured")
 	}
+	if err := options.Validate(); err != nil {
+		return err
+	}
 	if options.Debounce == 0 {
 		options.Debounce = 250 * time.Millisecond
 	}
-	if options.Debounce < 0 {
-		return fmt.Errorf("s3disk: debounce must not be negative")
-	}
 	if options.ReconcileInterval == 0 {
 		options.ReconcileInterval = 5 * time.Minute
+	}
+	if options.AfterPublishedRetryInterval == 0 {
+		options.AfterPublishedRetryInterval = defaultAfterPublishedRetryInterval
+	}
+	if options.AfterPublishedRetryMaxInterval == 0 {
+		options.AfterPublishedRetryMaxInterval = defaultAfterPublishedRetryMaximumInterval
+	}
+	if options.AfterPublishedRetryBackoffFactor == 0 {
+		options.AfterPublishedRetryBackoffFactor = 2
+	}
+	if options.AfterPublishedRetryJitterFraction == 0 {
+		options.AfterPublishedRetryJitterFraction = 0.10
+	}
+	if options.AfterPublishedRetryJitterFraction < 0 {
+		options.AfterPublishedRetryJitterFraction = 0
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -126,35 +192,108 @@ func (publisher *Publisher) watch(
 		defer close(workerDone)
 		var lastAcknowledged uint64
 		var pendingAfterPublished *Snapshot
+		retryDelayBase := options.AfterPublishedRetryInterval
+		var retryTimer *time.Timer
+		var retryChannel <-chan time.Time
+		stopRetryTimer := func() {
+			if retryTimer != nil && !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			retryChannel = nil
+		}
+		defer stopRetryTimer()
+		resetRetryBackoff := func() {
+			stopRetryTimer()
+			retryDelayBase = options.AfterPublishedRetryInterval
+		}
+		scheduleAfterPublishedRetry := func() {
+			stopRetryTimer()
+			delay := jitterDuration(retryDelayBase, options.AfterPublishedRetryJitterFraction)
+			if delay > options.AfterPublishedRetryMaxInterval {
+				delay = options.AfterPublishedRetryMaxInterval
+			}
+			if retryTimer == nil {
+				retryTimer = time.NewTimer(delay)
+			} else {
+				retryTimer.Reset(delay)
+			}
+			retryChannel = retryTimer.C
+			if retryDelayBase < options.AfterPublishedRetryMaxInterval {
+				retryDelayBase = nextBackoffDuration(
+					retryDelayBase,
+					options.AfterPublishedRetryMaxInterval,
+					options.AfterPublishedRetryBackoffFactor,
+				)
+			}
+		}
+		sendResult := func(result publishResult) bool {
+			select {
+			case results <- result:
+				return true
+			case <-workerCtx.Done():
+				return false
+			}
+		}
+		retryAfterPublished := func() bool {
+			retryChannel = nil
+			if pendingAfterPublished == nil {
+				resetRetryBackoff()
+				return true
+			}
+			snapshot := *pendingAfterPublished
+			err := invokeWatchAfterPublished(workerCtx, options, snapshot)
+			reconcile := false
+			if err == nil {
+				lastAcknowledged = snapshot.Generation
+				pendingAfterPublished = nil
+				resetRetryBackoff()
+				// Always scan once after the barrier opens. Source events may
+				// have been coalesced or consumed while exact generation N was
+				// waiting for its hook retry.
+				reconcile = true
+			} else {
+				scheduleAfterPublishedRetry()
+			}
+			return sendResult(publishResult{snapshot: snapshot, err: err, reconcile: reconcile})
+		}
 		for {
+			if workerCtx.Err() != nil {
+				return
+			}
+			// Once the timer is ready, service it ahead of a continuously
+			// refilled request channel. At most one request can race with timer
+			// readiness, so filesystem churn cannot probabilistically starve the
+			// exact-generation retry.
+			if pendingAfterPublished != nil && retryChannel != nil {
+				select {
+				case <-retryChannel:
+					if !retryAfterPublished() {
+						return
+					}
+					continue
+				default:
+				}
+			}
 			select {
 			case <-workerCtx.Done():
 				return
+			case <-retryChannel:
+				if !retryAfterPublished() {
+					return
+				}
 			case _, ok := <-requests:
 				if !ok {
 					return
 				}
 				// A repository generation which has not passed AfterPublished is
-				// a publication barrier. Retry that exact snapshot before scanning
+				// a publication barrier. Requests received during its bounded retry
+				// delay are coalesced rather than bypassing the backoff or scanning
 				// and committing a later generation; otherwise a root recovery WAL
 				// can retain Pending(N) while the repository advances to N+1.
 				if pendingAfterPublished != nil {
-					snapshot := *pendingAfterPublished
-					err := invokeWatchAfterPublished(workerCtx, options, snapshot)
-					reconcile := false
-					if err == nil {
-						lastAcknowledged = snapshot.Generation
-						pendingAfterPublished = nil
-						// Reconcile source changes which accumulated behind the
-						// barrier without requiring another filesystem event. The
-						// watch loop remains the only requests sender.
-						reconcile = true
-					}
-					select {
-					case results <- publishResult{snapshot: snapshot, err: err, reconcile: reconcile}:
-					case <-workerCtx.Done():
-						return
-					}
 					continue
 				}
 				snapshot, err := publish(workerCtx)
@@ -162,14 +301,14 @@ func (publisher *Publisher) watch(
 					err = invokeWatchAfterPublished(workerCtx, options, snapshot)
 					if err == nil {
 						lastAcknowledged = snapshot.Generation
+						resetRetryBackoff()
 					} else {
 						pending := snapshot
 						pendingAfterPublished = &pending
+						scheduleAfterPublishedRetry()
 					}
 				}
-				select {
-				case results <- publishResult{snapshot: snapshot, err: err}:
-				case <-workerCtx.Done():
+				if !sendResult(publishResult{snapshot: snapshot, err: err}) {
 					return
 				}
 			}
@@ -257,7 +396,7 @@ func (publisher *Publisher) watch(
 					resetDebounce()
 					continue
 				} else {
-					reportWatchError(options, rebuildErr)
+					reportWatchError(ctx, options, rebuildErr)
 				}
 			}
 			if event.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
@@ -268,12 +407,12 @@ func (publisher *Publisher) watch(
 				realDirectory := statErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
 				if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && !realDirectory {
 					if removeErr := watchTree.Remove(event.Name); removeErr != nil {
-						reportWatchError(options, removeErr)
+						reportWatchError(ctx, options, removeErr)
 					}
 				}
 				if realDirectory {
 					if addErr := watchTree.Add(ctx, event.Name); addErr != nil {
-						reportWatchError(options, addErr)
+						reportWatchError(ctx, options, addErr)
 					}
 				}
 			}
@@ -285,7 +424,7 @@ func (publisher *Publisher) watch(
 				watchErrors = nil
 				continue
 			}
-			reportWatchError(options, fmt.Errorf("filesystem watcher: %w", err))
+			reportWatchError(ctx, options, fmt.Errorf("filesystem watcher: %w", err))
 			// Overflow and transient watcher failures are repaired by a full
 			// reconciliation rather than trusted as authoritative state.
 			requestPublish()
@@ -301,12 +440,12 @@ func (publisher *Publisher) watch(
 				return err
 			}
 			if result.err != nil {
-				reportWatchError(options, result.err)
+				reportWatchError(ctx, options, result.err)
 				continue
 			}
 			if result.snapshot.Generation > lastPublished {
 				lastPublished = result.snapshot.Generation
-				invokeWatchPublished(options, result.snapshot)
+				invokeWatchPublished(ctx, options, result.snapshot)
 			}
 			if result.reconcile {
 				requestPublish()
@@ -553,8 +692,8 @@ func (tree *boundedWatchTree) Remove(rootPath string) error {
 	return firstErr
 }
 
-func reportWatchError(options WatchOptions, err error) {
-	if options.OnError != nil && err != nil && !errors.Is(err, context.Canceled) {
+func reportWatchError(ctx context.Context, options WatchOptions, err error) {
+	if options.OnError != nil && err != nil && (ctx == nil || ctx.Err() == nil) {
 		func() {
 			defer func() { _ = recover() }()
 			options.OnError(err)
@@ -580,13 +719,13 @@ func invokeWatchAfterPublished(ctx context.Context, options WatchOptions, snapsh
 	return ctx.Err()
 }
 
-func invokeWatchPublished(options WatchOptions, snapshot Snapshot) {
+func invokeWatchPublished(ctx context.Context, options WatchOptions, snapshot Snapshot) {
 	if options.OnPublished == nil {
 		return
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			reportWatchError(options, fmt.Errorf("s3disk: OnPublished callback panic: %v", recovered))
+			reportWatchError(ctx, options, fmt.Errorf("s3disk: OnPublished callback panic: %v", recovered))
 		}
 	}()
 	options.OnPublished(snapshot)
@@ -676,11 +815,7 @@ func (consumer *Consumer) Poll(ctx context.Context, options PollOptions) error {
 		}
 		delay := jitterDuration(delayBase, options.JitterFraction)
 		if err != nil && delayBase < options.MaxInterval {
-			next := time.Duration(float64(delayBase) * options.BackoffFactor)
-			if next <= delayBase || next > options.MaxInterval {
-				next = options.MaxInterval
-			}
-			delayBase = next
+			delayBase = nextBackoffDuration(delayBase, options.MaxInterval, options.BackoffFactor)
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -743,4 +878,24 @@ func scaleDurationSaturated(duration time.Duration, factor float64) time.Duratio
 		return 0
 	}
 	return time.Duration(scaled)
+}
+
+// nextBackoffDuration advances a retry interval without allowing floating-point
+// rounding to jump a sub-nanosecond increase straight to the maximum. A factor
+// of one intentionally keeps a fixed retry interval.
+func nextBackoffDuration(current, maximum time.Duration, factor float64) time.Duration {
+	if current >= maximum {
+		return maximum
+	}
+	if factor <= 1 {
+		return current
+	}
+	next := scaleDurationSaturated(current, factor)
+	if next <= current {
+		next = current + 1
+	}
+	if next > maximum {
+		return maximum
+	}
+	return next
 }

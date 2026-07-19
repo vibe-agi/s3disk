@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -116,6 +117,20 @@ func TestRootPublisherPublishedSnapshotRejectsIncompleteIdentityBeforeStoreIO(t 
 	stats := fixture.store.Stats()
 	if stats.Gets != 0 || stats.Puts != 0 || stats.Heads != 0 || stats.BytesRead != 0 || stats.BytesWritten != 0 {
 		t.Fatalf("incomplete snapshot performed Store I/O: %+v", stats)
+	}
+}
+
+func TestSafePublishedSnapshotErrorPreservesMissingBucketWithoutProviderDetails(t *testing.T) {
+	const secret = "https://provider.invalid/bucket?X-Amz-Signature=resolve-secret"
+	err := safePublishedSnapshotError(fmt.Errorf("provider rejected %s: %w", secret, s3disk.ErrBucketNotFound))
+	if !errors.Is(err, s3disk.ErrBucketNotFound) {
+		t.Fatalf("safe published-snapshot error = %v, want ErrBucketNotFound", err)
+	}
+	if errors.Is(err, s3disk.ErrStoreUnavailable) {
+		t.Fatalf("missing bucket was degraded to a transient Store error: %v", err)
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "resolve-secret") {
+		t.Fatalf("safe published-snapshot error leaked provider detail: %v", err)
 	}
 }
 

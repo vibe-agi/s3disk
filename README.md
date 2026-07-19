@@ -287,7 +287,10 @@ For an expiring selected share, bind the result of `PublishSelected` with
 `RootPublisher.UpdatePublishedSnapshot` inside `WatchOptions.AfterPublished` so
 a generation is not acknowledged until its exact authenticated closure has
 been installed at the S3 root. A failed hook is retried for that generation by
-periodic reconciliation. This safe automatic path resolves only the signed
+an independent bounded exponential backoff whose default base grows from one
+second to a 30-second cap with jitter, without waiting for another source event
+or the five-minute full reconciliation. Source changes remain behind that
+exact-generation barrier. This safe automatic path resolves only the signed
 reference namespace and checks the complete Publisher-returned snapshot
 identity before minting capabilities.
 
@@ -303,6 +306,11 @@ presigner; creating the next root still requires both. Every operation remains
 locally deadline-bounded by the share's original fixed authorization expiry and
 cannot extend it. A write already in flight at that boundary may still commit
 remotely and is reconciled from the exact pending WAL target.
+Likewise, a conditional write which reports success with an invalid Store
+version is treated as potentially applied and reconciled immediately. If it
+cannot be resolved, the error matches both `ErrRootPublishIndeterminate` and a
+sanitized Store classification such as `ErrStoreIncompatible` or
+`ErrAccessDenied`; provider response details are not propagated.
 
 If the surrounding application also persists A's share session, call
 `RootPublisher.PrepareRecovery` before marking that session resumable or

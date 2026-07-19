@@ -103,6 +103,7 @@ func safePublishedSnapshotError(err error) error {
 		s3disk.ErrRateLimited,
 		s3disk.ErrStoreUnavailable,
 		s3disk.ErrStoreMisconfigured,
+		s3disk.ErrBucketNotFound,
 		s3disk.ErrStoreIncompatible,
 		s3disk.ErrStoreOperationUnsupported,
 		s3disk.ErrResourceLimit,

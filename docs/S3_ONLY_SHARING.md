@@ -47,10 +47,12 @@ For the automatic A-side chain, pass the `Snapshot` returned by
 `RootPublisher.CreatePublishedSnapshot`. For continuous publication, call
 `RootPublisher.UpdatePublishedSnapshot` from `WatchOptions.AfterPublished`.
 That hook is acknowledged only after the root update succeeds; failure is
-reported and the same generation is retried by reconciliation. The helper
-re-resolves `signed-refs/v1` with the configured verifier and requires the
-generation, commit, root digest, and publication time to equal the Publisher
-result before it can mint any object capabilities.
+reported and the same generation is retried independently with bounded
+exponential backoff. Filesystem events are coalesced behind this barrier and
+cannot advance N+1 before N succeeds; periodic full reconciliation remains the
+lost-event fallback. The helper re-resolves `signed-refs/v1` with the configured
+verifier and requires the generation, commit, root digest, and publication time
+to equal the Publisher result before it can mint any object capabilities.
 
 A production library composition gives
 `RootPublisherConfig.RecoveryJournal` a confidential, authenticated,

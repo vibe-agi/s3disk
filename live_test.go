@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -241,8 +243,12 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	source := privateTestDirectory(t)
 	writeFile(t, filepath.Join(source, "data"), []byte("unchanged"))
 
+	type hookObservation struct {
+		snapshot s3disk.Snapshot
+		at       time.Time
+	}
 	injected := errors.New("injected acknowledgement failure")
-	hookCalls := make(chan s3disk.Snapshot, 4)
+	hookCalls := make(chan hookObservation, 4)
 	releaseRetry := make(chan struct{})
 	published := make(chan s3disk.Snapshot, 2)
 	watchErrors := make(chan error, 4)
@@ -250,11 +256,17 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	go func() {
 		calls := 0
 		watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
-			Debounce:          time.Millisecond,
-			ReconcileInterval: -1,
+			Debounce: time.Millisecond,
+			// Continuously refill publication requests while generation 1 is
+			// pending. A ready retry timer must still win without allowing a
+			// later source state to cross the acknowledgement barrier.
+			ReconcileInterval:                 time.Millisecond,
+			AfterPublishedRetryInterval:       40 * time.Millisecond,
+			AfterPublishedRetryMaxInterval:    40 * time.Millisecond,
+			AfterPublishedRetryJitterFraction: -1,
 			AfterPublished: func(hookCtx context.Context, snapshot s3disk.Snapshot) error {
 				calls++
-				hookCalls <- snapshot
+				hookCalls <- hookObservation{snapshot: snapshot, at: time.Now()}
 				if calls == 1 {
 					return injected
 				}
@@ -270,7 +282,18 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 		})
 	}()
 
-	first := waitWatchSnapshot(t, hookCalls, "first AfterPublished call")
+	waitHook := func(label string) hookObservation {
+		t.Helper()
+		select {
+		case observation := <-hookCalls:
+			return observation
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", label)
+			return hookObservation{}
+		}
+	}
+	firstCall := waitHook("first AfterPublished call")
+	first := firstCall.snapshot
 	select {
 	case err := <-watchErrors:
 		if !errors.Is(err, injected) {
@@ -283,7 +306,11 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	// root-share composition this prevents publication N+1 from overtaking a
 	// durable root-WAL Pending(N).
 	writeFile(t, filepath.Join(source, "data"), []byte("changed behind failed hook"))
-	second := waitWatchSnapshot(t, hookCalls, "retried AfterPublished call")
+	secondCall := waitHook("retried AfterPublished call")
+	second := secondCall.snapshot
+	if gap := secondCall.at.Sub(firstCall.at); gap < 20*time.Millisecond {
+		t.Fatalf("filesystem event bypassed AfterPublished retry backoff: gap=%v", gap)
+	}
 	if first.Generation != 1 || second.Generation != first.Generation || second.Commit != first.Commit {
 		t.Fatalf("hook snapshots = (%+v, %+v), want the same first publication", first, second)
 	}
@@ -297,7 +324,7 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	if accepted.Generation != first.Generation || accepted.Commit != first.Commit {
 		t.Fatalf("accepted snapshot = %+v, want %+v", accepted, first)
 	}
-	advanced := waitWatchSnapshot(t, hookCalls, "AfterPublished for accumulated source change")
+	advanced := waitHook("AfterPublished for accumulated source change").snapshot
 	if advanced.Generation != first.Generation+1 || advanced.Commit == first.Commit {
 		t.Fatalf("advanced hook snapshot = %+v, want generation %d after %+v", advanced, first.Generation+1, first)
 	}
@@ -316,6 +343,333 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	cancel()
 	if err := <-watchDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("watch stopped with %v", err)
+	}
+}
+
+func TestPublisherWatchRetriesAfterPublishedIndependentlyWithBoundedBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repository, err := s3disk.NewRepository(memstore.New(), "watch-after-published-independent-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := privateTestDirectory(t)
+	writeFile(t, filepath.Join(source, "data"), []byte("no filesystem event after initial publish"))
+
+	type hookObservation struct {
+		snapshot s3disk.Snapshot
+		at       time.Time
+	}
+	injected := errors.New("injected independent acknowledgement failure")
+	hookCalls := make(chan hookObservation, 5)
+	published := make(chan s3disk.Snapshot, 1)
+	watchErrors := make(chan error, 5)
+	watchDone := make(chan error, 1)
+	go func() {
+		calls := 0
+		watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
+			ReconcileInterval:                 -1,
+			AfterPublishedRetryInterval:       15 * time.Millisecond,
+			AfterPublishedRetryMaxInterval:    60 * time.Millisecond,
+			AfterPublishedRetryBackoffFactor:  2,
+			AfterPublishedRetryJitterFraction: -1,
+			AfterPublished: func(_ context.Context, snapshot s3disk.Snapshot) error {
+				calls++
+				hookCalls <- hookObservation{snapshot: snapshot, at: time.Now()}
+				if calls <= 4 {
+					return injected
+				}
+				return nil
+			},
+			OnPublished: func(snapshot s3disk.Snapshot) { published <- snapshot },
+			OnError:     func(err error) { watchErrors <- err },
+		})
+	}()
+
+	observed := make([]hookObservation, 0, 5)
+	for len(observed) < 5 {
+		select {
+		case call := <-hookCalls:
+			observed = append(observed, call)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for independent AfterPublished retries")
+		}
+	}
+	first := observed[0].snapshot
+	for index, call := range observed {
+		if call.snapshot.Generation != first.Generation || call.snapshot.Commit != first.Commit {
+			t.Fatalf("hook call %d snapshot = %+v, want exact %+v", index, call.snapshot, first)
+		}
+	}
+	minimumGaps := []time.Duration{7 * time.Millisecond, 18 * time.Millisecond, 40 * time.Millisecond, 40 * time.Millisecond}
+	for index, minimum := range minimumGaps {
+		if gap := observed[index+1].at.Sub(observed[index].at); gap < minimum {
+			t.Fatalf("independent retry gap %d = %v, want at least %v", index, gap, minimum)
+		}
+	}
+	for index := 0; index < 4; index++ {
+		select {
+		case err := <-watchErrors:
+			if !errors.Is(err, injected) {
+				t.Fatalf("watch error %d = %v, want injected hook error", index, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for watch error %d", index)
+		}
+	}
+	accepted := waitWatchSnapshot(t, published, "OnPublished after independent retry")
+	if accepted.Generation != first.Generation || accepted.Commit != first.Commit {
+		t.Fatalf("accepted snapshot = %+v, want %+v", accepted, first)
+	}
+
+	cancel()
+	if err := <-watchDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("watch stopped with %v", err)
+	}
+}
+
+func TestPublisherWatchRetriesPanickingAfterPublishedBeforeAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repository, err := s3disk.NewRepository(memstore.New(), "watch-after-published-panic-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := privateTestDirectory(t)
+	writeFile(t, filepath.Join(source, "data"), []byte("retry a panicking hook"))
+
+	type callbackEvent struct {
+		kind     string
+		snapshot s3disk.Snapshot
+		err      error
+	}
+	hookCalls := make(chan s3disk.Snapshot, 2)
+	callbacks := make(chan callbackEvent, 2)
+	watchDone := make(chan error, 1)
+	go func() {
+		calls := 0
+		watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
+			ReconcileInterval:                 -1,
+			AfterPublishedRetryInterval:       20 * time.Millisecond,
+			AfterPublishedRetryMaxInterval:    20 * time.Millisecond,
+			AfterPublishedRetryJitterFraction: -1,
+			AfterPublished: func(_ context.Context, snapshot s3disk.Snapshot) error {
+				calls++
+				hookCalls <- snapshot
+				if calls == 1 {
+					panic("injected hook panic")
+				}
+				return nil
+			},
+			OnError: func(err error) { callbacks <- callbackEvent{kind: "error", err: err} },
+			OnPublished: func(snapshot s3disk.Snapshot) {
+				callbacks <- callbackEvent{kind: "published", snapshot: snapshot}
+			},
+		})
+	}()
+
+	hooks := make([]s3disk.Snapshot, 0, 2)
+	for len(hooks) < 2 {
+		select {
+		case snapshot := <-hookCalls:
+			hooks = append(hooks, snapshot)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for hook call %d", len(hooks))
+		}
+	}
+	observedCallbacks := make([]callbackEvent, 0, 2)
+	for len(observedCallbacks) < 2 {
+		select {
+		case event := <-callbacks:
+			observedCallbacks = append(observedCallbacks, event)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for callback event %d", len(observedCallbacks))
+		}
+	}
+	if observedCallbacks[0].kind != "error" || observedCallbacks[1].kind != "published" {
+		t.Fatalf("callback order = %+v, want error then published", observedCallbacks)
+	}
+	if observedCallbacks[0].err == nil || !strings.Contains(observedCallbacks[0].err.Error(), "AfterPublished hook panic") {
+		t.Fatalf("panic callback error = %v", observedCallbacks[0].err)
+	}
+	first, retried, published := hooks[0], hooks[1], observedCallbacks[1].snapshot
+	if first.Generation != 1 || retried.Generation != first.Generation || retried.Commit != first.Commit ||
+		published.Generation != first.Generation || published.Commit != first.Commit {
+		t.Fatalf("panic retry snapshots = first %+v, retried %+v, published %+v", first, retried, published)
+	}
+
+	cancel()
+	if err := <-watchDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("watch stopped with %v", err)
+	}
+}
+
+func TestPublisherWatchReportsHookContextCanceledWhileWatchIsActive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repository, err := s3disk.NewRepository(memstore.New(), "watch-hook-canceled-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := privateTestDirectory(t)
+	writeFile(t, filepath.Join(source, "data"), []byte("hook-local cancellation"))
+
+	hookCalls := make(chan s3disk.Snapshot, 3)
+	watchErrors := make(chan error, 2)
+	published := make(chan s3disk.Snapshot, 1)
+	watchDone := make(chan error, 1)
+	go func() {
+		calls := 0
+		watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
+			ReconcileInterval:                 -1,
+			AfterPublishedRetryInterval:       10 * time.Millisecond,
+			AfterPublishedRetryMaxInterval:    10 * time.Millisecond,
+			AfterPublishedRetryJitterFraction: -1,
+			AfterPublished: func(_ context.Context, snapshot s3disk.Snapshot) error {
+				calls++
+				hookCalls <- snapshot
+				if calls <= 2 {
+					return context.Canceled
+				}
+				return nil
+			},
+			OnError:     func(err error) { watchErrors <- err },
+			OnPublished: func(snapshot s3disk.Snapshot) { published <- snapshot },
+		})
+	}()
+
+	observed := make([]s3disk.Snapshot, 0, 3)
+	for len(observed) < 3 {
+		observed = append(observed, waitWatchSnapshot(t, hookCalls, "canceled hook retry"))
+	}
+	for index := 0; index < 2; index++ {
+		select {
+		case err := <-watchErrors:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("hook error %d = %v, want context.Canceled", index, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for hook error %d", index)
+		}
+	}
+	accepted := waitWatchSnapshot(t, published, "publication after canceled hook retries")
+	for index, snapshot := range observed {
+		if snapshot.Generation != accepted.Generation || snapshot.Commit != accepted.Commit {
+			t.Fatalf("hook snapshot %d = %+v, want accepted %+v", index, snapshot, accepted)
+		}
+	}
+
+	cancel()
+	if err := <-watchDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("watch stopped with %v", err)
+	}
+}
+
+func TestPublisherWatchCancellationStopsAfterPublishedRetryTimer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repository, err := s3disk.NewRepository(memstore.New(), "watch-after-published-retry-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := privateTestDirectory(t)
+	writeFile(t, filepath.Join(source, "data"), []byte("cancel during retry delay"))
+
+	injected := errors.New("injected retry before cancellation")
+	hookCalls := make(chan struct{}, 2)
+	watchErrors := make(chan error, 1)
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
+			ReconcileInterval:                 -1,
+			AfterPublishedRetryInterval:       time.Hour,
+			AfterPublishedRetryMaxInterval:    time.Hour,
+			AfterPublishedRetryJitterFraction: -1,
+			AfterPublished: func(context.Context, s3disk.Snapshot) error {
+				hookCalls <- struct{}{}
+				return injected
+			},
+			OnError: func(err error) { watchErrors <- err },
+		})
+	}()
+	select {
+	case <-hookCalls:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial AfterPublished failure")
+	}
+	select {
+	case err := <-watchErrors:
+		if !errors.Is(err, injected) {
+			t.Fatalf("watch error = %v, want injected failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial watch error")
+	}
+	cancel()
+	select {
+	case err := <-watchDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("watch stopped with %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Watch did not stop while an AfterPublished retry timer was pending")
+	}
+	select {
+	case <-hookCalls:
+		t.Fatal("AfterPublished retried after watch cancellation")
+	default:
+	}
+}
+
+func TestWatchOptionsValidateAfterPublishedRetryPolicy(t *testing.T) {
+	valid := []s3disk.WatchOptions{
+		{},
+		{ReconcileInterval: -1},
+		{AfterPublishedRetryJitterFraction: -1},
+		{AfterPublishedRetryBackoffFactor: 1},
+		{
+			AfterPublishedRetryInterval:       time.Millisecond,
+			AfterPublishedRetryMaxInterval:    time.Second,
+			AfterPublishedRetryBackoffFactor:  10,
+			AfterPublishedRetryJitterFraction: 1,
+		},
+	}
+	for index, options := range valid {
+		if err := options.Validate(); err != nil {
+			t.Fatalf("valid options %d: %v", index, err)
+		}
+	}
+	invalid := []s3disk.WatchOptions{
+		{Debounce: -1},
+		{AfterPublishedRetryInterval: -1},
+		{AfterPublishedRetryInterval: time.Second, AfterPublishedRetryMaxInterval: time.Millisecond},
+		{AfterPublishedRetryBackoffFactor: math.NaN()},
+		{AfterPublishedRetryBackoffFactor: math.Inf(1)},
+		{AfterPublishedRetryBackoffFactor: 0.5},
+		{AfterPublishedRetryBackoffFactor: 11},
+		{AfterPublishedRetryJitterFraction: math.NaN()},
+		{AfterPublishedRetryJitterFraction: math.Inf(-1)},
+		{AfterPublishedRetryJitterFraction: 1.01},
+	}
+	for index, options := range invalid {
+		if err := options.Validate(); err == nil {
+			t.Fatalf("invalid options %d were accepted: %+v", index, options)
+		}
 	}
 }
 

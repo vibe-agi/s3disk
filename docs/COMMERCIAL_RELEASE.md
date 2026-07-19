@@ -429,6 +429,9 @@ accept or resolve each one explicitly.
   signer or presigner and prove that only the existing target is settled;
   require both dependencies and the dedicated authority-required error for the
   next root; prove that a Store configuration error never triggers presigning.
+  Treat a successful conditional-write response with an empty or oversized
+  Store version as indeterminate, reconcile it through authenticated GET, and
+  preserve only bounded Store error classifications in operator-visible errors.
   Test old-root replay, same-revision replacement, identity and
   closure mismatch, corrupt or oversized state, fixed-expiry cancellation, and
   direct plus marker-preserving encryption-wrapper rejection. Certify the
@@ -449,8 +452,10 @@ accept or resolve each one explicitly.
   `Get` call at the 64 MiB protocol maximum.
 - Exercise Watch registration at protocol path/depth/name/per-directory limits
   and at the 100,000-directory cap. Verify bounded-batch traversal, OS quota
-  errors, watcher overflow recovery, and periodic reconciliation after lost
-  events.
+  errors, watcher overflow recovery, periodic reconciliation after lost events,
+  and exact-generation `AfterPublished` retries with bounded exponential
+  backoff. Prove source-event churn cannot bypass that retry delay or publish
+  N+1 across a failed N barrier.
 - Measure directory size, file count, change rate, memory, object request rate,
   cold-read latency, cache hit ratio, and store cost at supported limits. Publish
   explicit limits and reject inputs beyond them.
