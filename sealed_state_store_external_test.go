@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -147,6 +148,107 @@ func TestFileSealedStateStoreSerializesConcurrentInstances(t *testing.T) {
 	}
 	if !errors.Is(loser, s3disk.ErrPrecondition) {
 		t.Fatalf("losing CAS error = %v, want ErrPrecondition", loser)
+	}
+}
+
+func TestFileSealedStateStoreSerializesConcurrentProcesses(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+		t.Skip("private sealed state intentionally fails closed on this platform")
+	}
+
+	ctx := context.Background()
+	directory := privateTestDirectory(t)
+	path := filepath.Join(directory, "cross-process.state")
+	key := mustCrossProcessRecoveryKey(t)
+	protector := mustPublisherStateProtector(t, "cross-process-key", key)
+	store, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Protector: protector, Binding: []byte("cross-process-binding"),
+	})
+	if errors.Is(err, s3disk.ErrTrustStateUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRevision, err := store.CompareAndSwap(ctx, nil, []byte("base"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type child struct {
+		command *exec.Cmd
+		output  bytes.Buffer
+		result  string
+	}
+	children := make([]child, 2)
+	for index := range children {
+		children[index].result = filepath.Join(directory, fmt.Sprintf("child-%d.result", index))
+		command := exec.Command(executable, "-test.run=^TestFileSealedStateStoreCrossProcessHelper$", "-test.count=1")
+		command.Env = append(os.Environ(),
+			"S3DISK_SEALED_STATE_HELPER=1",
+			"S3DISK_SEALED_STATE_PATH="+path,
+			"S3DISK_SEALED_STATE_EXPECTED="+baseRevision.String(),
+			"S3DISK_SEALED_STATE_RESULT="+children[index].result,
+			fmt.Sprintf("S3DISK_SEALED_STATE_VALUE=winner-%d", index),
+		)
+		command.Stdout = &children[index].output
+		command.Stderr = &children[index].output
+		children[index].command = command
+	}
+	for index := range children {
+		if err := children[index].command.Start(); err != nil {
+			t.Fatalf("start child %d: %v", index, err)
+		}
+	}
+	for index := range children {
+		if err := children[index].command.Wait(); err != nil {
+			t.Fatalf("wait child %d: %v\n%s", index, err, children[index].output.String())
+		}
+	}
+	results := make([]string, len(children))
+	for index := range children {
+		data, err := os.ReadFile(children[index].result)
+		if err != nil {
+			t.Fatalf("read child %d result: %v\n%s", index, err, children[index].output.String())
+		}
+		results[index] = string(data)
+	}
+	if !((results[0] == "success" && results[1] == "precondition") ||
+		(results[0] == "precondition" && results[1] == "success")) {
+		t.Fatalf("cross-process CAS results = %q, want exactly one success", results)
+	}
+}
+
+func TestFileSealedStateStoreCrossProcessHelper(t *testing.T) {
+	if os.Getenv("S3DISK_SEALED_STATE_HELPER") != "1" {
+		t.Skip("helper subprocess only")
+	}
+	path := os.Getenv("S3DISK_SEALED_STATE_PATH")
+	resultPath := os.Getenv("S3DISK_SEALED_STATE_RESULT")
+	expected, err := s3disk.ParseDigest(os.Getenv("S3DISK_SEALED_STATE_EXPECTED"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	protector := mustPublisherStateProtector(t, "cross-process-key", mustCrossProcessRecoveryKey(t))
+	store, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Protector: protector, Binding: []byte("cross-process-binding"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, casErr := store.CompareAndSwap(context.Background(), &expected, []byte(os.Getenv("S3DISK_SEALED_STATE_VALUE")))
+	result := "success"
+	if errors.Is(casErr, s3disk.ErrPrecondition) {
+		result = "precondition"
+	} else if casErr != nil {
+		result = "error: " + casErr.Error()
+	}
+	if err := os.WriteFile(resultPath, []byte(result), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -470,4 +572,14 @@ func mustPublisherStateProtector(t *testing.T, keyID string, key publisherstate.
 		t.Fatal(err)
 	}
 	return protector
+}
+
+func mustCrossProcessRecoveryKey(t *testing.T) publisherstate.RecoveryKey {
+	t.Helper()
+	const secret = "s3disk-publisher-recovery-v1.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+	key, err := publisherstate.ParseRecoveryKey(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
