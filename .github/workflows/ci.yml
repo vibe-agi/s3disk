@@ -313,6 +313,8 @@ jobs:
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-publisher-session.log
           go test ./presignedshare -run='^$' -fuzz='^FuzzDecodeRootRecoveryRecordNeverPanics$' \
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-root-recovery.log
+          go test ./internal/tlsroots -run='^$' -fuzz='^FuzzParsePEMCertificatesNeverPanics$' \
+            -fuzztime=10s 2>&1 | tee artifacts/fuzz-tls-roots.log
       - name: Third-party compliance
         run: |
           set -o pipefail

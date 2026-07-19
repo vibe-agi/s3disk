@@ -1685,6 +1685,65 @@ func TestPresignedGetCompatibilityAcceptsParsedTLSRootPEM(t *testing.T) {
 	}
 }
 
+func TestPresignedGetCompatibilityRejectsHiddenTLSRootPEMMaterial(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(server.Close)
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if len(certificate) == 0 {
+		t.Fatal("test certificate PEM is empty")
+	}
+
+	valid := append([]byte(" \t\r\n"), certificate...)
+	valid = append(valid, '\n')
+	if _, err := parsePresignedGetProbeTLSRootCAPEM(valid); err != nil {
+		t.Fatalf("strict parser rejected whitespace-separated certificate PEM: %v", err)
+	}
+
+	for _, test := range []struct {
+		name           string
+		prefix, suffix []byte
+	}{
+		{name: "arbitrary leading bytes", prefix: []byte("AWS_SECRET_ACCESS_KEY=must-not-be-ignored\n")},
+		{name: "unclosed leading certificate", prefix: []byte("-----BEGIN CERTIFICATE-----\ninvalid\n")},
+		{name: "arbitrary trailing bytes", suffix: []byte("AWS_SECRET_ACCESS_KEY=must-not-be-ignored\n")},
+		{name: "private key", suffix: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("must-not-be-ignored")})},
+		{name: "certificate headers", suffix: pem.EncodeToMemory(&pem.Block{
+			Type: "CERTIFICATE", Headers: map[string]string{"Secret": "must-not-be-ignored"}, Bytes: server.Certificate().Raw,
+		})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := append(append([]byte(nil), test.prefix...), certificate...)
+			input = append(input, test.suffix...)
+			if _, err := parsePresignedGetProbeTLSRootCAPEM(input); err == nil {
+				t.Fatal("strict parser accepted hidden non-certificate material")
+			}
+		})
+	}
+	firstWithoutLineEnd := bytes.TrimSuffix(certificate, []byte{'\n'})
+	sameLine := append(append([]byte(nil), firstWithoutLineEnd...), certificate...)
+	if _, err := parsePresignedGetProbeTLSRootCAPEM(sameLine); err == nil {
+		t.Fatal("strict parser accepted two certificate boundaries on the same line")
+	}
+}
+
+func TestPresignedGetCompatibilityBoundsTLSRootCertificateCount(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(server.Close)
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if len(certificate) == 0 {
+		t.Fatal("test certificate PEM is empty")
+	}
+	encoded := bytes.Repeat(certificate, maximumPresignedGetProbeTLSRootCertificates+1)
+	if len(encoded) > maximumPresignedGetProbeTLSRootCAPEMBytes {
+		t.Fatal("certificate-count fixture unexpectedly exceeded the byte limit")
+	}
+	if _, err := parsePresignedGetProbeTLSRootCAPEM(encoded); err == nil {
+		t.Fatal("strict parser accepted too many TLS root certificates")
+	}
+}
+
 func TestPresignedGetCompatibilityStripsHTTPTraceValues(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

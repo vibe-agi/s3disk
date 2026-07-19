@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -14,6 +13,7 @@ import (
 	"runtime"
 
 	"github.com/vibe-agi/s3disk"
+	"github.com/vibe-agi/s3disk/internal/tlsroots"
 	"github.com/vibe-agi/s3disk/presignedshare"
 )
 
@@ -315,12 +315,16 @@ func preflightMountLocalPaths(options MountOptions) (mountLocalPaths, error) {
 }
 
 func s3HTTPClient(tlsCAPEM []byte) (*http.Client, error) {
-	if len(tlsCAPEM) == 0 {
+	certificates, err := parseTLSRootCertificates(tlsCAPEM)
+	if err != nil {
+		return nil, err
+	}
+	if len(certificates) == 0 {
 		return nil, nil
 	}
 	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(tlsCAPEM) {
-		return nil, fmt.Errorf("PEM contains no certificates")
+	for _, certificate := range certificates {
+		roots.AddCert(certificate)
 	}
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
 		MinVersion: tls.VersionTLS12, RootCAs: roots,
@@ -328,61 +332,46 @@ func s3HTTPClient(tlsCAPEM []byte) (*http.Client, error) {
 }
 
 // canonicalTLSRootCAPEM accepts only a sequence of headerless CERTIFICATE PEM
-// blocks separated by ASCII whitespace. AppendCertsFromPEM deliberately skips
-// unknown blocks and trailing text, which would let a CA file smuggle private
-// keys or unrelated secrets into the sealed session and B's handoff.
+// blocks with complete line boundaries and ASCII whitespace between blocks.
+// The standard library's AppendCertsFromPEM deliberately skips unknown blocks
+// and trailing text, which would let a CA file smuggle private keys or unrelated
+// secrets into the sealed session and B's handoff.
 func canonicalTLSRootCAPEM(input []byte) ([]byte, error) {
-	if len(input) == 0 {
+	certificates, err := parseTLSRootCertificates(input)
+	if err != nil {
+		return nil, err
+	}
+	if len(certificates) == 0 {
 		return nil, nil
 	}
-	remaining := input
 	canonical := make([]byte, 0, len(input))
-	certificates := 0
-	for {
-		remaining = bytes.TrimLeft(remaining, " \t\r\n")
-		if len(remaining) == 0 {
-			break
-		}
-		if !bytes.HasPrefix(remaining, []byte("-----BEGIN CERTIFICATE-----")) {
-			clear(canonical)
-			return nil, fmt.Errorf("PEM must contain only headerless CERTIFICATE blocks")
-		}
-		const endMarker = "-----END CERTIFICATE-----"
-		endOffset := bytes.Index(remaining, []byte(endMarker))
-		if endOffset < 0 || bytes.Contains(
-			remaining[len("-----BEGIN CERTIFICATE-----"):endOffset],
-			[]byte("-----BEGIN "),
-		) {
-			clear(canonical)
-			return nil, fmt.Errorf("PEM must contain only complete CERTIFICATE blocks")
-		}
-		candidateEnd := endOffset + len(endMarker)
-		if candidateEnd < len(remaining) && remaining[candidateEnd] == '\r' {
-			candidateEnd++
-		}
-		if candidateEnd < len(remaining) && remaining[candidateEnd] == '\n' {
-			candidateEnd++
-		}
-		block, rest := pem.Decode(remaining[:candidateEnd])
-		if block == nil || len(bytes.TrimSpace(rest)) != 0 || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-			clear(canonical)
-			return nil, fmt.Errorf("PEM must contain only headerless CERTIFICATE blocks")
-		}
-		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-			clear(canonical)
-			return nil, fmt.Errorf("PEM contains an invalid certificate")
-		}
-		canonical = append(canonical, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes})...)
-		certificates++
-		if certificates > presignedshare.MaximumTLSRootCertificates {
-			clear(canonical)
-			return nil, fmt.Errorf("PEM contains too many certificates")
-		}
-		remaining = remaining[candidateEnd:]
-	}
-	if certificates == 0 {
-		clear(canonical)
-		return nil, fmt.Errorf("PEM contains no certificates")
+	for _, certificate := range certificates {
+		canonical = append(canonical, pem.EncodeToMemory(&pem.Block{
+			Type: "CERTIFICATE", Bytes: certificate.Raw,
+		})...)
 	}
 	return canonical, nil
+}
+
+func parseTLSRootCertificates(input []byte) ([]*x509.Certificate, error) {
+	certificates, err := tlsroots.ParsePEMCertificates(
+		input,
+		presignedshare.MaximumTLSRootCAPEMBytes,
+		presignedshare.MaximumTLSRootCertificates,
+	)
+	if err == nil {
+		return certificates, nil
+	}
+	switch {
+	case errors.Is(err, tlsroots.ErrPEMTooLarge):
+		return nil, fmt.Errorf("PEM exceeds the byte limit")
+	case errors.Is(err, tlsroots.ErrTooManyCertificates):
+		return nil, fmt.Errorf("PEM contains too many certificates")
+	case errors.Is(err, tlsroots.ErrInvalidCertificate):
+		return nil, fmt.Errorf("PEM contains an invalid certificate")
+	case errors.Is(err, tlsroots.ErrNoCertificates):
+		return nil, fmt.Errorf("PEM contains no certificates")
+	default:
+		return nil, fmt.Errorf("PEM must contain only complete headerless CERTIFICATE blocks")
+	}
 }

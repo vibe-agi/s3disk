@@ -1,13 +1,11 @@
 package presignedshare
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +17,7 @@ import (
 	"time"
 
 	"github.com/vibe-agi/s3disk"
+	"github.com/vibe-agi/s3disk/internal/tlsroots"
 )
 
 const (
@@ -77,10 +76,12 @@ type ReaderConfig struct {
 	// the built-in offline Ed25519 verifier. A custom implementation can perform
 	// arbitrary network I/O and therefore breaks Reader's S3-only guarantee.
 	DangerouslyAllowCustomReferenceVerifier bool
-	// TLSRootCAPEM replaces the host system trust roots when non-empty. Passing
-	// a caller-created *x509.CertPool through HTTPClient is forbidden because a
-	// CertPool can contain executable verification constraints and mutable
-	// certificate pointers. HTTPS requires a non-empty TLSRootCAPEM unless
+	// TLSRootCAPEM replaces the host system trust roots when non-empty. It must
+	// contain only headerless CERTIFICATE PEM blocks with complete line
+	// boundaries and ASCII whitespace between blocks. Passing a caller-created
+	// *x509.CertPool through HTTPClient is forbidden because a CertPool can
+	// contain executable verification constraints and mutable certificate
+	// pointers. HTTPS requires a non-empty TLSRootCAPEM unless
 	// DangerouslyAllowSystemTrustStore is set.
 	TLSRootCAPEM []byte
 	// DangerouslyAllowSystemTrustStore permits HTTPS to use the host system
@@ -891,55 +892,29 @@ func newLockedNetworkDialer() *net.Dialer {
 }
 
 func parseLockedTLSRootCAPEM(encoded []byte) (*x509.CertPool, error) {
-	if len(encoded) == 0 {
+	certificates, err := tlsroots.ParsePEMCertificates(
+		encoded, MaximumTLSRootCAPEMBytes, MaximumTLSRootCertificates,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, tlsroots.ErrPEMTooLarge):
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM exceeds the byte limit")
+		case errors.Is(err, tlsroots.ErrTooManyCertificates):
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains too many certificates")
+		case errors.Is(err, tlsroots.ErrInvalidCertificate):
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains an invalid certificate")
+		case errors.Is(err, tlsroots.ErrNoCertificates):
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains no certificates")
+		default:
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
+		}
+	}
+	if len(certificates) == 0 {
 		return nil, nil
 	}
-	if len(encoded) > MaximumTLSRootCAPEMBytes {
-		return nil, fmt.Errorf("presignedshare: TLS root CA PEM exceeds the byte limit")
-	}
-	remaining := append([]byte(nil), encoded...)
 	pool := x509.NewCertPool()
-	count := 0
-	for {
-		remaining = bytes.TrimLeft(remaining, " \t\r\n")
-		if len(remaining) == 0 {
-			break
-		}
-		if !bytes.HasPrefix(remaining, []byte("-----BEGIN CERTIFICATE-----")) {
-			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
-		}
-		const endMarker = "-----END CERTIFICATE-----"
-		endOffset := bytes.Index(remaining, []byte(endMarker))
-		if endOffset < 0 || bytes.Contains(
-			remaining[len("-----BEGIN CERTIFICATE-----"):endOffset],
-			[]byte("-----BEGIN "),
-		) {
-			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
-		}
-		candidateEnd := endOffset + len(endMarker)
-		if candidateEnd < len(remaining) && remaining[candidateEnd] == '\r' {
-			candidateEnd++
-		}
-		if candidateEnd < len(remaining) && remaining[candidateEnd] == '\n' {
-			candidateEnd++
-		}
-		block, rest := pem.Decode(remaining[:candidateEnd])
-		if block == nil || len(bytes.TrimSpace(rest)) != 0 || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
-		}
-		count++
-		if count > MaximumTLSRootCertificates {
-			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains too many certificates")
-		}
-		certificate, err := x509.ParseCertificate(append([]byte(nil), block.Bytes...))
-		if err != nil {
-			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains an invalid certificate")
-		}
+	for _, certificate := range certificates {
 		pool.AddCert(certificate)
-		remaining = remaining[candidateEnd:]
-	}
-	if count == 0 {
-		return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains no certificates")
 	}
 	return pool, nil
 }

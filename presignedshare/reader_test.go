@@ -346,6 +346,11 @@ func TestReaderHTTPSRequiresExplicitTrustSource(t *testing.T) {
 	if _, err := NewReader(config); err == nil {
 		t.Fatal("NewReader skipped an unclosed certificate block before a valid trust root")
 	}
+	firstWithoutLineEnd := bytes.TrimSuffix(fixture.readerConfig.TLSRootCAPEM, []byte{'\n'})
+	config.TLSRootCAPEM = append(append([]byte(nil), firstWithoutLineEnd...), fixture.readerConfig.TLSRootCAPEM...)
+	if _, err := NewReader(config); err == nil {
+		t.Fatal("NewReader accepted two certificate boundaries on the same line")
+	}
 }
 
 func TestReaderBuildsDirectLockedTransport(t *testing.T) {

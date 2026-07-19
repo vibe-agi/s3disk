@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/vibe-agi/s3disk"
+	"github.com/vibe-agi/s3disk/internal/tlsroots"
 	"github.com/vibe-agi/s3disk/presignedshare"
 )
 
@@ -160,10 +160,12 @@ const (
 // Only nil or an unextended *http.Transport is accepted. Custom RoundTrippers,
 // proxies, dialers, protocol selectors, TLS identities/callbacks/algorithms,
 // cookies, and redirects are rejected or removed so they cannot forge
-// commissioning evidence. TLSRootCAPEM is the strict trust-root input: it is
-// bounded, parsed, and copied into a callback-free private pool. HTTPS probes
-// require it by default because some operating-system trust implementations
-// can fetch AIA or revocation data outside the locked S3 transport.
+// commissioning evidence. TLSRootCAPEM is the strict trust-root input: it must
+// contain only headerless CERTIFICATE PEM blocks with complete line boundaries
+// and ASCII whitespace between blocks. It is bounded, parsed, and copied into a
+// callback-free private pool. HTTPS probes require it by default because some
+// operating-system trust implementations can fetch AIA or revocation data
+// outside the locked S3 transport.
 type PresignedGetCompatibilityProbeOptions struct {
 	ObjectKeyPrefix    string
 	TotalTimeout       time.Duration
@@ -1845,33 +1847,31 @@ func standardPresignedGetProbeNextProtos(protocols []string) bool {
 }
 
 func parsePresignedGetProbeTLSRootCAPEM(encoded []byte) (*x509.CertPool, error) {
-	if len(encoded) == 0 {
-		return nil, nil
-	}
-	if len(encoded) > maximumPresignedGetProbeTLSRootCAPEMBytes {
-		return nil, errors.New("TLS root CA PEM exceeds the byte limit")
-	}
-	remaining := append([]byte(nil), encoded...)
-	pool := x509.NewCertPool()
-	count := 0
-	for len(bytes.TrimSpace(remaining)) != 0 {
-		block, rest := pem.Decode(remaining)
-		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+	certificates, err := tlsroots.ParsePEMCertificates(
+		encoded,
+		maximumPresignedGetProbeTLSRootCAPEMBytes,
+		maximumPresignedGetProbeTLSRootCertificates,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, tlsroots.ErrPEMTooLarge):
+			return nil, errors.New("TLS root CA PEM exceeds the byte limit")
+		case errors.Is(err, tlsroots.ErrTooManyCertificates):
+			return nil, errors.New("TLS root CA PEM contains too many certificates")
+		case errors.Is(err, tlsroots.ErrInvalidCertificate):
+			return nil, errors.New("TLS root CA PEM contains an invalid certificate")
+		case errors.Is(err, tlsroots.ErrNoCertificates):
+			return nil, errors.New("TLS root CA PEM contains no certificates")
+		default:
 			return nil, errors.New("TLS root CA PEM is malformed")
 		}
-		count++
-		if count > maximumPresignedGetProbeTLSRootCertificates {
-			return nil, errors.New("TLS root CA PEM contains too many certificates")
-		}
-		certificate, err := x509.ParseCertificate(append([]byte(nil), block.Bytes...))
-		if err != nil {
-			return nil, errors.New("TLS root CA PEM contains an invalid certificate")
-		}
-		pool.AddCert(certificate)
-		remaining = rest
 	}
-	if count == 0 {
-		return nil, errors.New("TLS root CA PEM contains no certificates")
+	if len(certificates) == 0 {
+		return nil, nil
+	}
+	pool := x509.NewCertPool()
+	for _, certificate := range certificates {
+		pool.AddCert(certificate)
 	}
 	return pool, nil
 }

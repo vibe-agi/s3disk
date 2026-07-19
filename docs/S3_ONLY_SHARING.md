@@ -455,9 +455,10 @@ closure, and S3-only constraints.
   caller-selected TLS algorithms, and alternate-protocol round trippers are
   rejected. Caller `httptrace` values are stripped before a capability request
   reaches `net/http`. Every HTTPS deployment provides bounded commissioned PEM
-  roots in `ReaderConfig.TLSRootCAPEM`; Reader parses fresh certificate objects
-  into an internal callback-free pool. This avoids operating-system trust
-  evaluation that may perform non-S3 network fetches.
+  roots in `ReaderConfig.TLSRootCAPEM`; the shared strict parser accepts only
+  complete, headerless `CERTIFICATE` PEM blocks and Reader creates fresh
+  certificate objects in an internal callback-free pool. This avoids
+  operating-system trust evaluation that may perform non-S3 network fetches.
   `DangerouslyAllowSystemTrustStore` explicitly gives up the strict S3-only
   guarantee and must not be enabled on B/C/D. Those roots are trusted
   configuration and a malicious root can authenticate an S3 impersonator.

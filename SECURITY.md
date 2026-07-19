@@ -81,7 +81,8 @@ dates in customer-facing terms.
   only network destination. A zero-non-S3-egress profile requires separately
   certified pinned name resolution/routing, which is not implemented. Every
   HTTPS reader must receive bounded commissioned roots through
-  `ReaderConfig.TLSRootCAPEM`; they are parsed into Reader-owned certificate
+  `ReaderConfig.TLSRootCAPEM`; a shared strict parser accepts only complete,
+  headerless `CERTIFICATE` PEM blocks and creates Reader-owned certificate
   objects. This avoids platform system verifiers that may fetch AIA or
   revocation data outside the locked S3 dialer. The explicit
   `DangerouslyAllowSystemTrustStore` opt-out invalidates the strict S3-only

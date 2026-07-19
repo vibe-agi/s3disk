@@ -165,9 +165,11 @@ s3disk share publish \
   --tls-ca /secure/provider-ca.pem
 ```
 
-The strict share CLI requires `--tls-ca` for HTTPS; it will not create a
-system-trust handoff because an operating-system verifier may perform network
-requests outside S3. `s3 doctor` alone retains the explicit
+The strict share CLI requires `--tls-ca` for HTTPS. The file must contain only
+headerless `CERTIFICATE` PEM blocks with complete line boundaries; arbitrary
+text, private-key blocks, PEM headers, and malformed blocks are rejected. The
+CLI will not create a system-trust handoff because an operating-system verifier
+may perform network requests outside S3. `s3 doctor` alone retains the explicit
 `--dangerously-allow-system-trust` diagnostic opt-out. Literal loopback HTTP is
 for local tests only and requires an `http://127.0.0.1:...` endpoint plus
 `--dangerously-allow-http`. The publish command watches for changes by default;
@@ -396,13 +398,15 @@ The safe B-side path requires the exact built-in
 purely local. A custom verifier is rejected before any of its methods run;
 enabling `DangerouslyAllowCustomReferenceVerifier` explicitly gives up the
 S3-only guarantee because `RepositoryID` or `Verify` may perform arbitrary
-network I/O. Every HTTPS reader supplies its commissioned CA roots as bounded
-PEM bytes in `ReaderConfig.TLSRootCAPEM`; Reader rebuilds them internally and
-does not invoke an operating-system verifier that may fetch AIA or revocation
-data outside the S3 transport. `DangerouslyAllowSystemTrustStore` is an explicit
-interoperability opt-out and invalidates the strict S3-only claim. Reader also
-rejects a caller `*x509.CertPool`, client certificate, TLS callback, proxy,
-custom dialer, and caller `httptrace` callback.
+network I/O. Every HTTPS reader supplies its commissioned CA roots as bounded,
+certificate-only PEM bytes in `ReaderConfig.TLSRootCAPEM`; Reader rebuilds them
+internally with the same strict parser used by the CLI and S3 commissioning
+probe. It does not invoke an operating-system verifier that may fetch AIA or
+revocation data outside the S3 transport.
+`DangerouslyAllowSystemTrustStore` is an explicit interoperability opt-out and
+invalidates the strict S3-only claim. Reader also rejects a caller
+`*x509.CertPool`, client certificate, TLS callback, proxy, custom dialer, and
+caller `httptrace` callback.
 
 One share has a fixed absolute deadline covering the root and every object
 capability in every revision. After it, the reader refuses network I/O and the

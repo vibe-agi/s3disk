@@ -53,6 +53,16 @@ func TestCanonicalTLSRootCAPEMRejectsHiddenNonCertificateMaterial(t *testing.T) 
 		})
 	}
 
+	t.Run("same-line certificate boundaries", func(t *testing.T) {
+		firstWithoutLineEnd := bytes.TrimSuffix(certificate, []byte{'\n'})
+		input := append(append([]byte(nil), firstWithoutLineEnd...), certificate...)
+		canonical, err := canonicalTLSRootCAPEM(input)
+		clear(canonical)
+		if err == nil {
+			t.Fatal("certificate bundle accepted two boundaries on the same line")
+		}
+	})
+
 	t.Run("certificate count", func(t *testing.T) {
 		input := bytes.Repeat(certificate, presignedshare.MaximumTLSRootCertificates+1)
 		canonical, err := canonicalTLSRootCAPEM(input)

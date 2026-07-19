@@ -363,8 +363,9 @@ it does not inherit ambient proxies. It rejects caller proxies, dialers,
 alternate protocols, custom round trippers, TLS client certificates, TLS
 verification/session callbacks, custom ciphers/curves/ALPN/ECH, secret-key
 logging, caller-created certificate pools, and disabled certificate
-verification. HTTPS requires bounded PEM roots in `TLSRootCAPEM` by default,
-including for public CAs; the probe parses them into its own callback-free pool.
+verification. HTTPS requires bounded, certificate-only PEM roots in
+`TLSRootCAPEM` by default, including for public CAs; the probe uses the same
+strict complete-block parser as Reader and builds its own callback-free pool.
 This avoids operating-system trust evaluators that may fetch AIA or revocation
 data outside the locked S3 dialer. `DangerouslyAllowSystemTrustStore` is an
 explicit interoperability opt-out and adds
