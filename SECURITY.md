@@ -137,7 +137,10 @@ dates in customer-facing terms.
   through this API. A product integrating it must keep the recovery key in an
   independently protected key file, OS keystore, or KMS and must add a durable
   monotonic journal around sealed values; copying an old valid envelope remains
-  a successful replay at the cryptographic layer.
+  a successful replay at the cryptographic layer. `AESGCMKeyring` supports a
+  bounded active-plus-retained-key rewrap operation, but old keys cannot be
+  retired until every required live state and backup has been durably migrated
+  and verified.
 - Treat each prefix, `RepositoryID`, profile, and share key as one storage
   domain. Do not mix encrypted and plaintext repositories, different profiles,
   or ciphertext copied across prefixes. `InitializeRepository` creates or

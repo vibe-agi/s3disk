@@ -10,4 +10,5 @@ var (
 	ErrAuthenticationFailed = errors.New("publisherstate: envelope authentication failed")
 	ErrResourceLimit        = errors.New("publisherstate: resource limit exceeded")
 	ErrProtectorUnavailable = errors.New("publisherstate: protector is not configured")
+	ErrProtectorConflict    = errors.New("publisherstate: protector key ID conflict")
 )

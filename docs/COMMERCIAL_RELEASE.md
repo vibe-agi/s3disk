@@ -75,11 +75,13 @@ for a storage component that handles customer source data.
   rotation or migration path. The local `DiskCache` also remains plaintext. The
   `publisherstate` now provides an independently keyed, bounded AES-256-GCM
   envelope for protecting those recovery secrets, but it intentionally does
-  not provide storage freshness or rollback detection. The current CLI does
-  not yet persist the share key, publisher private signing key, or root
-  capability through that envelope and cannot resume the same share after A
-  crashes; durable CAS state, recovery-key provisioning, backup, and
-  zeroization remain product work.
+  not provide storage freshness or rollback detection. Its bounded built-in
+  keyring can authenticate retained-key envelopes and rewrap them with an
+  active key, but does not install that result. The current CLI does not yet
+  persist the share key, publisher private signing key, or root capability
+  through that envelope and cannot resume the same share after A crashes;
+  durable CAS state, recovery-key provisioning and rotation operations,
+  backup, and zeroization remain product work.
 
 <!-- RELEASE-BLOCKER: trust-root-lifecycle -->
 

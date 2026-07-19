@@ -230,6 +230,11 @@ func TestAESGCMProtectorErrorsDoNotContainCallerSecrets(t *testing.T) {
 
 func FuzzAESGCMProtectorOpenNeverPanics(f *testing.F) {
 	protector := newTestProtector(f, "fuzz-key")
+	active := newTestProtector(f, "fuzz-active-key")
+	keyring, err := NewAESGCMKeyring(active, protector)
+	if err != nil {
+		f.Fatal(err)
+	}
 	validBinding := []byte("fuzz-binding")
 	validEnvelope, err := protector.Seal(context.Background(), validBinding, []byte("fuzz plaintext"))
 	if err != nil {
@@ -243,6 +248,14 @@ func FuzzAESGCMProtectorOpenNeverPanics(f *testing.F) {
 		plaintext, err := protector.Open(context.Background(), binding, envelope)
 		if err == nil && len(plaintext) > MaximumPlaintextBytes {
 			t.Fatalf("Open returned %d plaintext bytes", len(plaintext))
+		}
+		plaintext, err = keyring.Open(context.Background(), binding, envelope)
+		if err == nil && len(plaintext) > MaximumPlaintextBytes {
+			t.Fatalf("keyring Open returned %d plaintext bytes", len(plaintext))
+		}
+		rewrapped, _, err := keyring.Rewrap(context.Background(), binding, envelope)
+		if err == nil && len(rewrapped) > MaximumEnvelopeBytes {
+			t.Fatalf("keyring Rewrap returned %d envelope bytes", len(rewrapped))
 		}
 	})
 }

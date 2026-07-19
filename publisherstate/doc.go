@@ -5,6 +5,9 @@
 // caller-supplied binding while encrypting plaintext with a key derived from a
 // 256-bit RecoveryKey. It does not read or write files, choose a storage path,
 // validate filesystem permissions, manage a KMS, or retain previous versions.
+// AESGCMKeyring can retain a finite, explicit set of old built-in keys while
+// sealing only with a new active key; Rewrap still requires an outer durable
+// compare-and-swap before an old key can safely be retired.
 //
 // In particular, a valid envelope has confidentiality and integrity but no
 // freshness. An attacker or faulty backup system which can replace storage may
