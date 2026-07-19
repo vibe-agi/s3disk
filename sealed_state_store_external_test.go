@@ -1,0 +1,385 @@
+package s3disk_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/vibe-agi/s3disk"
+	"github.com/vibe-agi/s3disk/publisherstate"
+)
+
+var _ s3disk.SealedStateProtector = (*publisherstate.AESGCMProtector)(nil)
+var _ s3disk.SealedStateProtector = (*publisherstate.AESGCMKeyring)(nil)
+
+func TestFileSealedStateStoreCreateUpdateAndAliasIsolation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(privateTestDirectory(t), "publisher.state")
+	store, _ := newFileSealedStateTestStore(t, path, []byte("repository/share/publisher-state"), "active-key", publisherstate.RecoveryKey{})
+
+	if state, revision, found, err := store.Load(ctx); err != nil || found || state != nil || !revision.IsZero() {
+		t.Fatalf("initial Load = %q, %s, %v, %v; want absent", state, revision, found, err)
+	}
+	first := []byte("first private publisher state")
+	firstRevision, err := store.CompareAndSwap(ctx, nil, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstRevision.IsZero() {
+		t.Fatal("create returned a zero revision")
+	}
+	first[0] = 'X'
+
+	loaded, loadedRevision, found, err := store.Load(ctx)
+	if err != nil || !found || loadedRevision != firstRevision || string(loaded) != "first private publisher state" {
+		t.Fatalf("Load = %q, %s, %v, %v", loaded, loadedRevision, found, err)
+	}
+	loaded[0] = 'Y'
+	reloaded, _, _, err := store.Load(ctx)
+	if err != nil || string(reloaded) != "first private publisher state" {
+		t.Fatalf("Load after caller mutation = %q, %v", reloaded, err)
+	}
+
+	second := []byte("second private publisher state")
+	secondRevision, err := store.CompareAndSwap(ctx, &firstRevision, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondRevision.IsZero() || secondRevision == firstRevision {
+		t.Fatalf("update revision = %s, want fresh non-zero value", secondRevision)
+	}
+	thirdRevision, err := store.CompareAndSwap(ctx, &secondRevision, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thirdRevision.IsZero() || thirdRevision == secondRevision {
+		t.Fatalf("same-state update revision = %s, want fresh non-zero value", thirdRevision)
+	}
+
+	if _, err := store.CompareAndSwap(ctx, nil, []byte("must not replace present")); !errors.Is(err, s3disk.ErrPrecondition) {
+		t.Fatalf("nil expected on present state error = %v, want ErrPrecondition", err)
+	}
+	if _, err := store.CompareAndSwap(ctx, &firstRevision, []byte("stale")); !errors.Is(err, s3disk.ErrPrecondition) {
+		t.Fatalf("stale CAS error = %v, want ErrPrecondition", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("state permissions = %o, want exactly 0600", info.Mode().Perm())
+		}
+	}
+}
+
+func TestFileSealedStateStoreCopiesConstructorBinding(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(privateTestDirectory(t), "binding-copy.state")
+	key, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := []byte("durable-binding")
+	store, _ := newFileSealedStateTestStore(t, path, binding, "active-key", key)
+	peer, _ := newFileSealedStateTestStore(t, path, []byte("durable-binding"), "active-key", key)
+	clear(binding)
+	if _, err := store.CompareAndSwap(ctx, nil, []byte("state")); err != nil {
+		t.Fatal(err)
+	}
+	state, _, found, err := peer.Load(ctx)
+	if err != nil || !found || string(state) != "state" {
+		t.Fatalf("peer Load after caller mutated constructor binding = %q, %v, %v", state, found, err)
+	}
+}
+
+func TestFileSealedStateStoreSerializesConcurrentInstances(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(privateTestDirectory(t), "concurrent.state")
+	key, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, _ := newFileSealedStateTestStore(t, path, []byte("shared-binding"), "key-1", key)
+	right, _ := newFileSealedStateTestStore(t, path, []byte("shared-binding"), "key-1", key)
+	baseRevision, err := left.CompareAndSwap(ctx, nil, []byte("base"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for index, store := range []*s3disk.FileSealedStateStore{left, right} {
+		index, store := index, store
+		go func() {
+			defer ready.Done()
+			<-start
+			_, err := store.CompareAndSwap(ctx, &baseRevision, []byte(fmt.Sprintf("winner-%d", index)))
+			results <- err
+		}()
+	}
+	close(start)
+	firstErr, secondErr := <-results, <-results
+	ready.Wait()
+	if (firstErr == nil) == (secondErr == nil) {
+		t.Fatalf("concurrent CAS errors = (%v, %v), want exactly one success", firstErr, secondErr)
+	}
+	loser := firstErr
+	if loser == nil {
+		loser = secondErr
+	}
+	if !errors.Is(loser, s3disk.ErrPrecondition) {
+		t.Fatalf("losing CAS error = %v, want ErrPrecondition", loser)
+	}
+}
+
+func TestFileSealedStateStoreAuthenticatesProtectorKeyAndBinding(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(privateTestDirectory(t), "authenticated.state")
+	key, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := newFileSealedStateTestStore(t, path, []byte("share-A"), "active-key", key)
+	if _, err := store.CompareAndSwap(ctx, nil, []byte("sensitive publisher state")); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongBinding, _ := newFileSealedStateTestStore(t, path, []byte("share-B"), "active-key", key)
+	wrongKey, _ := newFileSealedStateTestStore(t, path, []byte("share-A"), "active-key", publisherstate.RecoveryKey{})
+	wrongID, _ := newFileSealedStateTestStore(t, path, []byte("share-A"), "retired-key", key)
+	for name, candidate := range map[string]*s3disk.FileSealedStateStore{
+		"binding": wrongBinding,
+		"key":     wrongKey,
+		"key ID":  wrongID,
+	} {
+		if _, _, _, err := candidate.Load(ctx); !errors.Is(err, publisherstate.ErrAuthenticationFailed) {
+			t.Errorf("wrong %s Load error = %v, want ErrAuthenticationFailed", name, err)
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 1
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.Load(ctx); !errors.Is(err, publisherstate.ErrAuthenticationFailed) {
+		t.Fatalf("tampered envelope Load error = %v, want ErrAuthenticationFailed", err)
+	}
+}
+
+func TestFileSealedStateStoreRejectsTruncatedTrailingOversizedAndUnsafeFiles(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	directory := privateTestDirectory(t)
+	path := filepath.Join(directory, "strict.state")
+	store, _ := newFileSealedStateTestStoreWithOptions(t, path, s3disk.FileSealedStateStoreOptions{
+		Binding: []byte("strict-binding"), MaxEnvelopeBytes: 1024,
+	})
+	if _, err := store.CompareAndSwap(ctx, nil, []byte("valid")); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, length := range []int{0, 1, len(valid) - 1} {
+		if err := os.WriteFile(path, valid[:length], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := store.Load(ctx); !errors.Is(err, s3disk.ErrCorruptObject) {
+			t.Errorf("Load truncated to %d bytes error = %v, want ErrCorruptObject", length, err)
+		}
+	}
+	if err := os.WriteFile(path, append(bytes.Clone(valid), 0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.Load(ctx); !errors.Is(err, s3disk.ErrCorruptObject) {
+		t.Fatalf("Load with trailing byte error = %v, want ErrCorruptObject", err)
+	}
+	if err := os.WriteFile(path, make([]byte, 2048), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.Load(ctx); !errors.Is(err, s3disk.ErrCorruptObject) || !errors.Is(err, s3disk.ErrResourceLimit) {
+		t.Fatalf("Load oversized error = %v, want ErrCorruptObject and ErrResourceLimit", err)
+	}
+
+	if err := os.WriteFile(path, valid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := store.Load(ctx); !errors.Is(err, s3disk.ErrCorruptObject) {
+			t.Fatalf("Load mode 0644 error = %v, want ErrCorruptObject", err)
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	target := filepath.Join(directory, "target.state")
+	if err := os.WriteFile(target, valid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, _, _, err := store.Load(ctx); !errors.Is(err, s3disk.ErrCorruptObject) {
+		t.Fatalf("Load symlink error = %v, want ErrCorruptObject", err)
+	}
+}
+
+func TestFileSealedStateStoreLimitsCancellationAndDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	directory := privateTestDirectory(t)
+	path := filepath.Join(directory, "diagnostic-secret-path.state")
+	binding := []byte("secret-binding-must-not-appear")
+	key, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, _ := newFileSealedStateTestStore(t, path, binding, "diagnostic-key", key)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, err := store.Load(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Load error = %v", err)
+	}
+	if _, err := store.CompareAndSwap(canceled, nil, []byte("secret-state")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled CAS error = %v", err)
+	}
+	if _, _, _, err := store.Load(nil); err == nil {
+		t.Fatal("Load accepted nil context")
+	}
+	if _, err := store.CompareAndSwap(nil, nil, nil); err == nil {
+		t.Fatal("CompareAndSwap accepted nil context")
+	}
+
+	if s3disk.DefaultFileSealedStateMaxEnvelopeBytes < int64(publisherstate.MaximumEnvelopeBytes) {
+		t.Fatalf("default envelope limit = %d, cannot contain publisherstate maximum %d", s3disk.DefaultFileSealedStateMaxEnvelopeBytes, publisherstate.MaximumEnvelopeBytes)
+	}
+	smallStore, _ := newFileSealedStateTestStoreWithOptions(t, filepath.Join(directory, "small.state"), s3disk.FileSealedStateStoreOptions{
+		Binding: []byte("small-limit"), MaxEnvelopeBytes: 32,
+	})
+	if _, err := smallStore.CompareAndSwap(context.Background(), nil, make([]byte, 33)); !errors.Is(err, s3disk.ErrResourceLimit) {
+		t.Fatalf("oversized plaintext error = %v, want ErrResourceLimit", err)
+	}
+	if _, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Binding: binding, Protector: mustPublisherStateProtector(t, "limit-key", publisherstate.RecoveryKey{}),
+		MaxEnvelopeBytes: s3disk.FileSealedStateMaxEnvelopeBytesLimit + 1,
+	}); !errors.Is(err, s3disk.ErrResourceLimit) {
+		t.Fatalf("oversized configured limit error = %v, want ErrResourceLimit", err)
+	}
+
+	diagnostics := []string{fmt.Sprint(store), fmt.Sprintf("%#v", store)}
+	encoded, err := json.Marshal(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostics = append(diagnostics, string(encoded))
+	for _, diagnostic := range diagnostics {
+		for _, secret := range []string{path, string(binding), key.ExportSecret(), "diagnostic-key"} {
+			if strings.Contains(diagnostic, secret) {
+				t.Fatalf("diagnostic %q contains secret/configuration %q", diagnostic, secret)
+			}
+		}
+		if !strings.Contains(diagnostic, "redacted") {
+			t.Fatalf("diagnostic %q is not explicitly redacted", diagnostic)
+		}
+	}
+}
+
+func newFileSealedStateTestStore(
+	t *testing.T,
+	path string,
+	binding []byte,
+	keyID string,
+	key publisherstate.RecoveryKey,
+) (*s3disk.FileSealedStateStore, publisherstate.RecoveryKey) {
+	t.Helper()
+	if key.ExportSecret() == "" {
+		var err error
+		key, err = publisherstate.GenerateRecoveryKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	protector := mustPublisherStateProtector(t, keyID, key)
+	store, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Protector: protector, Binding: binding,
+	})
+	if errors.Is(err, s3disk.ErrTrustStateUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, key
+}
+
+func newFileSealedStateTestStoreWithOptions(
+	t *testing.T,
+	path string,
+	options s3disk.FileSealedStateStoreOptions,
+) (*s3disk.FileSealedStateStore, publisherstate.RecoveryKey) {
+	t.Helper()
+	key, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.Protector = mustPublisherStateProtector(t, "test-key", key)
+	store, err := s3disk.NewFileSealedStateStore(path, options)
+	if errors.Is(err, s3disk.ErrTrustStateUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, key
+}
+
+func mustPublisherStateProtector(t *testing.T, keyID string, key publisherstate.RecoveryKey) *publisherstate.AESGCMProtector {
+	t.Helper()
+	if key.ExportSecret() == "" {
+		var err error
+		key, err = publisherstate.GenerateRecoveryKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	protector, err := publisherstate.NewAESGCMProtector(keyID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protector
+}
