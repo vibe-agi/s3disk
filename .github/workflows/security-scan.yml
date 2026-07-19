@@ -1,0 +1,63 @@
+name: Scheduled vulnerability scan
+
+on:
+  schedule:
+    - cron: "17 19 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-vulnerability-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.5"
+  GOVULNCHECK_VERSION: "v1.6.0"
+  GOWORK: "off"
+  GOFLAGS: "-mod=readonly"
+  GOTOOLCHAIN: "local"
+
+jobs:
+  govulncheck:
+    name: Go vulnerability database scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Scan modules for newly disclosed vulnerabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(go env GOVERSION)" == "go$GO_VERSION" ]]
+          mkdir -p artifacts
+          tool_dir="$RUNNER_TEMP/s3disk-security-tools"
+          mkdir -p "$tool_dir"
+          {
+            git rev-parse HEAD
+            go version
+            go env GOOS GOARCH GOVERSION GOWORK GOFLAGS GOTOOLCHAIN
+            go mod download
+            git diff --exit-code -- go.mod go.sum
+            GOFLAGS="" GOBIN="$tool_dir" go install \
+              "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK_VERSION"
+            "$tool_dir/govulncheck" -version
+            "$tool_dir/govulncheck" -scan=module
+          } 2>&1 | tee artifacts/govulncheck.log
+      - name: Archive vulnerability evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: scheduled-vulnerability-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
