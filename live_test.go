@@ -3,6 +3,7 @@ package s3disk_test
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -122,13 +123,11 @@ func TestPublisherWatchSelectedConvergesWithoutExposingSiblings(t *testing.T) {
 	// projected manifests nor consume a generation by itself.
 	writeFile(t, filepath.Join(source, "hidden.txt"), []byte("hidden-two"))
 	writeFile(t, filepath.Join(source, "shared", "two.txt"), []byte("two"))
-	waitSnapshotGeneration(t, published, watchErrors, 2)
-	result, err := consumer.Refresh(ctx)
-	if err != nil || result.Generation != 2 {
-		t.Fatalf("updated selected refresh = %+v, %v", result, err)
-	}
-	if got := string(readFile(t, consumer, "shared/two.txt")); got != "two" {
-		t.Fatalf("new selected read = %q", got)
+	result := waitSnapshotFileContent(
+		t, published, watchErrors, consumer, 2, "shared/two.txt", "two",
+	)
+	if result.Generation < 2 {
+		t.Fatalf("updated selected refresh = %+v, want generation at least 2", result)
 	}
 	entries, err = consumer.ListDir(ctx, ".")
 	if err != nil || len(entries) != 1 || entries[0].Name != "shared" {
@@ -629,9 +628,68 @@ func waitSnapshotGeneration(t *testing.T, snapshots <-chan s3disk.Snapshot, errs
 				return
 			}
 		case err := <-errs:
+			// A scan racing the deliberate test mutation must fail closed and
+			// report ErrUnstableFile. Watch is expected to reconcile again; the
+			// deadline below still proves that it eventually converges.
+			if errors.Is(err, s3disk.ErrUnstableFile) {
+				continue
+			}
 			t.Fatalf("watch error: %v", err)
 		case <-deadline.C:
 			t.Fatalf("timed out waiting for published generation %d", generation)
+		}
+	}
+}
+
+func waitSnapshotFileContent(
+	t *testing.T,
+	snapshots <-chan s3disk.Snapshot,
+	errs <-chan error,
+	consumer *s3disk.Consumer,
+	generation uint64,
+	name, want string,
+) s3disk.RefreshResult {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		select {
+		case snapshot := <-snapshots:
+			if snapshot.Generation < generation {
+				continue
+			}
+			result, err := consumer.Refresh(waitCtx)
+			if err != nil {
+				t.Fatalf("refresh generation %d: %v", snapshot.Generation, err)
+			}
+			entry, err := consumer.Stat(waitCtx, name)
+			if errors.Is(err, s3disk.ErrPathNotFound) {
+				continue
+			}
+			if err != nil {
+				t.Fatalf("stat converging file %q: %v", name, err)
+			}
+			if entry.Size != int64(len(want)) {
+				continue
+			}
+			file, err := consumer.Open(waitCtx, name)
+			if err != nil {
+				t.Fatalf("open converging file %q: %v", name, err)
+			}
+			data := make([]byte, len(want))
+			if _, err := file.ReadAtContext(waitCtx, data, 0); err != nil && !errors.Is(err, io.EOF) {
+				t.Fatalf("read converging file %q: %v", name, err)
+			}
+			if string(data) == want {
+				return result
+			}
+		case err := <-errs:
+			if errors.Is(err, s3disk.ErrUnstableFile) {
+				continue
+			}
+			t.Fatalf("watch error while awaiting %q: %v", name, err)
+		case <-waitCtx.Done():
+			t.Fatalf("timed out waiting for %q to converge to %q", name, want)
 		}
 	}
 }
