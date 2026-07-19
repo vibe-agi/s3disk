@@ -1,0 +1,67 @@
+name: Trusted DCO
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: trusted-dco-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-dco:
+    name: Trusted DCO sign-off
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # pull_request_target loads this workflow from the trusted base branch.
+      # Keep the checkout pinned to that exact base commit. The PR tree is
+      # never checked out and no executable content from it is invoked.
+      - name: Check out trusted checker
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          # The read-only token remains just long enough to fetch the base
+          # repository's refs/pull metadata when the repository is private.
+          # It is removed before the checker runs.
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Fetch untrusted commit metadata without checkout
+        if: github.event_name == 'pull_request_target'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          fetched_ref="refs/remotes/origin/s3disk-pr-$PR_NUMBER"
+          git fetch --no-tags --force origin \
+            "+refs/pull/$PR_NUMBER/head:$fetched_ref"
+          git config --local --unset-all http.https://github.com/.extraheader || :
+          actual_head=$(git rev-parse "$fetched_ref^{commit}")
+          [[ "$actual_head" == "$EXPECTED_HEAD_SHA" ]]
+          ./scripts/check-dco.sh "$BASE_SHA..$EXPECTED_HEAD_SHA"
+      # The pull request has already crossed the trusted base-branch check
+      # before it can enter a protected merge queue. Recheck the synthesized
+      # queue commit so the same required status is reported for merge_group.
+      - name: Check out merge-queue commit
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check merge-queue commits
+        if: github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: ./scripts/check-dco.sh "$BASE_SHA..$HEAD_SHA"

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -21,6 +22,50 @@ env:
   GOFLAGS: "-mod=readonly"
 
 jobs:
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check pull-request commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/check-dco.sh "$BASE_SHA..$HEAD_SHA"
+      - name: Check merge-queue commits
+        if: github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: ./scripts/check-dco.sh "$BASE_SHA..$HEAD_SHA"
+      - name: Check pushed commits
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] ||
+            ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null
+          then
+            # A lone revision makes check-dco scan every reachable non-merge
+            # ancestor, covering a new or force-updated branch fail-closed.
+            ./scripts/check-dco.sh "$HEAD_SHA"
+          else
+            ./scripts/check-dco.sh "$BEFORE_SHA..$HEAD_SHA"
+          fi
+      - name: Check dispatched commit
+        if: github.event_name == 'workflow_dispatch'
+        run: ./scripts/check-dco.sh 'HEAD^!'
+
   native-platforms:
     name: Native tests (${{ matrix.os }})
     strategy:
@@ -273,6 +318,10 @@ jobs:
         run: |
           set -o pipefail
           ./scripts/test-release-ref.sh 2>&1 | tee artifacts/release-reference-test.log
+      - name: DCO gate self-test
+        run: |
+          set -o pipefail
+          ./scripts/test-dco.sh 2>&1 | tee artifacts/dco-test.log
       - name: Lint GitHub Actions workflows
         env:
           GOFLAGS: ""
@@ -347,3 +396,45 @@ jobs:
           path: artifacts/
           if-no-files-found: warn
           retention-days: 30
+
+  required-gate:
+    name: Required CI gate
+    if: always()
+    needs:
+      - dco
+      - native-platforms
+      - minimum-go
+      - cross-build
+      - quality
+      - minio
+      - model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every protected job
+        env:
+          DCO_RESULT: ${{ needs.dco.result }}
+          NATIVE_RESULT: ${{ needs.native-platforms.result }}
+          MINIMUM_GO_RESULT: ${{ needs.minimum-go.result }}
+          CROSS_BUILD_RESULT: ${{ needs.cross-build.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          MINIO_RESULT: ${{ needs.minio.result }}
+          MODEL_RESULT: ${{ needs.model.result }}
+        run: |
+          set -euo pipefail
+          require_success() {
+            local job_name=$1
+            local result=$2
+            if [[ "$result" != "success" ]]; then
+              echo "required job $job_name finished with result $result" >&2
+              exit 1
+            fi
+          }
+          require_success dco "$DCO_RESULT"
+          require_success native-platforms "$NATIVE_RESULT"
+          require_success minimum-go "$MINIMUM_GO_RESULT"
+          require_success cross-build "$CROSS_BUILD_RESULT"
+          require_success quality "$QUALITY_RESULT"
+          require_success minio "$MINIO_RESULT"
+          require_success model "$MODEL_RESULT"

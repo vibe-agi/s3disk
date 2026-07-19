@@ -24,6 +24,8 @@ go test -race ./...
 go vet ./...
 ./scripts/check-project-license.sh
 ./scripts/check-third-party.sh
+./scripts/check-dco.sh HEAD
+./scripts/test-dco.sh
 ./scripts/test-release-ref.sh
 ```
 
@@ -60,4 +62,6 @@ Signed-off-by: Your Name <your-email@example.com>
 Add it with `git commit -s`. By signing off, you certify the Developer
 Certificate of Origin 1.1 at <https://developercertificate.org/>: you created
 the contribution or otherwise have the right to submit it under the project's
-license. A sign-off is not a copyright assignment.
+license. A sign-off is not a copyright assignment. CI checks every non-merge
+commit in a pull request and requires a trailer which exactly matches that
+commit's author identity.

@@ -543,7 +543,14 @@ accept or resolve each one explicitly.
 
 1. Put the candidate on a protected branch and record its full lowercase commit
    ID. The tree must be committed and clean; test output from an uncommitted
-   checkout is not attributable release evidence.
+   checkout is not attributable release evidence. Configure the repository
+   ruleset to require the stable `Required CI gate` and `Trusted DCO sign-off`
+   statuses, CODEOWNER review, and resolved review threads, and to reject branch
+   deletion and force-pushes with no administrator bypass. Prefer an
+   independently managed DCO App or organization required workflow as an
+   additional authority. The checked-in workflows, `CODEOWNERS`, and DCO script
+   do not themselves prove those GitHub settings are enabled; archive an
+   independent settings review with the candidate.
 2. Manually run `Commercial Linux release gate`, select that branch, and enter
    the intended `candidate_version` and exact `candidate_commit`. The workflow
    rejects a commit other than the selected branch head and checks out the

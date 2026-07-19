@@ -63,7 +63,9 @@ require_clean_tree() {
 
 for required_file in \
   LICENSE NOTICE README.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md \
-  docs/COMPATIBILITY.md docs/COMMERCIAL_RELEASE.md
+  docs/COMPATIBILITY.md docs/COMMERCIAL_RELEASE.md .github/CODEOWNERS \
+  .github/workflows/ci.yml .github/workflows/dco.yml \
+  scripts/check-dco.sh scripts/test-dco.sh
 do
   [ -s "$required_file" ] || fail "missing or empty $required_file"
 done
@@ -186,6 +188,8 @@ unformatted=$(rg --files -g '*.go' -0 | xargs -0 gofmt -l)
 
 ./scripts/check-project-license.sh
 ./scripts/check-third-party.sh
+./scripts/check-dco.sh HEAD
+./scripts/test-dco.sh
 ./scripts/test-release-ref.sh
 
 command -v actionlint >/dev/null 2>&1 || fail "actionlint v1.7.7 is required on the reviewed release runner"

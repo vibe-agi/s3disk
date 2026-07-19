@@ -1,0 +1,12 @@
+# Default review owner for every change.
+* @xujinzheng
+
+# Security, protocol, automation, release, and dependency boundaries remain
+# explicit so future ownership changes cannot accidentally leave them unowned.
+/.github/ @xujinzheng
+/SECURITY.md @xujinzheng
+/go.mod @xujinzheng
+/go.sum @xujinzheng
+/scripts/ @xujinzheng
+/spec/ @xujinzheng
+/third_party/ @xujinzheng
