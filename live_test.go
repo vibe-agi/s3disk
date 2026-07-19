@@ -20,7 +20,7 @@ func TestPublisherWatchAndConsumerPollConverge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestPublisherWatchSelectedConvergesWithoutExposingSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestPublisherWatchCallsOnPublishedOnlyAfterHookReturns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +281,7 @@ func TestPublisherWatchCancellationReachesAfterPublishedHook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestPublisherWatchWithoutAfterPublishedUsesNormalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestPollCallbackPanicIsReportedAndContained(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func TestPollOnResultNotifiesBothPollersWhenOneAdopts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +530,7 @@ func TestPollOnResultSeesSnapshotAdoptedByExternalRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

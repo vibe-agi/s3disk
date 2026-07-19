@@ -3,6 +3,7 @@ package s3disk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -123,6 +124,51 @@ func TestRepositoryClientEncryptionIgnoresExternalAppliedClaim(t *testing.T) {
 	}
 	if !bytes.Equal(opened, plaintext) {
 		t.Fatalf("backing ciphertext opened to %q, want %q", opened, plaintext)
+	}
+}
+
+func TestRepositoryRejectsUnannouncedAppliedClientEncryption(t *testing.T) {
+	t.Parallel()
+
+	repositoryID, err := GenerateRepositoryID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateClientEncryptionKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewClientEncryptionProfile(repositoryID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped, err := NewClientEncryptedStore(repositoryEncryptionNoopStore{}, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewRepository(wrapped, "private/unannounced"); !errors.Is(err, ErrStoreMisconfigured) || !errors.Is(err, ErrRepositoryConfigurationMismatch) {
+		t.Fatalf("NewRepository error = %v, want store and repository configuration mismatch", err)
+	}
+	if _, err := NewReadOnlyRepository(wrapped, "private/unannounced"); !errors.Is(err, ErrStoreMisconfigured) || !errors.Is(err, ErrRepositoryConfigurationMismatch) {
+		t.Fatalf("NewReadOnlyRepository error = %v, want store and repository configuration mismatch", err)
+	}
+}
+
+func TestPublisherRequiresCommissionedRepositoryByDefault(t *testing.T) {
+	t.Parallel()
+
+	repository, err := NewRepository(repositoryEncryptionNoopStore{}, "private/uncommissioned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewPublisher(repository, PublisherOptions{}); !errors.Is(err, ErrRepositoryNotInitialized) {
+		t.Fatalf("NewPublisher error = %v, want ErrRepositoryNotInitialized", err)
+	}
+	if _, err := NewPublisher(repository, PublisherOptions{
+		DangerouslyAllowUncommissionedRepository: true,
+	}); err != nil {
+		t.Fatalf("NewPublisher with explicit legacy override: %v", err)
 	}
 }
 

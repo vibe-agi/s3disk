@@ -20,7 +20,12 @@ type PublisherOptions struct {
 	Chunking        ChunkingOptions
 	StableReadTries int
 	Symlinks        SymlinkPolicy
-	ReferenceSigner ReferenceSigner
+	// DangerouslyAllowUncommissionedRepository permits publication through a
+	// low-level Repository which has no durable commissioning descriptor. This
+	// disables prefix/profile/chunking identity protection and is intended only
+	// for controlled legacy migration and protocol tests.
+	DangerouslyAllowUncommissionedRepository bool
+	ReferenceSigner                          ReferenceSigner
 	// ReferenceVerifier is required with ReferenceSigner and must trust the
 	// signing key. It also authenticates the existing signed history.
 	ReferenceVerifier ReferenceVerifier
@@ -60,6 +65,12 @@ func NewPublisher(repository *Repository, options PublisherOptions) (*Publisher,
 	if repository.store == nil {
 		return nil, fmt.Errorf("%w: Publisher requires Head and conditional write authority", ErrRepositoryReadOnly)
 	}
+	if repository.descriptor == nil && !options.DangerouslyAllowUncommissionedRepository {
+		return nil, fmt.Errorf(
+			"%w: Publisher requires InitializeRepository or an explicit dangerous legacy override",
+			ErrRepositoryNotInitialized,
+		)
+	}
 	if options.ReferenceSigner != nil && !interfaceDependencyConfigured(options.ReferenceSigner) {
 		return nil, fmt.Errorf("s3disk: reference signer must not be a typed nil")
 	}
@@ -69,11 +80,18 @@ func NewPublisher(repository *Repository, options PublisherOptions) (*Publisher,
 	if options.PublicationJournal != nil && !interfaceDependencyConfigured(options.PublicationJournal) {
 		return nil, fmt.Errorf("s3disk: publication journal must not be a typed nil")
 	}
-	normalized, err := options.Chunking.normalized()
-	if err != nil {
-		return nil, err
+	if repository.descriptor != nil && options.Chunking == (ChunkingOptions{}) {
+		options.Chunking = repository.descriptor.ChunkingOptions()
+	} else {
+		normalized, err := options.Chunking.normalized()
+		if err != nil {
+			return nil, err
+		}
+		if repository.descriptor != nil && normalized != repository.descriptor.ChunkingOptions() {
+			return nil, fmt.Errorf("%w: publisher chunking differs from repository descriptor", ErrRepositoryConfigurationMismatch)
+		}
+		options.Chunking = normalized
 	}
-	options.Chunking = normalized
 	if options.StableReadTries == 0 {
 		options.StableReadTries = 3
 	}
@@ -88,6 +106,10 @@ func NewPublisher(repository *Repository, options PublisherOptions) (*Publisher,
 	}
 	if options.ReferenceSigner != nil && (options.ReferenceSigner.RepositoryID().IsZero() || options.ReferenceSigner.RepositoryID() != options.ReferenceVerifier.RepositoryID()) {
 		return nil, fmt.Errorf("%w: publisher signer/verifier repository mismatch", ErrUntrustedReference)
+	}
+	if repository.descriptor != nil && options.ReferenceSigner != nil &&
+		options.ReferenceSigner.RepositoryID() != repository.descriptor.RepositoryID {
+		return nil, fmt.Errorf("%w: publisher signer does not match repository descriptor", ErrUntrustedReference)
 	}
 	if options.ReferenceSigner != nil {
 		if options.PublicationJournal == nil {

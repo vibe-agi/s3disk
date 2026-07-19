@@ -27,6 +27,7 @@ type Repository struct {
 	store            Store
 	prefix           string
 	clientEncryption *ClientEncryptionProfile
+	descriptor       *RepositoryDescriptor
 }
 
 // RepositoryOptions selects an explicit, versioned repository storage
@@ -37,19 +38,30 @@ type RepositoryOptions struct {
 	ClientEncryption *ClientEncryptionProfile
 }
 
-// NewRepository constructs a repository with full publication authority.
+// NewRepository constructs a low-level, uncommissioned repository retaining
+// full store authority. NewPublisher rejects it unless the caller selects the
+// explicit dangerous legacy override; normal writable deployments should use
+// InitializeRepository.
 func NewRepository(store Store, prefix string) (*Repository, error) {
 	return NewRepositoryWithOptions(store, prefix, RepositoryOptions{})
 }
 
-// NewRepositoryWithOptions constructs a repository with full publication
-// authority and the selected storage profile.
+// NewRepositoryWithOptions constructs a low-level, uncommissioned repository
+// retaining full store authority and the selected storage profile. It performs
+// no descriptor I/O; normal writable deployments should use
+// InitializeRepository.
 func NewRepositoryWithOptions(store Store, prefix string, options RepositoryOptions) (*Repository, error) {
 	if store == nil {
 		return nil, fmt.Errorf("s3disk: nil store")
 	}
 	if !interfaceDependencyConfigured(store) {
 		return nil, fmt.Errorf("s3disk: store must not be a typed nil")
+	}
+	if options.ClientEncryption == nil && builtInClientEncryptionWrapper(store) {
+		return nil, fmt.Errorf(
+			"%w: %w: an encrypted store requires matching repository client-encryption options",
+			ErrStoreMisconfigured, ErrRepositoryConfigurationMismatch,
+		)
 	}
 	reader := ObjectReader(store)
 	writable := store
@@ -81,6 +93,12 @@ func NewReadOnlyRepositoryWithOptions(reader ObjectReader, prefix string, option
 	}
 	if !interfaceDependencyConfigured(reader) {
 		return nil, fmt.Errorf("s3disk: object reader must not be a typed nil")
+	}
+	if options.ClientEncryption == nil && builtInClientEncryptionWrapper(reader) {
+		return nil, fmt.Errorf(
+			"%w: %w: an encrypted object reader requires matching repository client-encryption options",
+			ErrStoreMisconfigured, ErrRepositoryConfigurationMismatch,
+		)
 	}
 	if options.ClientEncryption != nil {
 		if !clientEncryptionAlreadyApplied(reader, options.ClientEncryption) {
@@ -123,6 +141,26 @@ func (repository *Repository) key(relative string) string {
 		base = repository.prefix + "/" + base
 	}
 	return base + "/" + relative
+}
+
+// DescriptorKey returns the exact write-once commissioning-record key for the
+// repository prefix. It is useful for least-privilege policy construction.
+func (repository *Repository) DescriptorKey() string {
+	if repository == nil {
+		return ""
+	}
+	return repository.key("repository")
+}
+
+// Descriptor returns the validated commissioning record when the Repository
+// was created through InitializeRepository, OpenRepository, or
+// OpenReadOnlyRepository. Low-level NewRepository constructors intentionally
+// perform no Store I/O and therefore return false here.
+func (repository *Repository) Descriptor() (RepositoryDescriptor, bool) {
+	if repository == nil || repository.descriptor == nil {
+		return RepositoryDescriptor{}, false
+	}
+	return *repository.descriptor, true
 }
 
 // ReferenceKey returns the exact store key used for a channel's mutable

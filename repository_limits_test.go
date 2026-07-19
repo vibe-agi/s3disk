@@ -51,7 +51,7 @@ func TestRepositoryRejectsObjectKeysBeyondS3LimitBeforeIO(t *testing.T) {
 
 	// The public entry point must reject the key before reading the source or
 	// touching the store as well.
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

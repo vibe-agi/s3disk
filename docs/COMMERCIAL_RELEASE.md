@@ -57,15 +57,25 @@ for a storage component that handles customer source data.
 - The `strict-share-isolation-v1` profile now provides per-share client-side
   encryption, opaque immutable object IDs, and encrypted roots, references,
   manifests, and chunks while retaining lazy reads and within-share
-  deduplication. This narrows but does not close the blocker. There is still no
-  repository initialization record that durably binds a prefix to its storage
-  profile and chunking polynomial, no repository-level KEK or repository-dedup
-  mode, and no certified key rotation or migration path. Existing prefixes
-  cannot be silently reinterpreted or upgraded, and the local `DiskCache`
-  remains plaintext. The current CLI also does not persist/wrap the share key,
-  publisher private signing key, or root capability and cannot resume the same
-  share after A crashes; secure recovery, backup, and zeroization remain product
-  work.
+  deduplication. `InitializeRepository` now installs a write-once descriptor
+  binding the normalized prefix, `RepositoryID`, storage profile, and Rabin
+  chunking algorithm and parameters; identical initialization is idempotent,
+  conflicting configuration fails closed, and descriptor creation requires an
+  explicit `ConfirmEmptyPrefix` assertion. `NewPublisher` rejects an
+  uncommissioned repository by default; the only bypass is the explicitly
+  dangerous legacy option. The A-side `share publish` CLI allocates a fresh
+  random share namespace, confirms it for initialization, and uses this safe
+  path. This narrows but does not close the blocker. The Store interface cannot
+  prove a legacy prefix is empty, so an operator must never assert
+  `ConfirmEmptyPrefix` for an existing namespace without an independent
+  inventory and migration decision. The descriptor is not yet included in the
+  signed share-root bundle or its exact capability closure, so B does not fetch
+  or authenticate it as part of root adoption.
+  There is no repository-level KEK or repository-dedup mode and no certified key
+  rotation or migration path. The local `DiskCache` also remains plaintext. The
+  current CLI does not persist/wrap the share key, publisher private signing key,
+  or root capability and cannot resume the same share after A crashes; secure
+  recovery, backup, and zeroization remain product work.
 
 <!-- RELEASE-BLOCKER: trust-root-lifecycle -->
 
@@ -274,6 +284,20 @@ accept or resolve each one explicitly.
   contains the share key but no `SecretAccessKey`, credential provider, or
   reusable signer; account for the access-key ID and temporary session token
   that a bearer URL can expose.
+- Require A to create or exactly reopen the repository through
+  `InitializeRepository`. Test descriptor idempotence, concurrent initialization,
+  conflicting repository ID/profile/chunking rejection, encrypted raw storage,
+  wrong-key failure, and reconciliation after a lost `PutIfAbsent` response.
+  When the descriptor is absent, require `ConfirmEmptyPrefix=false` to return
+  `ErrRepositoryNotInitialized` with zero writes, and permit true only for a
+  separately allocated and inventoried empty namespace. Test that
+  `NewPublisher` rejects an uncommissioned repository by default and that the
+  dangerous legacy opt-out is never selected by the commercial CLI or product
+  configuration.
+  Until the descriptor is cryptographically included in the signed root bundle,
+  archive evidence that B neither receives nor requests a descriptor capability
+  and instead binds its read-only repository to the authenticated handoff and
+  signed root. Do not present the A-side descriptor as B-side trust evidence.
 - Require an independent cryptographic design review plus stable envelope test
   vectors, cross-version decode evidence, fuzzing, randomness-failure tests,
   and key-lifecycle/zeroization review. The consistency TLA+ model does not

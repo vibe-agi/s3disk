@@ -77,6 +77,15 @@ var (
 	ErrAccessDenied              = errors.New("s3disk: object store access denied")
 	ErrRateLimited               = errors.New("s3disk: object store rate limited")
 	ErrStoreUnavailable          = errors.New("s3disk: object store temporarily unavailable")
+	// ErrRepositoryNotInitialized reports that the write-once repository
+	// commissioning descriptor is absent.
+	ErrRepositoryNotInitialized = errors.New("s3disk: repository is not initialized")
+	// ErrRepositoryConfigurationMismatch reports that caller-held identity,
+	// profile, prefix, or chunking state differs from the durable descriptor.
+	ErrRepositoryConfigurationMismatch = errors.New("s3disk: repository configuration mismatch")
+	// ErrRepositoryInitializationIndeterminate reports that descriptor creation
+	// may have reached the Store but could not be reconciled through a later GET.
+	ErrRepositoryInitializationIndeterminate = errors.New("s3disk: repository initialization outcome indeterminate")
 	// ErrRepositoryReadOnly reports that an operation requiring Head or write
 	// authority was attempted through a repository deliberately constructed
 	// with only ObjectReader capability.

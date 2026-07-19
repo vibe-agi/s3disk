@@ -127,6 +127,8 @@ jobs:
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-reference.log
           go test ./ -run='^$' -fuzz='^FuzzVerifySignedReferenceNeverPanics$' \
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-signed-reference.log
+          go test ./ -run='^$' -fuzz='^FuzzOpenRepositoryDescriptorNeverPanics$' \
+            -fuzztime=10s 2>&1 | tee artifacts/fuzz-repository-descriptor.log
       - name: Third-party compliance
         run: |
           set -o pipefail

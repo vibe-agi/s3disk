@@ -19,7 +19,7 @@ func TestPublisherRejectsImpossibleChunkCountBeforeUploading(t *testing.T) {
 		t.Fatal(err)
 	}
 	options := ChunkingOptions{MinSize: 64, AverageSize: 128, MaxSize: 129}
-	publisher, err := NewPublisher(repository, PublisherOptions{Chunking: options})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true, Chunking: options})
 	if err != nil {
 		t.Fatal(err)
 	}

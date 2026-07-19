@@ -76,7 +76,7 @@ func newSnapshotBundleFixture(t *testing.T) snapshotBundleFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -66,7 +66,8 @@ func TestEmptyPublicationJournalRequiresFreshBootstrapChoice(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier, PublicationJournal: journal,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier, PublicationJournal: journal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +92,8 @@ func TestSignedPublisherRejectsZeroJournalRevisionBeforeRemoteCAS(t *testing.T) 
 	}
 	journal := &zeroPendingRevisionJournal{base: fileJournal}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -130,7 +132,8 @@ func TestSignedPublisherRejectsVersionIDOnlyReferenceBeforePending(t *testing.T)
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -220,7 +223,8 @@ func TestSignedPublishReconcilesLostJournalCASResponses(t *testing.T) {
 				base: fileJournal, loseBegin: test.loseBegin, loseFinalize: test.loseFinalize,
 			}
 			publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-				ReferenceSigner: signer, ReferenceVerifier: verifier,
+				DangerouslyAllowUncommissionedRepository: true,
+				ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 				PublicationJournal: journal, AllowTrustOnFirstUse: true,
 			})
 			if err != nil {
@@ -265,7 +269,8 @@ func TestSignedPublishRecoversSuccessfulRemoteCASWithLostResponse(t *testing.T) 
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -296,7 +301,8 @@ func TestSignedStagedPublishSurvivesBaseResign(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldPublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: oldSigner, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          oldSigner, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -314,7 +320,8 @@ func TestSignedStagedPublishSurvivesBaseResign(t *testing.T) {
 		t.Fatal(err)
 	}
 	newPublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -355,7 +362,8 @@ func TestResignRecoveryUsesExactJournaledEnvelopeWithoutSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldPublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: oldSigner, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          oldSigner, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -367,7 +375,8 @@ func TestResignRecoveryUsesExactJournaledEnvelopeWithoutSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 	newPublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -395,7 +404,8 @@ func TestResignRecoveryUsesExactJournaledEnvelopeWithoutSigner(t *testing.T) {
 	}
 	unavailable := &unavailableReferenceSigner{delegate: newSigner}
 	restarted, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: unavailable, ReferenceVerifier: verifier, PublicationJournal: restartedJournal,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          unavailable, ReferenceVerifier: verifier, PublicationJournal: restartedJournal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -429,7 +439,8 @@ func TestConcurrentResignRecoveryNeverUsesCommitAncestryAsEnvelopeProof(t *testi
 		t.Fatal(err)
 	}
 	oldPublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: oldSigner, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          oldSigner, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -468,7 +479,8 @@ func TestConcurrentResignRecoveryNeverUsesCommitAncestryAsEnvelopeProof(t *testi
 		return base.CompareAndSwap(ctx, key, expected, data)
 	}
 	resigner, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -497,7 +509,8 @@ func TestConcurrentResignRecoveryNeverUsesCommitAncestryAsEnvelopeProof(t *testi
 		RepositoryID: verifier.RepositoryID(), Generation: first.Generation, Commit: first.Commit,
 	}
 	competitor, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: oldSigner, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          oldSigner, ReferenceVerifier: verifier,
 		PublicationJournal: competitorJournal, TrustedCheckpoint: &checkpoint,
 	})
 	if err != nil {
@@ -510,7 +523,8 @@ func TestConcurrentResignRecoveryNeverUsesCommitAncestryAsEnvelopeProof(t *testi
 	}
 
 	recoveryPublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          newSigner, ReferenceVerifier: verifier, PublicationJournal: journal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -547,7 +561,8 @@ func TestSignedRecoveryClassifiesConcurrentWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisherA, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journalA, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -582,7 +597,8 @@ func TestSignedRecoveryClassifiesConcurrentWinner(t *testing.T) {
 	}
 	checkpoint := s3disk.Watermark{RepositoryID: verifier.RepositoryID(), Generation: first.Generation, Commit: first.Commit}
 	publisherB, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journalB, TrustedCheckpoint: &checkpoint,
 	})
 	if err != nil {
@@ -621,7 +637,8 @@ func TestSignedRecoveryRecognizesPublishedDescendant(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisherA, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journalA, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -667,7 +684,8 @@ func TestSignedRecoveryRecognizesPublishedDescendant(t *testing.T) {
 	}
 	checkpoint := s3disk.Watermark{RepositoryID: verifier.RepositoryID(), Generation: first.Generation, Commit: first.Commit}
 	publisherB, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journalB, TrustedCheckpoint: &checkpoint,
 	})
 	if err != nil {

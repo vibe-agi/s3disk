@@ -26,7 +26,7 @@ func TestStagedSnapshotIsInvisibleUntilCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestConsumerNeverRegressesAndOpenFilePinsItsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestPublishingUnchangedTreeDoesNotAdvanceGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestPublisherRejectsSymlinkAsSourceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestUnsafeSymlinkRequiresExplicitPreservePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	safePublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	safePublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestUnsafeSymlinkRequiresExplicitPreservePolicy(t *testing.T) {
 		t.Fatalf("safe publish error = %v, want ErrUnsafeSymlink", err)
 	}
 
-	preservePublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{Symlinks: s3disk.SymlinkPreserve})
+	preservePublisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true, Symlinks: s3disk.SymlinkPreserve})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestPublisherNeverFollowsPreservedSymlinkForContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{Symlinks: s3disk.SymlinkPreserve})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true, Symlinks: s3disk.SymlinkPreserve})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestPublisherRetryUsesMetadataFromStableFileVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

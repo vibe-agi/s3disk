@@ -24,7 +24,8 @@ func TestConsumerBoundsMetadataAndChunkDownloadsTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		Chunking: s3disk.ChunkingOptions{MinSize: 64, AverageSize: 128, MaxSize: 256},
+		DangerouslyAllowUncommissionedRepository: true,
+		Chunking:                                 s3disk.ChunkingOptions{MinSize: 64, AverageSize: 128, MaxSize: 256},
 	})
 	if err != nil {
 		t.Fatal(err)

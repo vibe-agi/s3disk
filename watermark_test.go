@@ -21,7 +21,7 @@ func TestPersistentWatermarkPreventsRollbackAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestSharedWatermarkAdvanceForcesUnconditionalRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestConsumerReconcilesAmbiguousWatermarkCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

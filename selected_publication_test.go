@@ -33,7 +33,7 @@ func TestPublishSelectedHidesUnselectedSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestPublishSelectedDirectoryIncludesCompleteSubtree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestPublishSelectedSymlinkDoesNotIncludeItsTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestPublishSelectedGenerationTracksOnlyProjectedTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,8 @@ func TestPublishSelectedUsesSignedPublicationPipeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -241,7 +242,7 @@ func TestStageSelectedValidatesSelectionBeforeObjectStoreIO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +291,7 @@ func TestStageSelectedRejectsMissingAndNonDirectoryPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

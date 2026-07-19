@@ -21,7 +21,7 @@ func TestReadOnlyRepositorySupportsConsumerWithoutWritableCapability(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(writable, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(writable, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestReadOnlyRepositoryDropsConcreteStoreWriteCapability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{}); !errors.Is(err, s3disk.ErrRepositoryReadOnly) {
+	if _, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true}); !errors.Is(err, s3disk.ErrRepositoryReadOnly) {
 		t.Fatalf("NewPublisher error = %v, want ErrRepositoryReadOnly", err)
 	}
 }

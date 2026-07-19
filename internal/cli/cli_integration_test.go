@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/vibe-agi/s3disk"
 	"github.com/vibe-agi/s3disk/presignedshare"
+	"github.com/vibe-agi/s3disk/s3store"
 )
 
 // TestMinIOCLIContinuousHandoffAndCredentialFreeRead exercises the real A-side CLI
@@ -86,6 +87,29 @@ func TestMinIOCLIContinuousHandoffAndCredentialFreeRead(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("handoff was not published: %v", err)
 		}
+	}
+	rawStore, err := s3store.New(ctx, s3store.Config{
+		Bucket: bucket, Region: defaultRegion, Endpoint: endpoint, UsePathStyle: true,
+		AllowInsecureEndpoint: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commissioned, descriptor, err := s3disk.OpenRepository(ctx, rawStore, share.wire.RepositoryPrefix, s3disk.RepositoryConfig{
+		RepositoryID: share.repository, ClientEncryption: share.profile,
+	})
+	if err != nil {
+		t.Fatalf("open CLI repository descriptor: %v", err)
+	}
+	if descriptor.RepositoryID != share.repository || descriptor.StorageProfile != s3disk.RepositoryStorageProfileStrictShareIsolationV1 {
+		t.Fatalf("CLI repository descriptor = %#v", descriptor)
+	}
+	rawDescriptor, err := rawStore.Get(ctx, commissioned.DescriptorKey(), s3disk.GetOptions{MaxBytes: 64 << 10})
+	if err != nil {
+		t.Fatalf("read raw repository descriptor: %v", err)
+	}
+	if string(rawDescriptor.Data) == "" || rawDescriptor.Data[0] == '{' {
+		t.Fatal("repository descriptor was not encrypted at rest")
 	}
 	t.Setenv("AWS_ACCESS_KEY_ID", "B-MUST-NOT-HAVE-S3-CREDENTIALS")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "B-MUST-NOT-HAVE-S3-CREDENTIALS")

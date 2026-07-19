@@ -87,7 +87,8 @@ func TestMinIOOnlyS3PresignedShare(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {
@@ -346,7 +347,8 @@ func TestMinIOOnlyS3EncryptedPresignedShare(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {

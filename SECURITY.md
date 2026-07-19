@@ -130,14 +130,32 @@ dates in customer-facing terms.
   local ACL platforms fail closed.
 - Treat each prefix, `RepositoryID`, profile, and share key as one storage
   domain. Do not mix encrypted and plaintext repositories, different profiles,
-  or ciphertext copied across prefixes. A wrong key, repository identity, or
-  exact logical key fails authentication, but there is no repository init
-  record yet to reject every accidental deployment mismatch before I/O. The
-  constructors cannot enforce per-share key/profile uniqueness, and the opaque
-  HMAC suffix does not include prefix or `ShareID`; reusing one profile across
-  prefixes leaks equality. Associated data does not bind bucket, account,
-  origin, region, S3 version, or expiry; capability, IAM, TLS, and commissioning
-  controls remain mandatory.
+  or ciphertext copied across prefixes. `InitializeRepository` creates or
+  exactly reopens a write-once `RepositoryDescriptor` binding the normalized
+  prefix, `RepositoryID`, storage profile, and Rabin chunking algorithm and
+  parameters. A descriptor-backed `Publisher` inherits that chunking profile
+  and rejects different chunking parameters or a signer for another repository;
+  the `share publish` CLI allocates a fresh random share namespace and uses this
+  initialized A-side path. If a descriptor is missing, initialization requires
+  the caller to set `RepositoryInitializationOptions.ConfirmEmptyPrefix`; without
+  it the call fails with `ErrRepositoryNotInitialized` after a read and performs
+  no write. This is an assertion that the caller has independently allocated and
+  checked a new namespace, not a `Store` verification: the API does not require
+  `LIST` and cannot detect objects in an uncommissioned legacy prefix.
+  `NewPublisher` likewise rejects a repository without a verified descriptor by
+  default. `PublisherOptions.DangerouslyAllowUncommissionedRepository` is the
+  explicit legacy escape hatch and is outside the commercial path. A wrong key,
+  repository identity, or exact logical key also fails authentication.
+  The descriptor is not yet included in the signed root bundle or its exact-GET
+  capability closure, so B does not fetch it and must not treat it as signed
+  trust evidence. Low-level repository constructors can still create an
+  uncommissioned value for read-only or explicit legacy use, but cannot silently
+  publish through it. The descriptor does not prove per-share key/profile
+  uniqueness. The opaque HMAC suffix does not include prefix or `ShareID`;
+  reusing one profile across prefixes leaks equality. Neither associated data
+  nor the descriptor binds bucket, account, origin, region, S3 version,
+  `ShareID`, or expiry; capability, IAM, TLS, and commissioning controls remain
+  mandatory.
   Within-share HMAC IDs preserve lazy loading and S3 deduplication;
   independently keyed shares do not deduplicate with each other at S3. Never
   replace this design with convergent encryption or derive encryption keys from

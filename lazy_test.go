@@ -21,6 +21,7 @@ func TestMetadataOperationsDoNotFetchFileChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repo, s3disk.PublisherOptions{
+		DangerouslyAllowUncommissionedRepository: true,
 		Chunking: s3disk.ChunkingOptions{
 			MinSize:     64,
 			AverageSize: 256,

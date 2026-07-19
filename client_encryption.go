@@ -330,6 +330,15 @@ func clientEncryptionAlreadyApplied(reader ObjectReader, profile *ClientEncrypti
 	return ok && applied.ClientEncryptionApplied(profile)
 }
 
+func builtInClientEncryptionWrapper(reader ObjectReader) bool {
+	switch reader.(type) {
+	case *ClientEncryptedStore, *clientEncryptedObjectReader:
+		return true
+	default:
+		return false
+	}
+}
+
 func newClientEncryptedObjectReader(reader ObjectReader, profile *ClientEncryptionProfile) (*clientEncryptedObjectReader, error) {
 	if reader == nil {
 		return nil, fmt.Errorf("s3disk: nil object reader")

@@ -26,7 +26,7 @@ func TestResolveSnapshotClosureReturnsExactCurrentTreeAndCommitHistory(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestResolveSnapshotClosureEnforcesBoundsBeforeUnboundedTraversal(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestResolveSnapshotClosureCountsDuplicateManifestEdges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestResolveSnapshotClosureEnforcesExactMetadataByteBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestResolveSnapshotClosureObservesCancellationInsideManifestEdges(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestSnapshotClosureIsSufficientForExactKeyConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{Chunking: ChunkingOptions{
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true, Chunking: ChunkingOptions{
 		MinSize: 64, AverageSize: 128, MaxSize: 256,
 	}})
 	if err != nil {
@@ -462,7 +462,8 @@ func TestResolveSnapshotClosureUsesAuthenticatedReferenceNamespace(t *testing.T)
 		t.Fatal(err)
 	}
 	publisher, err := NewPublisher(repository, PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {

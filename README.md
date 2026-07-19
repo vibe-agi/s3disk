@@ -139,8 +139,13 @@ if err != nil {
 	return err
 }
 const sharePrefix = "customer/project/shares/<random-share-id>"
-repository, err := s3disk.NewRepositoryWithOptions(store, sharePrefix,
-	s3disk.RepositoryOptions{ClientEncryption: clientEncryption})
+repository, _, err := s3disk.InitializeRepository(ctx, store, sharePrefix,
+	s3disk.RepositoryConfig{
+		RepositoryID:     repositoryID,
+		ClientEncryption: clientEncryption,
+		Chunking:         s3disk.ChunkingOptions{}, // use and durably bind the defaults
+	},
+	s3disk.RepositoryInitializationOptions{ConfirmEmptyPrefix: true})
 if err != nil {
 	return err
 }
@@ -252,15 +257,39 @@ deliberately not used.
 
 Treat the prefix, `RepositoryID`, profile, and share key as one inseparable
 storage domain. Never reuse a prefix with plaintext mode or another profile,
-and never combine ciphertext from different prefixes/profiles. There is not yet
-a repository initialization record that can discover every accidental mismatch
-before I/O; a wrong key, identity, or exact object key fails authentication.
-The constructors also cannot prove that a key/profile is unique to one share.
-Because an opaque HMAC suffix does not itself include the prefix or `ShareID`,
-reusing a profile across prefixes would reveal equality. Associated data binds
-the exact object key, not the bucket, account, origin, region, S3 version, or
-expiry; those boundaries remain the responsibility of signed capabilities,
-IAM, TLS, and commissioning.
+and never combine ciphertext from different prefixes/profiles.
+`InitializeRepository` creates or exactly reopens a write-once
+`RepositoryDescriptor` that binds the normalized prefix, `RepositoryID`, storage
+profile, and Rabin chunking algorithm and parameters. A `Publisher` created from
+that repository inherits the descriptor's chunking defaults and rejects a
+different chunking profile or signer repository identity. The `share publish`
+CLI allocates a fresh random share namespace, explicitly confirms it as new, and
+uses this initialized path before publishing its first snapshot.
+
+When the descriptor is absent, `InitializeRepository` writes nothing unless the
+caller sets `RepositoryInitializationOptions.ConfirmEmptyPrefix`. That flag is a
+caller assertion, not a `Store` proof: the protocol does not require `LIST` and
+cannot discover objects left in an uncommissioned legacy prefix. Set it only
+after allocating and independently validating a new dedicated namespace. An
+existing identical descriptor can be reopened without that creation
+confirmation; conflicting configuration fails closed.
+
+The descriptor is an A-side commissioning guard, not B's signed trust root. It
+is not yet included in the signed share-root bundle or its capability closure,
+so the credential-free B path does not fetch it and continues to construct its
+repository from the authenticated handoff and signed root. Low-level
+`NewRepositoryWithOptions` constructors can still represent legacy or externally
+commissioned storage, but `NewPublisher` rejects such an uncommissioned
+repository by default with `ErrRepositoryNotInitialized`. Bypassing that guard
+requires the explicitly dangerous
+`PublisherOptions.DangerouslyAllowUncommissionedRepository` option and is outside
+the commercial path. The descriptor binds the profile name, not proof that a
+key/profile is unique to one share. A wrong key, identity, or exact object key
+still fails authentication, but reusing one profile across prefixes would
+repeat opaque HMAC suffixes and reveal equality. Associated data and the
+descriptor do not bind the bucket, account, origin, region, S3 version,
+`ShareID`, or expiry; signed capabilities, IAM, TLS, and deployment
+commissioning enforce those boundaries.
 
 The private handoff to B contains the share key in addition to the root bearer
 and trust bindings, but no `SecretAccessKey`, credential provider, or reusable

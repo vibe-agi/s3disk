@@ -32,9 +32,9 @@ func TestNewPublisherRejectsTypedNilDependencies(t *testing.T) {
 		options s3disk.PublisherOptions
 		want    string
 	}{
-		{name: "signer", options: s3disk.PublisherOptions{ReferenceSigner: signer}, want: "s3disk: reference signer must not be a typed nil"},
-		{name: "verifier", options: s3disk.PublisherOptions{ReferenceVerifier: verifier}, want: "s3disk: reference verifier must not be a typed nil"},
-		{name: "journal", options: s3disk.PublisherOptions{PublicationJournal: journal}, want: "s3disk: publication journal must not be a typed nil"},
+		{name: "signer", options: s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true, ReferenceSigner: signer}, want: "s3disk: reference signer must not be a typed nil"},
+		{name: "verifier", options: s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true, ReferenceVerifier: verifier}, want: "s3disk: reference verifier must not be a typed nil"},
+		{name: "journal", options: s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true, PublicationJournal: journal}, want: "s3disk: publication journal must not be a typed nil"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()

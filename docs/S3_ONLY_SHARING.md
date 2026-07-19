@@ -22,9 +22,12 @@ and remount; it is not an in-band renewal protocol.
 
 The data flow is:
 
-1. A creates a dedicated random share prefix and encryption key, then publishes
-   the selected projection as encrypted immutable objects with keyed opaque
-   physical IDs and advances its encrypted authenticated channel reference.
+1. A creates a dedicated random share prefix and encryption key, initializes a
+   write-once repository descriptor after explicitly confirming that newly
+   allocated namespace, binding its prefix, `RepositoryID`, storage profile, and
+   Rabin chunking parameters. It then publishes the selected projection as
+   encrypted immutable objects with keyed opaque physical IDs and advances its
+   encrypted authenticated channel reference.
 2. A resolves the exact object closure for that reference, creates exact-key
    presigned `GetObject` capabilities with one fixed absolute expiry, signs the
    capability bundle, encrypts it, and conditionally creates or replaces one
@@ -128,13 +131,35 @@ The profile must be configured consistently on A's `Repository` and
 prefix, `RepositoryID`, profile, and share key as one inseparable storage
 domain. Do not use one prefix for plaintext and encrypted modes, point a
 different profile at it, or combine objects from different prefixes/profiles.
+On A, `InitializeRepository` creates or exactly reopens a write-once
+`RepositoryDescriptor` containing the normalized prefix, `RepositoryID`, storage
+profile, and Rabin chunking algorithm and parameters. Descriptor-backed
+publishers inherit the stored chunking defaults and reject different parameters
+or a signer for another repository. A missing descriptor fails closed after its
+bounded read by default: `InitializeRepository` performs no write unless the
+caller explicitly sets `RepositoryInitializationOptions.ConfirmEmptyPrefix`.
+The Store interface
+cannot verify that assertion because this protocol neither requires nor grants
+`LIST`; allocate and independently validate a fresh namespace before setting it.
+The `share publish` CLI does so with its random per-share prefix.
+`NewPublisher` also rejects an uncommissioned repository by default with
+`ErrRepositoryNotInitialized`; the explicitly dangerous legacy opt-out is not a
+commercial sharing mode.
 Resolved closures contain an internal keyed profile binding, so
 `RootPublisher` rejects an unencrypted, encrypted, or wrong-key Repository
 mismatch before presigning or writing a root. Writable Repository construction
 also refuses external self-reported encryption boundaries. The current AEAD
-fails closed when the key, repository identity, or exact object key is wrong,
-but there is no repository initialization record that can detect every
-accidental prefix/profile mismatch before access.
+fails closed when the key, repository identity, or exact object key is wrong.
+
+The descriptor is not yet included in the signed root bundle or its capability
+closure. B therefore receives no exact-GET descriptor capability and continues
+to construct its read-only repository from the authenticated handoff and signed
+root; the descriptor is an A-side commissioning guard, not B-side trust
+evidence. Low-level repository constructors can still represent legacy or
+read-only storage, but cannot silently create a Publisher without the dangerous
+opt-out. The descriptor binds a storage-profile name but does not prove that a
+key/profile is unique to one share, nor does it bind `ShareID`, bucket, account,
+origin, region, S3 version, or expiry.
 
 S3 credential compromise does not become harmless. Within its IAM scope an
 attacker can list opaque keys if allowed, download ciphertext, overwrite or
@@ -151,9 +176,9 @@ every share a separate private cache directory. Reusing a directory permits
 local cross-share plaintext equality and cache hits even though S3 objects are
 isolated. Protect and erase it as customer data. Enforce SSE-S3 or SSE-KMS as
 defense in depth for server-side media, backups, and operations; SSE does not
-replace the client-side profile. Repository initialization, repository-level
-KEK and repository-dedup modes, key rotation, and migration are not implemented
-yet.
+replace the client-side profile. Repository-level KEK and repository-dedup
+modes, key rotation, migration, and descriptor inclusion in signed root bundles
+are not implemented yet.
 
 ## Fixed expiry and mount lifecycle
 
@@ -303,7 +328,17 @@ closure, and S3-only constraints.
 - Give S3 credentials only to A. Do not construct a credentialed `s3store.Store`
   on B; build B's repository with `presignedshare.Reader` and
   `s3disk.NewReadOnlyRepositoryWithOptions`, using the same client-encryption
-  profile at both decryption boundaries.
+  profile at both decryption boundaries. The current root closure does not grant
+  B descriptor GET authority, so do not replace this with
+  `OpenReadOnlyRepository` until the signed protocol explicitly carries that
+  capability and binding.
+- On A, initialize the dedicated prefix with `InitializeRepository` before the
+  first publication, setting `ConfirmEmptyPrefix` only after independently
+  allocating and checking a fresh namespace. Require later opens to match its
+  `RepositoryID`, storage profile, and chunking parameters exactly. Never enable
+  `DangerouslyAllowUncommissionedRepository` in the commercial path. The built-in
+  `share publish` CLI performs the confirmed initialization for its random
+  per-share prefix.
 - Give every share a dedicated random prefix, `RepositoryID`, and encryption
   key. Never reuse a prefix across plaintext/encrypted modes or different
   profiles. Do not claim repository-level rotation, migration, or deduplication

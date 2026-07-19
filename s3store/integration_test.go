@@ -52,7 +52,7 @@ func TestMinIOAtomicPublishAndLazyRead(t *testing.T) {
 	if err := repository.CheckStoreCompatibility(ctx); err != nil {
 		t.Fatalf("store compatibility: %v", err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,8 @@ func TestMinIOAtomicPublishAndLazyRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	signedPublisher, err := s3disk.NewPublisher(signedRepository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: publicationJournal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {

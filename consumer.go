@@ -144,6 +144,9 @@ func NewConsumer(repository *Repository, channel string, options ConsumerOptions
 		if options.ReferenceVerifier.RepositoryID().IsZero() {
 			return nil, fmt.Errorf("%w: zero verifier repository ID", ErrUntrustedReference)
 		}
+		if repository.descriptor != nil && options.ReferenceVerifier.RepositoryID() != repository.descriptor.RepositoryID {
+			return nil, fmt.Errorf("%w: verifier does not match repository descriptor", ErrUntrustedReference)
+		}
 		if options.Watermarks == nil {
 			return nil, ErrTrustStateRequired
 		}

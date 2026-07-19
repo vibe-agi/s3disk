@@ -75,7 +75,7 @@ func TestRootPublisherPublishedSnapshotNeverFallsBackToUnsignedReference(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	unsignedPublisher, err := s3disk.NewPublisher(unsignedRepository, s3disk.PublisherOptions{})
+	unsignedPublisher, err := s3disk.NewPublisher(unsignedRepository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,8 @@ func newPublishedSnapshotFixture(t *testing.T) *publishedSnapshotFixture {
 		t.Fatal(err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
-		ReferenceSigner: signer, ReferenceVerifier: verifier,
+		DangerouslyAllowUncommissionedRepository: true,
+		ReferenceSigner:                          signer, ReferenceVerifier: verifier,
 		PublicationJournal: journal, AllowTrustOnFirstUse: true,
 	})
 	if err != nil {

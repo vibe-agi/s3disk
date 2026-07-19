@@ -29,7 +29,7 @@ func TestRootPublisherClientEncryptionIsOpaqueAndReconcilesLostResponse(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.snapshotPublisher, err = s3disk.NewPublisher(fixture.repository, s3disk.PublisherOptions{})
+	fixture.snapshotPublisher, err = s3disk.NewPublisher(fixture.repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestRootPublisherRejectsSnapshotClosureEncryptionProfileMismatch(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		fixture.snapshotPublisher, err = s3disk.NewPublisher(fixture.repository, s3disk.PublisherOptions{})
+		fixture.snapshotPublisher, err = s3disk.NewPublisher(fixture.repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +172,7 @@ func TestOnlyS3ReaderClientEncryptionKeepsImmutableObjectsLazy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

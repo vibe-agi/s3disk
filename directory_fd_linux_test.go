@@ -56,7 +56,7 @@ func TestDeepDirectoryTraversalStaysBelowLowFileDescriptorLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := NewPublisher(repository, PublisherOptions{})
+	publisher, err := NewPublisher(repository, PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

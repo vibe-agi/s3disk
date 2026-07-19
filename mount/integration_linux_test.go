@@ -66,6 +66,7 @@ func TestLinuxMinIOFUSEEndToEnd(t *testing.T) {
 		t.Fatalf("MinIO store compatibility: %v", err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
+		DangerouslyAllowUncommissionedRepository: true,
 		Chunking: s3disk.ChunkingOptions{
 			MinSize: 1 << 20, AverageSize: 2 << 20, MaxSize: 4 << 20,
 		},
@@ -231,7 +232,7 @@ func TestLinuxMountRefreshAndSnapshotPinning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

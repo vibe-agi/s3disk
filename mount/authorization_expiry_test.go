@@ -220,7 +220,7 @@ func newAuthorizationMountConsumer(
 	if err != nil {
 		t.Fatal(err)
 	}
-	publisher, err := s3disk.NewPublisher(writable, s3disk.PublisherOptions{})
+	publisher, err := s3disk.NewPublisher(writable, s3disk.PublisherOptions{DangerouslyAllowUncommissionedRepository: true})
 	if err != nil {
 		t.Fatal(err)
 	}

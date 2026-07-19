@@ -83,10 +83,6 @@ func runPublish(ctx context.Context, options PublishOptions) error {
 	}
 	basePrefix := strings.Trim(options.Prefix, "/")
 	sharePrefix := basePrefix + "/shares/" + shareID.String()
-	repository, err := s3disk.NewRepositoryWithOptions(rawStore, sharePrefix, s3disk.RepositoryOptions{ClientEncryption: profile})
-	if err != nil {
-		return fmt.Errorf("s3disk share publish: create repository: %w", err)
-	}
 	stateDir, err := preparePrivateDirectory(options.StateDir)
 	if err != nil {
 		return fmt.Errorf("s3disk share publish: state directory: %w", err)
@@ -98,6 +94,12 @@ func runPublish(ctx context.Context, options PublishOptions) error {
 	journal, err := s3disk.NewFilePublicationJournal(filepath.Join(shareStateDir, "publication-journal.json"))
 	if err != nil {
 		return err
+	}
+	repository, _, err := s3disk.InitializeRepository(ctx, rawStore, sharePrefix, s3disk.RepositoryConfig{
+		RepositoryID: repositoryID, ClientEncryption: profile,
+	}, s3disk.RepositoryInitializationOptions{ConfirmEmptyPrefix: true})
+	if err != nil {
+		return fmt.Errorf("s3disk share publish: initialize repository: %w", err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
 		ReferenceSigner: signer, ReferenceVerifier: verifier, PublicationJournal: journal,
