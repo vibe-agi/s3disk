@@ -746,7 +746,7 @@ func assertS3CommissioningEarlyEnvelope(t *testing.T, report S3CommissioningRepo
 	}
 	if report.PresignedGet.Scope != PresignedGetCompatibilitySingleEndpointFiniteProbe ||
 		report.PresignedGet.Status != PresignedGetCompatibilityIndeterminate ||
-		report.PresignedGet.RequiredChecks != presignedGetCompatibilityRequiredChecks ||
+		report.PresignedGet.RequiredChecks != PresignedGetCompatibilityRequiredChecks ||
 		report.PresignedGet.Checks == nil || len(report.PresignedGet.Checks) != 0 ||
 		report.PresignedGet.Cleanup.Status != PresignedGetCompatibilityCleanupNotAttempted {
 		t.Fatalf("early presigned envelope = %+v", report.PresignedGet)

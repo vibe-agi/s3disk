@@ -177,18 +177,49 @@ func TestDoctorCommandPassesSafeConfigurationAndOutput(t *testing.T) {
 		_, err := io.WriteString(output, "{\"compatible\":true}\n")
 		return err
 	}})
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	root.SetOut(&stdout)
+	root.SetErr(&stderr)
 	root.SetArgs([]string{
 		"s3", "doctor", "--bucket", "bucket", "--endpoint", "http://127.0.0.1:9000", "--path-style",
-		"--dangerously-allow-http", "--timeout", "20s", "--capability-lifetime", "30s", "--cleanup-timeout", "3s",
+		"--dangerously-allow-http", "--timeout", "20s", "--total-timeout", "45s",
+		"--capability-lifetime", "30s", "--cleanup-timeout", "3s",
+		"--deployment-fingerprint", strings.Repeat("a", 64), "--evidence-id", "release-42",
+		"--implementation-version", "v0.0.0-dev+42",
 	})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if stdout.String() != "{\"compatible\":true}\n" || observed.Bucket != "bucket" || !observed.UsePathStyle ||
-		!observed.AllowInsecureEndpoint || observed.TotalTimeout != 20*time.Second || observed.CapabilityLifetime != 30*time.Second {
+		!observed.AllowInsecureEndpoint || observed.PresignedTimeout != 20*time.Second || observed.TotalTimeout != 45*time.Second ||
+		observed.CapabilityLifetime != 30*time.Second || observed.DeploymentFingerprint != strings.Repeat("a", 64) ||
+		observed.EvidenceID != "release-42" || observed.ImplementationVersion != "v0.0.0-dev+42" ||
+		observed.ErrorWriter != &stderr {
 		t.Fatalf("stdout=%q options=%#v", stdout.String(), observed)
+	}
+}
+
+func TestDoctorCommandRejectsPartialEvidenceBindingsBeforeOutput(t *testing.T) {
+	called := false
+	root := NewRootCommand(Dependencies{Doctor: func(context.Context, DoctorOptions, io.Writer) error {
+		called = true
+		return nil
+	}})
+	var stdout bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetArgs([]string{
+		"s3", "doctor", "--bucket", "bucket", "--endpoint", "http://127.0.0.1:9000",
+		"--dangerously-allow-http", "--deployment-fingerprint", strings.Repeat("a", 64),
+	})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "must be supplied together") {
+		t.Fatalf("error = %v", err)
+	}
+	if called {
+		t.Fatal("doctor runner called after preflight failure")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("preflight wrote stdout: %q", stdout.String())
 	}
 }
 

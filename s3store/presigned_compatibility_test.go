@@ -54,7 +54,7 @@ func TestProbePresignedGetCompatibilityAnonymousOnlyS3Semantics(t *testing.T) {
 		t.Fatalf("ProbePresignedGetCompatibilityWithOptions: %v", err)
 	}
 	if report.Status != PresignedGetCompatibilityPassed || !report.Compatible || !report.Complete ||
-		report.RequiredChecks != presignedGetCompatibilityRequiredChecks || len(report.Checks) != presignedGetCompatibilityRequiredChecks {
+		report.RequiredChecks != PresignedGetCompatibilityRequiredChecks || len(report.Checks) != PresignedGetCompatibilityRequiredChecks {
 		t.Fatalf("report = %+v", report)
 	}
 	wantIDs := []PresignedGetCompatibilityCheckID{

@@ -3,12 +3,15 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +23,54 @@ import (
 	"github.com/vibe-agi/s3disk/presignedshare"
 	"github.com/vibe-agi/s3disk/s3store"
 )
+
+// TestMinIOCLIDoctorCommissioning proves the CLI accepts the real combined
+// evidence envelope rather than only structurally convenient unit fakes.
+func TestMinIOCLIDoctorCommissioning(t *testing.T) {
+	endpoint := os.Getenv("S3DISK_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("S3DISK_TEST_S3_ENDPOINT is not set")
+	}
+	accessKey := integrationEnvOr("S3DISK_TEST_S3_ACCESS_KEY", "s3disk")
+	secretKey := integrationEnvOr("S3DISK_TEST_S3_SECRET_KEY", "s3disk-secret")
+	t.Setenv("AWS_ACCESS_KEY_ID", accessKey)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", secretKey)
+	t.Setenv("AWS_REGION", defaultRegion)
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	bucket := fmt.Sprintf("s3disk-cli-doctor-%d", time.Now().UnixNano())
+	createIntegrationBucket(t, ctx, endpoint, accessKey, secretKey, bucket)
+
+	var stdout, stderr bytes.Buffer
+	err := runDoctor(ctx, DoctorOptions{
+		Bucket: bucket, Prefix: "cli-doctor/commissioning", Region: defaultRegion,
+		Endpoint: endpoint, UsePathStyle: true, AllowInsecureEndpoint: true,
+		PresignedTimeout: 25 * time.Second, TotalTimeout: 60 * time.Second,
+		CapabilityLifetime: 2 * time.Minute, CleanupTimeout: 10 * time.Second,
+		DeploymentFingerprint: strings.Repeat("d", 64),
+		EvidenceID:            "minio-cli-doctor",
+		ImplementationVersion: "integration-test",
+		ErrorWriter:           &stderr,
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("doctor: %v; stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	}
+	decoder := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
+	var report s3store.S3CommissioningReport
+	if err := decoder.Decode(&report); err != nil {
+		t.Fatalf("decode doctor report: %v", err)
+	}
+	if report.Status != s3store.S3CommissioningPassed || !report.Compatible || !report.Complete ||
+		!report.Evidence.FullyBound || report.WritableStoreOutcome != s3store.S3CommissioningStagePassed ||
+		report.PresignedGetOutcome != s3store.S3CommissioningStagePassed {
+		t.Fatalf("doctor report = %s", report)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("doctor stdout contains another JSON value: %v", err)
+	}
+}
 
 // TestMinIOCLIContinuousHandoffAndCredentialFreeRead exercises the real A-side CLI
 // pipeline and reconstructs B's credential-free reader entirely from the

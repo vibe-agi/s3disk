@@ -40,8 +40,10 @@ const (
 	// PresignedGetCompatibilityDefaultCleanupTimeout bounds best-effort removal
 	// independently of cancellation of the main probe.
 	PresignedGetCompatibilityDefaultCleanupTimeout = 15 * time.Second
+	// PresignedGetCompatibilityRequiredChecks is the number of assertions in
+	// the current credential-free reader commissioning contract.
+	PresignedGetCompatibilityRequiredChecks = 14
 
-	presignedGetCompatibilityRequiredChecks     = 14
 	defaultPresignedGetProbePrefix              = ".s3disk/compatibility/presigned-get"
 	maximumPresignedGetProbePrefixBytes         = 768
 	maximumPresignedGetProbeResponseBytes       = 4 << 10
@@ -2580,8 +2582,8 @@ func newPresignedGetCompatibilityReport() PresignedGetCompatibilityReport {
 	return PresignedGetCompatibilityReport{
 		Scope:          PresignedGetCompatibilitySingleEndpointFiniteProbe,
 		Status:         PresignedGetCompatibilityIndeterminate,
-		RequiredChecks: presignedGetCompatibilityRequiredChecks,
-		Checks:         make([]PresignedGetCompatibilityCheck, 0, presignedGetCompatibilityRequiredChecks),
+		RequiredChecks: PresignedGetCompatibilityRequiredChecks,
+		Checks:         make([]PresignedGetCompatibilityCheck, 0, PresignedGetCompatibilityRequiredChecks),
 		Limitations: []PresignedGetCompatibilityLimitation{
 			PresignedGetCompatibilityLimitationFutureStatesNotProven,
 			PresignedGetCompatibilityLimitationExpiryNotSampled,

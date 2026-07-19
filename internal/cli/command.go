@@ -72,11 +72,16 @@ type DoctorOptions struct {
 	ExpectedBucketOwner         string
 	UsePathStyle                bool
 	AllowInsecureEndpoint       bool
+	PresignedTimeout            time.Duration
 	TotalTimeout                time.Duration
 	CapabilityLifetime          time.Duration
 	CleanupTimeout              time.Duration
+	DeploymentFingerprint       string
+	EvidenceID                  string
+	ImplementationVersion       string
 	TLSCAFile                   string
 	DangerouslyAllowSystemTrust bool
+	ErrorWriter                 io.Writer
 }
 
 func NewRootCommand(dependencies Dependencies) *cobra.Command {
@@ -212,27 +217,32 @@ func newDoctorCommand(dependencies Dependencies) *cobra.Command {
 	options := DoctorOptions{}
 	command := &cobra.Command{
 		Use:   "doctor",
-		Short: "Probe exact presigned-GET semantics and anonymous-policy confinement",
+		Short: "Probe writable Store and exact presigned-GET semantics",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			if err := validateDoctorOptions(&options); err != nil {
 				return err
 			}
+			options.ErrorWriter = command.ErrOrStderr()
 			return dependencies.Doctor(command.Context(), options, command.OutOrStdout())
 		},
 	}
 	flags := command.Flags()
 	flags.SortFlags = false
-	flags.StringVar(&options.Bucket, "bucket", "", "S3 bucket used for two temporary canary objects")
-	flags.StringVar(&options.Prefix, "prefix", "", "private temporary-object prefix (uses a safe default when empty)")
+	flags.StringVar(&options.Bucket, "bucket", "", "S3 bucket used for temporary commissioning objects")
+	flags.StringVar(&options.Prefix, "prefix", "", "repository namespace (bucket root and a derived probe prefix when empty)")
 	flags.StringVar(&options.Region, "region", defaultRegion, "S3 region")
 	flags.StringVar(&options.Endpoint, "endpoint", "", "S3-compatible endpoint (AWS is used when empty)")
 	flags.StringVar(&options.ExpectedBucketOwner, "expected-bucket-owner", "", "expected AWS account ID for the bucket")
 	flags.BoolVar(&options.UsePathStyle, "path-style", false, "use path-style S3 addressing")
 	flags.BoolVar(&options.AllowInsecureEndpoint, "dangerously-allow-http", false, "allow an HTTP loopback endpoint for local testing")
-	flags.DurationVar(&options.TotalTimeout, "timeout", s3store.PresignedGetCompatibilityDefaultTimeout, "total semantic probe timeout")
+	flags.DurationVar(&options.PresignedTimeout, "timeout", s3store.PresignedGetCompatibilityDefaultTimeout, "presigned-GET semantic probe timeout")
+	flags.DurationVar(&options.TotalTimeout, "total-timeout", s3store.S3CommissioningDefaultTimeout, "combined writable and presigned probe timeout")
 	flags.DurationVar(&options.CapabilityLifetime, "capability-lifetime", s3store.PresignedGetCompatibilityDefaultCapabilityLifetime, "temporary bearer lifetime")
 	flags.DurationVar(&options.CleanupTimeout, "cleanup-timeout", s3store.PresignedGetCompatibilityDefaultCleanupTimeout, "best-effort cleanup timeout")
+	flags.StringVar(&options.DeploymentFingerprint, "deployment-fingerprint", "", "non-secret SHA-256 deployment fingerprint (requires all evidence bindings)")
+	flags.StringVar(&options.EvidenceID, "evidence-id", "", "non-secret commissioning evidence ID (requires all evidence bindings)")
+	flags.StringVar(&options.ImplementationVersion, "implementation-version", "", "non-secret implementation/build identifier (requires all evidence bindings)")
 	flags.StringVar(&options.TLSCAFile, "tls-ca", "", "PEM trust roots for HTTPS probes")
 	flags.BoolVar(&options.DangerouslyAllowSystemTrust, "dangerously-allow-system-trust", false, "allow system TLS trust without an explicit CA bundle")
 	return command
@@ -339,13 +349,16 @@ func validateDoctorOptions(options *DoctorOptions) error {
 	if strings.TrimSpace(options.Region) == "" {
 		return errors.New("s3disk s3 doctor: --region is required")
 	}
-	if options.TotalTimeout <= 0 || options.TotalTimeout > s3store.PresignedGetCompatibilityMaximumTimeout {
+	if options.PresignedTimeout <= 0 || options.PresignedTimeout > s3store.PresignedGetCompatibilityMaximumTimeout {
 		return fmt.Errorf("s3disk s3 doctor: --timeout must be positive and at most %s", s3store.PresignedGetCompatibilityMaximumTimeout)
+	}
+	if options.TotalTimeout <= 0 || options.TotalTimeout > s3store.S3CommissioningMaximumTimeout {
+		return fmt.Errorf("s3disk s3 doctor: --total-timeout must be positive and at most %s", s3store.S3CommissioningMaximumTimeout)
 	}
 	if options.CapabilityLifetime < 2*time.Second || options.CapabilityLifetime > presignedshare.MaximumCapabilityLifetime {
 		return fmt.Errorf("s3disk s3 doctor: --capability-lifetime must be between 2s and %s", presignedshare.MaximumCapabilityLifetime)
 	}
-	if options.CapabilityLifetime < options.TotalTimeout+2*time.Second {
+	if options.CapabilityLifetime < options.PresignedTimeout+2*time.Second {
 		return errors.New("s3disk s3 doctor: --capability-lifetime must cover --timeout plus the signing margin")
 	}
 	if options.CleanupTimeout <= 0 || options.CleanupTimeout > s3store.PresignedGetCompatibilityMaximumTimeout {
@@ -353,6 +366,15 @@ func validateDoctorOptions(options *DoctorOptions) error {
 	}
 	if options.TLSCAFile != "" && options.DangerouslyAllowSystemTrust {
 		return errors.New("s3disk s3 doctor: --tls-ca and --dangerously-allow-system-trust are mutually exclusive")
+	}
+	bindingCount := 0
+	for _, value := range []string{options.DeploymentFingerprint, options.EvidenceID, options.ImplementationVersion} {
+		if value != "" {
+			bindingCount++
+		}
+	}
+	if bindingCount != 0 && bindingCount != 3 {
+		return errors.New("s3disk s3 doctor: --deployment-fingerprint, --evidence-id, and --implementation-version must be supplied together")
 	}
 	if err := validateEndpointTrust(options.Endpoint, options.AllowInsecureEndpoint, options.TLSCAFile != "", options.DangerouslyAllowSystemTrust); err != nil {
 		return fmt.Errorf("s3disk s3 doctor: %w", err)

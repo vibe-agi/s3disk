@@ -46,6 +46,16 @@ S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
 S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
 S3DISK_TEST_S3_ACCESS_KEY=s3disk \
 S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
+./scripts/run-required-go-test.sh ./s3store TestMinIOS3Commissioning 90s integration
+
+S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
+S3DISK_TEST_S3_ACCESS_KEY=s3disk \
+S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
+./scripts/run-required-go-test.sh ./internal/cli TestMinIOCLIDoctorCommissioning 90s integration
+
+S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
+S3DISK_TEST_S3_ACCESS_KEY=s3disk \
+S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
 ./scripts/run-required-go-test.sh ./s3store TestMinIOOnlyS3PresignedShare 90s integration
 
 S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
