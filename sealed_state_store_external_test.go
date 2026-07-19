@@ -190,6 +190,94 @@ func TestFileSealedStateStoreAuthenticatesProtectorKeyAndBinding(t *testing.T) {
 	}
 }
 
+func TestFileSealedStateStoreRotatesRecoveryKeyThroughCAS(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(privateTestDirectory(t), "rotated.state")
+	binding := []byte("repository/share/rotated-state")
+	oldKey, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldProtector := mustPublisherStateProtector(t, "old-recovery-key", oldKey)
+	newProtector := mustPublisherStateProtector(t, "new-recovery-key", newKey)
+	oldKeyring, err := publisherstate.NewAESGCMKeyring(oldProtector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStore, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Protector: oldKeyring, Binding: binding,
+	})
+	if errors.Is(err, s3disk.ErrTrustStateUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRevision, err := oldStore.CompareAndSwap(ctx, nil, []byte("publisher recovery state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotationKeyring, err := publisherstate.NewAESGCMKeyring(newProtector, oldProtector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatingStore, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Protector: rotationKeyring, Binding: binding,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, loadedRevision, found, err := rotatingStore.Load(ctx)
+	if err != nil || !found || loadedRevision != originalRevision || string(state) != "publisher recovery state" {
+		t.Fatalf("retained-key Load = %q, %s, %v, %v", state, loadedRevision, found, err)
+	}
+	rotatedRevision, err := rotatingStore.CompareAndSwap(ctx, &loadedRevision, state)
+	clear(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotatedRevision.IsZero() || rotatedRevision == originalRevision {
+		t.Fatalf("rotation revision = %s, want fresh non-zero revision", rotatedRevision)
+	}
+	rotatedFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(rotatedFile, originalFile) {
+		t.Fatal("recovery-key rotation did not replace the sealed file")
+	}
+
+	newOnlyKeyring, err := publisherstate.NewAESGCMKeyring(newProtector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newOnlyStore, err := s3disk.NewFileSealedStateStore(path, s3disk.FileSealedStateStoreOptions{
+		Protector: newOnlyKeyring, Binding: binding,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, loadedRevision, found, err = newOnlyStore.Load(ctx)
+	if err != nil || !found || loadedRevision != rotatedRevision || string(state) != "publisher recovery state" {
+		t.Fatalf("active-only Load = %q, %s, %v, %v", state, loadedRevision, found, err)
+	}
+	clear(state)
+	if _, _, _, err := oldStore.Load(ctx); !errors.Is(err, publisherstate.ErrAuthenticationFailed) {
+		t.Fatalf("retired-only Load error = %v, want ErrAuthenticationFailed", err)
+	}
+}
+
 func TestFileSealedStateStoreRejectsTruncatedTrailingOversizedAndUnsafeFiles(t *testing.T) {
 	t.Parallel()
 
