@@ -31,9 +31,22 @@ var (
 // it is never exposed to Reader or B/C/D.
 type RootPublisherConfig struct {
 	Store s3disk.Store
+	// RecoveryJournal durably records exact pending root bytes before any S3
+	// write. It is optional for API compatibility, but production publishers
+	// must configure a confidential, authenticated SealedStateStore. Without it,
+	// a crash can regenerate different presigned URLs under the same root
+	// revision. Replaying both an old journal and its matching old S3 root is
+	// outside this journal's freshness guarantee and requires an independently
+	// protected monotonic backup or audit anchor.
+	RecoveryJournal s3disk.SealedStateStore
 	// ClientEncryption encrypts the signed root bundle before it is stored.
 	// Repository objects must be configured independently with the same
-	// profile through s3disk.RepositoryOptions.
+	// profile through s3disk.RepositoryOptions. With RecoveryJournal, Store must
+	// be the raw, unwrapped S3 Store: RootPublisher seals once, journals the exact
+	// ciphertext, and hands those same bytes to Store on every recovery attempt.
+	// Stores which advertise ClientEncryptionApplied are rejected. Go cannot
+	// discover an opaque custom wrapper which transforms bytes without exposing
+	// that marker; commercial adapters must preserve it when wrapping encryption.
 	ClientEncryption   *s3disk.ClientEncryptionProfile
 	RootKey            string
 	RootCapability     Capability
@@ -79,6 +92,8 @@ type RootPublisher struct {
 	maxAttempts                             int
 	allowInsecureLoopback                   bool
 	dangerouslyAllowCustomReferenceVerifier bool
+	dangerouslyAllowUnsignedReference       bool
+	recoveryJournal                         s3disk.SealedStateStore
 
 	// gate, rather than sync.Mutex, makes waiting for the process-local
 	// serialization point cancellable. The S3 conditional write remains the
@@ -91,10 +106,10 @@ type RootPublisher struct {
 // value cannot recursively print the private root bearer, Store, or presigner.
 func (publisher RootPublisher) String() string {
 	return fmt.Sprintf(
-		"presignedshare.RootPublisher{configured:%t,max_publish_attempts:%d,authorization_expires_at:%s,secrets:redacted}",
-		publisher.rootCapability.Configured() && configuredInterface(publisher.store) &&
-			configuredInterface(publisher.presigner) && configuredInterface(publisher.signer) &&
-			configuredInterface(publisher.verifier) && publisher.gate != nil,
+		"presignedshare.RootPublisher{configured:%t,can_build_new_root:%t,recovery_enabled:%t,max_publish_attempts:%d,authorization_expires_at:%s,secrets:redacted}",
+		publisher.configured(),
+		publisher.CanBuildNewRoot(),
+		publisher.RecoveryEnabled(),
 		publisher.maxAttempts,
 		publisher.rootCapability.expiresAt.Format(time.RFC3339Nano),
 	)
@@ -105,17 +120,38 @@ func (publisher RootPublisher) GoString() string { return publisher.String() }
 func (publisher RootPublisher) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Configured             bool      `json:"configured"`
+		CanBuildNewRoot        bool      `json:"can_build_new_root"`
+		RecoveryEnabled        bool      `json:"recovery_enabled"`
 		MaxPublishAttempts     int       `json:"max_publish_attempts"`
 		AuthorizationExpiresAt time.Time `json:"authorization_expires_at,omitempty"`
 		Secrets                string    `json:"secrets"`
 	}{
-		Configured: publisher.rootCapability.Configured() && configuredInterface(publisher.store) &&
-			configuredInterface(publisher.presigner) && configuredInterface(publisher.signer) &&
-			configuredInterface(publisher.verifier) && publisher.gate != nil,
+		Configured:             publisher.configured(),
+		CanBuildNewRoot:        publisher.CanBuildNewRoot(),
+		RecoveryEnabled:        publisher.RecoveryEnabled(),
 		MaxPublishAttempts:     publisher.maxAttempts,
 		AuthorizationExpiresAt: publisher.rootCapability.expiresAt,
 		Secrets:                "redacted",
 	})
+}
+
+func (publisher RootPublisher) configured() bool {
+	return publisher.rootCapability.Configured() && configuredInterface(publisher.store) &&
+		configuredInterface(publisher.verifier) && publisher.gate != nil &&
+		(publisher.CanBuildNewRoot() || publisher.RecoveryEnabled())
+}
+
+// CanBuildNewRoot reports whether this instance retains both dependencies
+// needed to mint a new root target. A recovery-only instance can still settle
+// an existing durable pending target while this method returns false.
+func (publisher RootPublisher) CanBuildNewRoot() bool {
+	return configuredInterface(publisher.presigner) && configuredInterface(publisher.signer)
+}
+
+// RecoveryEnabled reports whether exact pending root bytes are durably
+// journaled before Store writes.
+func (publisher RootPublisher) RecoveryEnabled() bool {
+	return configuredInterface(publisher.recoveryJournal)
 }
 
 // NewRootPublisher validates configuration without Store I/O. Signer identity
@@ -125,28 +161,51 @@ func NewRootPublisher(config RootPublisherConfig) (*RootPublisher, error) {
 	if !configuredInterface(config.Store) {
 		return nil, fmt.Errorf("%w: root Store is required", s3disk.ErrStoreMisconfigured)
 	}
-	if !configuredInterface(config.Presigner) || !configuredInterface(config.Signer) || !configuredInterface(config.Verifier) {
-		return nil, fmt.Errorf("%w: presigner, signer, and verifier are required", ErrInvalidBundle)
+	if config.RecoveryJournal != nil && !configuredInterface(config.RecoveryJournal) {
+		return nil, fmt.Errorf("%w: recovery journal must not be a typed nil", ErrRootRecoveryState)
+	}
+	hasRecovery := configuredInterface(config.RecoveryJournal)
+	hasPresigner := configuredInterface(config.Presigner)
+	hasSigner := configuredInterface(config.Signer)
+	if !configuredInterface(config.Verifier) {
+		return nil, fmt.Errorf("%w: verifier is required", ErrInvalidBundle)
+	}
+	if !hasRecovery && (!hasPresigner || !hasSigner) {
+		return nil, fmt.Errorf("%w: presigner and signer are required without a recovery journal", ErrInvalidBundle)
 	}
 	if !s3disk.IsOfflineReferenceVerifier(config.Verifier) && !config.DangerouslyAllowCustomReferenceVerifier {
 		return nil, fmt.Errorf("%w: custom verifier requires DangerouslyAllowCustomReferenceVerifier", ErrUntrustedBundle)
 	}
-	if config.Signer.RepositoryID().IsZero() || config.Signer.RepositoryID() != config.Verifier.RepositoryID() {
+	repositoryID := config.Verifier.RepositoryID()
+	if repositoryID.IsZero() || (hasSigner && config.Signer.RepositoryID() != repositoryID) {
 		return nil, fmt.Errorf("%w: root publisher trust roots do not match", ErrUntrustedBundle)
 	}
 	store := config.Store
 	if config.ClientEncryption != nil {
-		if config.ClientEncryption.RepositoryID() != config.Signer.RepositoryID() {
+		if config.ClientEncryption.RepositoryID() != repositoryID {
 			return nil, fmt.Errorf("%w: client encryption and root publisher repository identities do not match", ErrUntrustedBundle)
 		}
-		encryptedStore, err := s3disk.NewClientEncryptedStore(config.Store, config.ClientEncryption)
-		if err != nil {
-			return nil, fmt.Errorf("%w: client encryption configuration is invalid", s3disk.ErrStoreMisconfigured)
+		if hasRecovery {
+			if _, advertisesEncryption := config.Store.(interface {
+				ClientEncryptionApplied(*s3disk.ClientEncryptionProfile) bool
+			}); advertisesEncryption {
+				return nil, fmt.Errorf(
+					"%w: recovery with client encryption requires a raw Store without an encryption wrapper",
+					s3disk.ErrStoreMisconfigured,
+				)
+			}
+		} else {
+			encryptedStore, err := s3disk.NewClientEncryptedStore(config.Store, config.ClientEncryption)
+			if err != nil {
+				return nil, fmt.Errorf("%w: client encryption configuration is invalid", s3disk.ErrStoreMisconfigured)
+			}
+			store = encryptedStore
 		}
-		store = encryptedStore
 	}
-	if err := validateKeyID(config.Signer.KeyID()); err != nil {
-		return nil, err
+	if hasSigner {
+		if err := validateKeyID(config.Signer.KeyID()); err != nil {
+			return nil, err
+		}
 	}
 	prefix, err := validateBundleBindings(config.RepositoryPrefix, config.ReferenceKey, config.ShareID, 1, 1)
 	if err != nil {
@@ -170,9 +229,11 @@ func NewRootPublisher(config RootPublisherConfig) (*RootPublisher, error) {
 		(validReferenceRemainder(relativeRootKey) || validImmutableRemainder(relativeRootKey)) {
 		return nil, fmt.Errorf("%w: root key collides with a repository protocol object", ErrInvalidBundle)
 	}
-	expiresAt, known := config.Presigner.AuthorizationExpiry()
-	if !known || !expiresAt.UTC().Round(0).Equal(config.RootCapability.expiresAt) {
-		return nil, fmt.Errorf("%w: presigner and root capability expiry do not match", ErrInvalidBundle)
+	if hasPresigner {
+		expiresAt, known := config.Presigner.AuthorizationExpiry()
+		if !known || !expiresAt.UTC().Round(0).Equal(config.RootCapability.expiresAt) {
+			return nil, fmt.Errorf("%w: presigner and root capability expiry do not match", ErrInvalidBundle)
+		}
 	}
 	if !config.RootCapability.expiresAt.After(time.Now()) {
 		return nil, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
@@ -188,9 +249,11 @@ func NewRootPublisher(config RootPublisherConfig) (*RootPublisher, error) {
 		repositoryPrefix: prefix, referenceKey: config.ReferenceKey,
 		shareID: config.ShareID, presigner: config.Presigner, signer: config.Signer,
 		verifier: config.Verifier, clientEncryption: config.ClientEncryption,
+		recoveryJournal:                         config.RecoveryJournal,
 		maxAttempts:                             config.MaxPublishAttempts,
 		allowInsecureLoopback:                   strings.HasPrefix(config.RootCapability.origin, "http://"),
 		dangerouslyAllowCustomReferenceVerifier: config.DangerouslyAllowCustomReferenceVerifier,
+		dangerouslyAllowUnsignedReference:       config.DangerouslyAllowUnsignedReference,
 		gate:                                    make(chan struct{}, 1),
 	}
 	publisher.gate <- struct{}{}
@@ -214,7 +277,7 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 	if publisher == nil {
 		return RootPublication{}, fmt.Errorf("%w: nil root publisher", s3disk.ErrStoreMisconfigured)
 	}
-	if ctx == nil {
+	if !configuredInterface(ctx) {
 		return RootPublication{}, fmt.Errorf("presignedshare: root publish context is required")
 	}
 	if err := ctx.Err(); err != nil {
@@ -222,13 +285,17 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 	}
 	if publisher.gate == nil || !publisher.rootCapability.Configured() ||
 		!configuredInterface(publisher.store) ||
-		!configuredInterface(publisher.presigner) || !configuredInterface(publisher.signer) ||
-		!configuredInterface(publisher.verifier) {
+		!configuredInterface(publisher.verifier) ||
+		((!configuredInterface(publisher.presigner) || !configuredInterface(publisher.signer)) &&
+			!configuredInterface(publisher.recoveryJournal)) {
 		return RootPublication{}, fmt.Errorf("%w: root publisher is not initialized", s3disk.ErrStoreMisconfigured)
 	}
 	if !publisher.rootCapability.expiresAt.After(time.Now()) {
 		return RootPublication{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
 	}
+	authorizationCtx, cancelAuthorization := context.WithDeadline(ctx, publisher.rootCapability.expiresAt)
+	defer cancelAuthorization()
+	ctx = authorizationCtx
 	if err := closure.ValidateResolvedForClientEncryption(publisher.clientEncryption); err != nil {
 		return RootPublication{}, err
 	}
@@ -246,6 +313,9 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 	}
 	if !publisher.rootCapability.expiresAt.After(time.Now()) {
 		return RootPublication{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+	if configuredInterface(publisher.recoveryJournal) {
+		return publisher.publishRecoverable(ctx, closure, allowCreate)
 	}
 
 	var hadAmbiguousWrite bool
@@ -348,9 +418,11 @@ func (publisher *RootPublisher) publish(ctx context.Context, closure s3disk.Snap
 func (publisher *RootPublisher) load(ctx context.Context) (s3disk.Object, *Bundle, bool, error) {
 	object, err := publisher.store.Get(ctx, publisher.rootKey, s3disk.GetOptions{MaxBytes: MaximumBundleBytes})
 	if errors.Is(err, s3disk.ErrObjectNotFound) {
+		clear(object.Data)
 		return s3disk.Object{}, nil, false, nil
 	}
 	if err != nil {
+		clear(object.Data)
 		return s3disk.Object{}, nil, false, safeRootStoreError(err)
 	}
 	if err := validateRootVersion(object.Version); err != nil {

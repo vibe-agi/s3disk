@@ -21,9 +21,10 @@ const (
 	// MaximumBindingBytes bounds caller-controlled authenticated context. The
 	// binding is not stored in the envelope and must be supplied again to Open.
 	MaximumBindingBytes = 4 << 10
-	// MaximumPlaintextBytes permits the largest current flat share root while
-	// keeping all cryptographic allocation finite.
-	MaximumPlaintextBytes = 64 << 20
+	// MaximumPlaintextBytes permits a maximum 64 MiB share root plus bounded
+	// recovery-journal framing and metadata while keeping every cryptographic
+	// allocation finite. Protocol objects retain their independent 64 MiB cap.
+	MaximumPlaintextBytes = 65 << 20
 
 	recoverySaltBytes              = 16
 	randomNonceBytes               = 12

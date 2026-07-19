@@ -18,8 +18,9 @@ import (
 const (
 	// DefaultFileSealedStateMaxEnvelopeBytes is the finite envelope limit used
 	// when FileSealedStateStoreOptions.MaxEnvelopeBytes is zero. It includes
-	// headroom above a 64 MiB root-bundle plaintext and its AEAD envelope.
-	DefaultFileSealedStateMaxEnvelopeBytes int64 = 65 << 20
+	// headroom above a maximum framed root-recovery journal and its AEAD
+	// envelope.
+	DefaultFileSealedStateMaxEnvelopeBytes int64 = 66 << 20
 	// FileSealedStateMaxEnvelopeBytesLimit is the hard allocation and file-size
 	// ceiling accepted from configuration.
 	FileSealedStateMaxEnvelopeBytesLimit int64 = 256 << 20
@@ -69,6 +70,9 @@ type SealedStateProtector interface {
 // follow a visible rename, so callers reconcile uncertain outcomes with Load.
 // A non-zero revision returned with an error is only a reconciliation candidate
 // and must not be treated as proof that the write succeeded.
+//
+// Load returns state owned by the caller. CompareAndSwap must copy or consume
+// next before returning and must not retain, mutate, or alias it afterward.
 type SealedStateStore interface {
 	Load(ctx context.Context) (state []byte, revision SealedStateRevision, found bool, err error)
 	CompareAndSwap(ctx context.Context, expected *SealedStateRevision, next []byte) (SealedStateRevision, error)
