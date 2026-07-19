@@ -36,8 +36,9 @@ const (
 	maximumPublisherSessionSelectedPaths           = presignedshare.MaximumBundleCapabilities
 	maximumPublisherSessionEndpointBytes           = 16 << 10
 
-	publisherSessionFileName = "session.sealed"
-	rootRecoveryFileName     = "root-recovery.sealed"
+	publisherSessionFileName   = "session.sealed"
+	rootRecoveryFileName       = "root-recovery.sealed"
+	publicationJournalFileName = "publication-journal.json"
 
 	publisherSessionRole = "session-manifest"
 	rootRecoveryRole     = "root-recovery-journal"

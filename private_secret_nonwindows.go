@@ -30,10 +30,18 @@ func validatePrivateSecretFile(path string, file *os.File) error {
 	if !privateSecretOwnedByCurrentProcess(linked) || !privateSecretOwnedByCurrentProcess(opened) {
 		return fmt.Errorf("%w: private secret file is not owned by the current process identity", ErrCorruptObject)
 	}
+	if !privateSecretHasSingleLink(linked) || !privateSecretHasSingleLink(opened) {
+		return fmt.Errorf("%w: private secret file must have exactly one filesystem link", ErrCorruptObject)
+	}
 	return nil
 }
 
 func privateSecretOwnedByCurrentProcess(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && uint64(stat.Uid) == uint64(os.Geteuid())
+}
+
+func privateSecretHasSingleLink(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && uint64(stat.Nlink) == 1
 }

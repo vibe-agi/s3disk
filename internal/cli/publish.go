@@ -52,7 +52,7 @@ func runPublishWithOperations(ctx context.Context, options PublishOptions, opera
 	if err != nil {
 		return fmt.Errorf("s3disk share publish: local preflight: %w", err)
 	}
-	recoveryMaterial, err := readRecoveryKeyFile(localPaths.recoveryKey)
+	recoveryMaterial, err := readRecoveryKeyFileContext(runContext, localPaths.recoveryKey)
 	if err != nil {
 		return fmt.Errorf("s3disk share publish: read recovery key: %w", err)
 	}
@@ -242,13 +242,16 @@ func runPublishWithOperations(ctx context.Context, options PublishOptions, opera
 		return fmt.Errorf("s3disk share publish: after repository phase: %w", err)
 	}
 
-	journal, err := s3disk.NewFilePublicationJournal(filepath.Join(shareDirectory, "publication-journal.json"))
+	journal, err := s3disk.NewFilePublicationJournal(filepath.Join(shareDirectory, publicationJournalFileName))
 	if err != nil {
 		return fmt.Errorf("s3disk share publish: create publication journal: %w", err)
 	}
 	publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
 		ReferenceSigner: signer, ReferenceVerifier: verifier, PublicationJournal: journal,
 		AllowTrustOnFirstUse: true, Symlinks: s3disk.SymlinkRejectExternal,
+		ProtectedSourceFiles: protectedPublisherSourceFiles(
+			localPaths.recoveryKey, localPaths.handoff, shareDirectory,
+		),
 	})
 	if err != nil {
 		return fmt.Errorf("s3disk share publish: create publisher: %w", err)

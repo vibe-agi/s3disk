@@ -46,6 +46,22 @@ func TestValidatePrivateSecretFileRejectsUnsafeLocalBoundaries(t *testing.T) {
 	if err := s3disk.ValidatePrivateSecretFile(link, file); !errors.Is(err, s3disk.ErrCorruptObject) {
 		t.Fatalf("symlink error = %v, want ErrCorruptObject", err)
 	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	hardLink := filepath.Join(privateDirectory, "secret-hard-link")
+	if err := os.Link(path, hardLink); err != nil {
+		t.Skipf("hard links unavailable on this filesystem: %v", err)
+	}
+	if err := s3disk.ValidatePrivateSecretFile(path, file); !errors.Is(err, s3disk.ErrCorruptObject) {
+		t.Fatalf("hard-link error = %v, want ErrCorruptObject", err)
+	}
+	if err := os.Remove(hardLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := s3disk.ValidatePrivateSecretFile(path, file); err != nil {
+		t.Fatalf("ValidatePrivateSecretFile after hard-link removal: %v", err)
+	}
 }
 
 func TestValidatePrivateSecretFileRejectsWritableParent(t *testing.T) {

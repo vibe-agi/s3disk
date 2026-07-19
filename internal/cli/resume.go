@@ -41,7 +41,7 @@ func runResumeWithOperations(ctx context.Context, options ResumeOptions, operati
 	// No credential provider, S3 constructor, authenticated source path, or
 	// handoff is touched before the recovery key opens the sealed session and
 	// its original absolute authorization deadline is checked.
-	recoveryMaterial, err := readRecoveryKeyFile(localPaths.recoveryKey)
+	recoveryMaterial, err := readRecoveryKeyFileContext(ctx, localPaths.recoveryKey)
 	if err != nil {
 		return fmt.Errorf("s3disk share resume: read recovery key: %w", err)
 	}
@@ -175,7 +175,7 @@ func runResumeWithOperations(ctx context.Context, options ResumeOptions, operati
 		}
 	}
 
-	journal, err := s3disk.NewFilePublicationJournal(filepath.Join(localPaths.shareDirectory, "publication-journal.json"))
+	journal, err := s3disk.NewFilePublicationJournal(filepath.Join(localPaths.shareDirectory, publicationJournalFileName))
 	if err != nil {
 		return fmt.Errorf("s3disk share resume: open publication journal: %w", err)
 	}
@@ -187,6 +187,9 @@ func runResumeWithOperations(ctx context.Context, options ResumeOptions, operati
 		ReferenceSigner: identity.signer, ReferenceVerifier: identity.verifier,
 		PublicationJournal: journal, TrustedCheckpoint: trustedCheckpoint,
 		AllowTrustOnFirstUse: trustedCheckpoint == nil, Symlinks: s3disk.SymlinkRejectExternal,
+		ProtectedSourceFiles: protectedPublisherSourceFiles(
+			localPaths.recoveryKey, string(loaded.state.HandoffPath), localPaths.shareDirectory,
+		),
 	})
 	if err != nil {
 		return fmt.Errorf("s3disk share resume: restore publisher: %w", err)

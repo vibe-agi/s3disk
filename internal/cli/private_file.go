@@ -38,12 +38,11 @@ func (result privateFileWriteResult) needsReconciliation() bool {
 }
 
 // reconcileInstalledPrivateFileStaging removes only reserved staging names
-// which still identify the exact installed inode. This carries a hard-link
-// install's cleanup obligation across process restarts without deleting an
-// unrelated file which merely happens to match the temporary-name pattern.
-// The caller must sync the directory after this returns, whether it succeeds
-// or fails, so removals and the installed destination share one durability
-// barrier.
+// which still identify the exact installed inode. It then syncs the directory
+// and requires the installed file to pass the strict single-link secret-file
+// validation before returning success. This carries a hard-link install's
+// cleanup obligation across process restarts without deleting an unrelated
+// file which merely happens to match the temporary-name pattern.
 func reconcileInstalledPrivateFileStaging(
 	ctx context.Context,
 	absolute resolvedPrivatePath,
@@ -66,34 +65,58 @@ func reconcileInstalledPrivateFileStaging(
 	}
 	prefix := temporaryPattern[:wildcard]
 	suffix := temporaryPattern[wildcard+1:]
-	matchesTemporaryName := func(name string) bool {
-		return len(name) > len(prefix)+len(suffix) &&
-			strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix)
-	}
-
 	directory := filepath.Dir(path)
 	if err := s3disk.ValidatePrivateSecretDirectory(directory); err != nil {
 		return fmt.Errorf("s3disk: unsafe private staging directory: %w", err)
 	}
-	installedPathInfo, err := os.Lstat(path)
-	if err != nil || installedPathInfo.Mode()&os.ModeSymlink != 0 || !installedPathInfo.Mode().IsRegular() {
-		return fmt.Errorf("s3disk: installed private output is not a regular non-symlink file")
+	installedInfo, cleanupErr := removeInstalledPrivateFileStagingAliases(
+		ctx, path, directory, prefix, suffix, operations,
+	)
+	syncErr := operations.syncDirectory(directory)
+	if cleanupErr != nil || syncErr != nil {
+		if syncErr != nil {
+			syncErr = fmt.Errorf("s3disk: sync private staging directory: %w", syncErr)
+		}
+		if installedInfo != nil {
+			return errors.Join(ErrPrivateFileInstalledUnconfirmed, cleanupErr, syncErr)
+		}
+		return errors.Join(cleanupErr, syncErr)
 	}
-	installed, err := os.Open(path)
+	reconciliation, err := reconcilePrivateFile(path, installedInfo)
 	if err != nil {
-		return fmt.Errorf("s3disk: open installed private output: %w", err)
+		return fmt.Errorf("s3disk: strictly validate reconciled private output: %w", err)
 	}
-	installedInfo, statErr := installed.Stat()
-	validationErr := s3disk.ValidatePrivateSecretFile(path, installed)
-	closeErr := installed.Close()
-	if statErr != nil || validationErr != nil || closeErr != nil ||
-		!os.SameFile(installedPathInfo, installedInfo) {
-		return fmt.Errorf("s3disk: installed private output changed before staging reconciliation")
+	if !reconciliation.sameStagingFile {
+		return fmt.Errorf("s3disk: installed private output changed during staging reconciliation")
 	}
+	return nil
+}
 
+func removeInstalledPrivateFileStagingAliases(
+	ctx context.Context,
+	path string,
+	directory string,
+	prefix string,
+	suffix string,
+	operations privateFileOperations,
+) (os.FileInfo, error) {
+	installed, installedInfo, err := openPrivateFileForReconciliation(path)
+	if err != nil {
+		return nil, fmt.Errorf("s3disk: inspect installed private output: %w", err)
+	}
+	installedOpen := true
+	defer func() {
+		if installedOpen {
+			_ = installed.Close()
+		}
+	}()
+	matchesTemporaryName := func(name string) bool {
+		return len(name) > len(prefix)+len(suffix) &&
+			strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix)
+	}
 	directoryFile, err := os.Open(directory)
 	if err != nil {
-		return fmt.Errorf("s3disk: open private staging directory: %w", err)
+		return installedInfo, fmt.Errorf("s3disk: open private staging directory: %w", err)
 	}
 	directoryOpen := true
 	defer func() {
@@ -104,16 +127,16 @@ func reconcileInstalledPrivateFileStaging(
 	entriesSeen := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return installedInfo, err
 		}
 		entries, readErr := directoryFile.ReadDir(256)
 		entriesSeen += len(entries)
 		if entriesSeen > maximumPrivateStagingScanEntries {
-			return fmt.Errorf("s3disk: %w: private staging directory exceeds %d entries", s3disk.ErrResourceLimit, maximumPrivateStagingScanEntries)
+			return installedInfo, fmt.Errorf("s3disk: %w: private staging directory exceeds %d entries", s3disk.ErrResourceLimit, maximumPrivateStagingScanEntries)
 		}
 		for _, entry := range entries {
 			if err := ctx.Err(); err != nil {
-				return err
+				return installedInfo, err
 			}
 			name := entry.Name()
 			if name == filepath.Base(path) || !matchesTemporaryName(name) {
@@ -125,7 +148,7 @@ func reconcileInstalledPrivateFileStaging(
 				continue
 			}
 			if candidateErr != nil {
-				return fmt.Errorf("s3disk: inspect staged private output: %w", candidateErr)
+				return installedInfo, fmt.Errorf("s3disk: inspect staged private output: %w", candidateErr)
 			}
 			if candidateInfo.Mode()&os.ModeSymlink != 0 || !candidateInfo.Mode().IsRegular() ||
 				!os.SameFile(installedInfo, candidateInfo) {
@@ -140,24 +163,28 @@ func reconcileInstalledPrivateFileStaging(
 			if installedErr != nil || stagedErr != nil ||
 				!os.SameFile(installedInfo, currentInstalled) ||
 				!os.SameFile(installedInfo, currentCandidate) {
-				return fmt.Errorf("s3disk: private staging alias changed during reconciliation")
+				return installedInfo, fmt.Errorf("s3disk: private staging alias changed during reconciliation")
 			}
 			if err := operations.remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("s3disk: remove installed private staging alias: %w", err)
+				return installedInfo, fmt.Errorf("s3disk: remove installed private staging alias: %w", err)
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			return fmt.Errorf("s3disk: read private staging directory: %w", readErr)
+			return installedInfo, fmt.Errorf("s3disk: read private staging directory: %w", readErr)
 		}
 	}
 	if err := directoryFile.Close(); err != nil {
-		return fmt.Errorf("s3disk: close private staging directory: %w", err)
+		return installedInfo, fmt.Errorf("s3disk: close private staging directory: %w", err)
 	}
 	directoryOpen = false
-	return nil
+	if err := installed.Close(); err != nil {
+		return installedInfo, fmt.Errorf("s3disk: close installed private output: %w", err)
+	}
+	installedOpen = false
+	return installedInfo, nil
 }
 
 type privateFileOperations struct {
@@ -281,7 +308,7 @@ func writePrivateFileNoReplace(
 
 	result := privateFileWriteResult{InstallAttempted: true}
 	installErr := operations.install(temporary, path)
-	reconciliation, reconciliationErr := reconcilePrivateFile(path, stagedInfo)
+	provisional, _ := reconcilePrivateFileIdentity(path, stagedInfo)
 	// Once installation has been attempted, every outcome must explicitly
 	// settle the staged secret and make both its removal and any destination
 	// entry durable. A deferred best-effort unlink is not sufficient evidence
@@ -301,6 +328,18 @@ func writePrivateFileNoReplace(
 		syncErr = fmt.Errorf("s3disk: sync private output directory: %w", syncErr)
 	}
 	cleanupBarrierErr := errors.Join(removeErr, syncErr)
+	var reconciliation privateFileReconciliation
+	var reconciliationErr error
+	if provisional.sameStagingFile && !result.CleanupConfirmed {
+		// A successful Unix no-replace install legitimately has two links until
+		// staging cleanup succeeds. Reconfirm only identity in this error state;
+		// callers receive InstalledUnconfirmed and must not read it as a secret.
+		reconciliation, reconciliationErr = reconcilePrivateFileIdentity(path, stagedInfo)
+	} else {
+		// Once the staging name is gone, or when the destination is a different
+		// inode, require the complete single-link private-file invariant.
+		reconciliation, reconciliationErr = reconcilePrivateFile(path, stagedInfo)
+	}
 	if !reconciliation.sameStagingFile {
 		if errors.Is(installErr, os.ErrExist) && reconciliation.validatedOtherFile {
 			result.InstallResolved = true
@@ -341,15 +380,51 @@ type privateFileReconciliation struct {
 	validatedOtherFile bool
 }
 
-func reconcilePrivateFile(path string, staged os.FileInfo) (privateFileReconciliation, error) {
+func openPrivateFileForReconciliation(path string) (*os.File, os.FileInfo, error) {
 	linked, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if linked.Mode()&os.ModeSymlink != 0 || !linked.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("final private output is not a regular non-symlink file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, err := file.Stat()
+	current, currentErr := os.Lstat(path)
+	if err != nil || currentErr != nil || !opened.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(linked, opened) || !os.SameFile(opened, current) {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("final private output changed during identity inspection")
+	}
+	return file, opened, nil
+}
+
+func reconcilePrivateFileIdentity(path string, staged os.FileInfo) (privateFileReconciliation, error) {
+	if staged == nil {
+		return privateFileReconciliation{}, fmt.Errorf("staged private output identity is required")
+	}
+	file, opened, err := openPrivateFileForReconciliation(path)
 	if err != nil {
 		return privateFileReconciliation{}, err
 	}
-	if linked.Mode()&os.ModeSymlink != 0 || !linked.Mode().IsRegular() {
-		return privateFileReconciliation{}, fmt.Errorf("final private output is not a regular non-symlink file")
+	if err := file.Close(); err != nil {
+		return privateFileReconciliation{}, err
 	}
-	file, err := os.Open(path)
+	if os.SameFile(staged, opened) {
+		return privateFileReconciliation{sameStagingFile: true}, nil
+	}
+	return privateFileReconciliation{}, nil
+}
+
+func reconcilePrivateFile(path string, staged os.FileInfo) (privateFileReconciliation, error) {
+	if staged == nil {
+		return privateFileReconciliation{}, fmt.Errorf("staged private output identity is required")
+	}
+	file, opened, err := openPrivateFileForReconciliation(path)
 	if err != nil {
 		return privateFileReconciliation{}, err
 	}
@@ -357,11 +432,11 @@ func reconcilePrivateFile(path string, staged os.FileInfo) (privateFileReconcili
 	if err := s3disk.ValidatePrivateSecretFile(path, file); err != nil {
 		return privateFileReconciliation{}, err
 	}
-	opened, err := file.Stat()
-	if err != nil {
-		return privateFileReconciliation{}, err
+	current, err := os.Lstat(path)
+	if err != nil || !os.SameFile(opened, current) {
+		return privateFileReconciliation{}, fmt.Errorf("final private output changed during strict validation")
 	}
-	if os.SameFile(staged, linked) && os.SameFile(staged, opened) {
+	if os.SameFile(staged, opened) {
 		return privateFileReconciliation{sameStagingFile: true}, nil
 	}
 	return privateFileReconciliation{validatedOtherFile: true}, nil

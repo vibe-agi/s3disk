@@ -98,4 +98,8 @@ var (
 	// FilePublicationJournal, and DiskCache. Callers must not silently fall back
 	// to an unprotected path for anti-rollback or publication state.
 	ErrTrustStateUnsupported = errors.New("s3disk: secure local trust state is unsupported")
+	// ErrProtectedSourceFile reports that a configured local file protection
+	// could not be established or that the same filesystem object appeared in
+	// the snapshot source. No bytes from the matching source file are uploaded.
+	ErrProtectedSourceFile = errors.New("s3disk: protected source file constraint violated")
 )

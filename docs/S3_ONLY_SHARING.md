@@ -488,11 +488,14 @@ closure, and S3-only constraints.
   commercial deployment, still define recovery-key backup and rotation,
   external freshness anchoring, disaster-recovery restoration, old-key
   retirement, memory/core-dump handling, and zeroization.
-- Treat source/state/recovery path separation as necessary but not sufficient:
-  a hard-link or bind-mount alias can expose the same secret inode through the
-  source tree. Keep recovery material on separately controlled storage and add
-  deployment alias checks until the publisher supports a continuously
-  revalidated forbidden-inode/mount policy.
+- Treat source/state/recovery path separation plus Publisher's per-scan current
+  file-identity pinning as necessary but not sufficient. It rejects matching
+  hard links and direct file bind mounts before uploading their bytes, but it
+  does not enumerate mount IDs. Supported Unix secret-file reads and sealed
+  state replacements also require `nlink == 1`, closing the normal old-hardlink
+  rotation path but not stale file bind mounts or same-UID races. Keep recovery
+  material on separately controlled storage, forbid source submounts, and
+  certify OS-specific alias policy before release.
 - Protect the handoff, share key, bearer URLs, and cached plaintext from logs,
   command lines, crash reports, telemetry, and other local users. `DiskCache`
   is plaintext even though its S3 source objects are ciphertext; allocate a

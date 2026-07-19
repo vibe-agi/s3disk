@@ -143,6 +143,122 @@ func TestRunPublishPersistsPreparedRecoveryBeforeFirstStoreOperation(t *testing.
 	}
 }
 
+func TestRunPublishRejectsRecoveryKeyAliasBeforeChunkUpload(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	requirePublisherSessionSealedState(t)
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	source := t.TempDir()
+	stateDirectory := t.TempDir()
+	if err := os.Chmod(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoffPath := filepath.Join(t.TempDir(), "share.handoff")
+	recoveryKeyPath := filepath.Join(t.TempDir(), "publisher-recovery-key.json")
+	writeOrderingRecoveryKey(t, recoveryKeyPath)
+	store := memstore.New()
+	presigner := &orderingExactPresigner{}
+	operations := orderingMemstorePublisherOperations(now, store, presigner, nil)
+	linked := false
+	operations.afterDurablePhase = func(_ context.Context, phase publisherSessionPhase) error {
+		if phase != publisherSessionJournalReady || linked {
+			return nil
+		}
+		store.ResetStats()
+		if err := os.Link(recoveryKeyPath, filepath.Join(source, "recovery-key-alias")); err != nil {
+			return fmt.Errorf("create recovery-key test alias: %w", err)
+		}
+		linked = true
+		return nil
+	}
+	options := PublishOptions{
+		Source: source, All: true, Bucket: "protected-source-bucket", Prefix: "protected/publish",
+		Region: "us-east-1", Endpoint: "http://127.0.0.1:9000", UsePathStyle: true,
+		AllowInsecureEndpoint: true, Channel: "main", ExpiresIn: time.Hour,
+		HandoffOut: handoffPath, StateDir: stateDirectory, RecoveryKey: recoveryKeyPath, Once: true,
+	}
+
+	err := runPublishWithOperations(ctx, options, operations)
+	if !linked {
+		if err != nil && strings.Contains(err.Error(), "create recovery-key test alias") {
+			t.Skipf("hard links unavailable on this filesystem: %v", err)
+		}
+		t.Fatal("journal-ready boundary did not create the recovery-key alias")
+	}
+	if !errors.Is(err, s3disk.ErrProtectedSourceFile) {
+		t.Fatalf("runPublishWithOperations error = %v, want ErrProtectedSourceFile", err)
+	}
+	if stats := store.Stats(); stats.ChunkPuts != 0 {
+		t.Fatalf("chunk puts = %d, want zero before protected recovery-key rejection", stats.ChunkPuts)
+	}
+}
+
+func TestRunResumeRejectsSessionAliasBeforeChunkUpload(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	requirePublisherSessionSealedState(t)
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	source := t.TempDir()
+	stateDirectory := t.TempDir()
+	if err := os.Chmod(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handoffPath := filepath.Join(t.TempDir(), "share.handoff")
+	recoveryKeyPath := filepath.Join(t.TempDir(), "publisher-recovery-key.json")
+	writeOrderingRecoveryKey(t, recoveryKeyPath)
+	store := memstore.New()
+	presigner := &orderingExactPresigner{}
+	crash := errors.New("crash after journal-ready durable phase")
+	crashOperations := orderingMemstorePublisherOperations(now, store, presigner, nil)
+	crashOperations.afterDurablePhase = func(_ context.Context, phase publisherSessionPhase) error {
+		if phase == publisherSessionJournalReady {
+			return crash
+		}
+		return nil
+	}
+	options := PublishOptions{
+		Source: source, All: true, Bucket: "protected-source-bucket", Prefix: "protected/resume",
+		Region: "us-east-1", Endpoint: "http://127.0.0.1:9000", UsePathStyle: true,
+		AllowInsecureEndpoint: true, Channel: "main", ExpiresIn: time.Hour,
+		HandoffOut: handoffPath, StateDir: stateDirectory, RecoveryKey: recoveryKeyPath, Once: true,
+	}
+	if err := runPublishWithOperations(ctx, options, crashOperations); !errors.Is(err, crash) {
+		t.Fatalf("crashed publish error = %v, want crash sentinel", err)
+	}
+	if presigner.shareID.IsZero() {
+		t.Fatal("crashed publish did not retain its share identity")
+	}
+
+	shareDirectory := filepath.Join(stateDirectory, presigner.shareID.String())
+	sessionPath := filepath.Join(shareDirectory, publisherSessionFileName)
+	alias := filepath.Join(source, "session-alias")
+	resumeOperations := orderingMemstorePublisherOperations(now, store, presigner, nil)
+	baseOpenS3 := resumeOperations.openS3
+	var linkErr error
+	resumeOperations.openS3 = func(ctx context.Context, config publisherS3Config) (publisherS3Handle, error) {
+		linkErr = os.Link(sessionPath, alias)
+		if linkErr != nil {
+			return publisherS3Handle{}, linkErr
+		}
+		return baseOpenS3(ctx, config)
+	}
+	store.ResetStats()
+	err := runResumeWithOperations(ctx, ResumeOptions{
+		StateDir: stateDirectory, ShareID: presigner.shareID.String(), RecoveryKey: recoveryKeyPath,
+	}, resumeOperations)
+	if linkErr != nil {
+		t.Skipf("hard links unavailable on this filesystem: %v", linkErr)
+	}
+	if !errors.Is(err, s3disk.ErrProtectedSourceFile) {
+		t.Fatalf("runResumeWithOperations error = %v, want ErrProtectedSourceFile", err)
+	}
+	if stats := store.Stats(); stats.ChunkPuts != 0 {
+		t.Fatalf("chunk puts = %d, want zero before protected session rejection", stats.ChunkPuts)
+	}
+}
+
 func TestRunResumeRejectsAuthenticatedExpiredSessionBeforeOpeningS3(t *testing.T) {
 	requirePrivateSecretFiles(t)
 	requirePublisherSessionSealedState(t)

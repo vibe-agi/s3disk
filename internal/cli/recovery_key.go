@@ -222,12 +222,27 @@ func writeRecoveryKeyBytesWithOperations(
 // reading secret bytes, then authenticates the non-secret key ID by recomputing
 // it from the canonical recovery-key representation.
 func readRecoveryKeyFile(path string) (recoveryKeyMaterial, error) {
+	return readRecoveryKeyFileContext(context.Background(), path)
+}
+
+func readRecoveryKeyFileContext(ctx context.Context, path string) (recoveryKeyMaterial, error) {
+	if ctx == nil {
+		return recoveryKeyMaterial{}, fmt.Errorf("s3disk: recovery-key context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return recoveryKeyMaterial{}, err
+	}
 	if path == "" {
 		return recoveryKeyMaterial{}, fmt.Errorf("s3disk: recovery-key path is required")
 	}
 	absolute, err := resolvePrivatePath(path)
 	if err != nil {
 		return recoveryKeyMaterial{}, ErrInvalidRecoveryKeyFile
+	}
+	if err := reconcileInstalledPrivateFileStaging(
+		ctx, absolute, ".s3disk-recovery-key-*", privateFileOperations{},
+	); err != nil {
+		return recoveryKeyMaterial{}, fmt.Errorf("%w: staging reconciliation failed: %w", ErrInvalidRecoveryKeyFile, err)
 	}
 	before, err := os.Lstat(string(absolute))
 	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {

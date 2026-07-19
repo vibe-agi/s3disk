@@ -27,10 +27,10 @@ func ValidatePrivateSecretDirectory(path string) error {
 
 // ValidatePrivateSecretFile proves that file is the same regular file named by
 // path, is owned by the current process identity, has exactly 0600 permissions,
-// and resides below a trusted private-secret directory hierarchy. ACLs are
-// inspected where the platform exposes a sound implementation. The caller must
-// invoke this before writing or reading secret bytes. Unsupported platforms
-// fail closed.
+// has exactly one filesystem link where link counts are supported, and resides
+// below a trusted private-secret directory hierarchy. ACLs are inspected where
+// the platform exposes a sound implementation. The caller must invoke this
+// before writing or reading secret bytes. Unsupported platforms fail closed.
 func ValidatePrivateSecretFile(path string, file *os.File) error {
 	if path == "" || file == nil {
 		return fmt.Errorf("s3disk: private secret path and open file are required")

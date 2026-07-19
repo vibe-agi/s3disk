@@ -500,11 +500,18 @@ accept or resolve each one explicitly.
   rewrap transaction, KMS integration, recovery-key backup workflow, certified
   disaster restore, or secure zeroization. Approve and test those controls
   before certifying commercial recovery.
-- CLI source/state/recovery separation is pathname-based. A hard-link or
-  bind-mount alias can make recovery material appear inside the published
-  source even when its configured path is outside. Production policy must keep
-  those secrets on separately controlled storage and detect aliases; a
-  continuously revalidated forbidden-inode/mount set remains release work.
+- CLI source/state/recovery separation now also pins the current filesystem
+  identity of each then-existing protected file--the recovery key, sealed
+  session, publication journal, root WAL, and handoff--before every source
+  scan. The handoff may be absent initially but cannot disappear after it is
+  first observed. Matching hard links and direct file bind mounts are rejected
+  before their bytes are uploaded. Supported Unix secret files additionally
+  require `nlink == 1`
+  before reads and state replacement, preventing the normal writer from
+  rotating past an external hard link. This does not enumerate mount IDs:
+  stale bind mounts, source submounts, publication-journal history, and
+  same-UID filesystem races still require a separately controlled storage and
+  deployment policy. OS-specific mount certification remains release work.
 - Redacted formatting is not a memory boundary. The raw handoff contains a
   usable client key and bearer, and values may remain visible to reflection,
   debuggers, core dumps, or swap. There is no `mlock`, automatic handoff

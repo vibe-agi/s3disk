@@ -181,6 +181,19 @@ func TestRecoveryKeyFileRejectsPermissionsAndSymlink(t *testing.T) {
 	}
 }
 
+func TestMissingRecoveryKeyDoesNotClaimInstallationUncertainty(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	path := filepath.Join(t.TempDir(), "missing-recovery-key.json")
+	_, err := readRecoveryKeyFile(path)
+	if !errors.Is(err, ErrInvalidRecoveryKeyFile) {
+		t.Fatalf("missing recovery-key error = %v, want ErrInvalidRecoveryKeyFile", err)
+	}
+	if errors.Is(err, ErrPrivateFileInstalledUnconfirmed) ||
+		errors.Is(err, ErrPrivateFileInstallIndeterminate) {
+		t.Fatalf("missing recovery-key error falsely claims installation uncertainty: %v", err)
+	}
+}
+
 func TestRecoveryKeyFileNeverOverwrites(t *testing.T) {
 	requirePrivateSecretFiles(t)
 	directory := t.TempDir()
@@ -368,6 +381,49 @@ func TestRecoveryKeyInstalledUnconfirmedReturnsMaterial(t *testing.T) {
 	}
 	if loaded.keyID != material.keyID || loaded.key.ExportSecret() != key.ExportSecret() {
 		t.Fatal("installed recovery-key file differs from returned material")
+	}
+}
+
+func TestRecoveryKeyReadReconcilesReservedInstallStagingBeforeStrictRead(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	directory := t.TempDir()
+	path := filepath.Join(directory, "recovery-key.json")
+	key, err := publisherstate.GenerateRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlinkFailure := errors.New("injected recovery-key staging unlink failure")
+	removeCalls := 0
+	operations := privateFileOperationsFor(installPrivateFileNoReplace)
+	operations.remove = func(path string) error {
+		removeCalls++
+		if removeCalls <= 2 {
+			return unlinkFailure
+		}
+		return os.Remove(path)
+	}
+
+	material, result, err := writeRecoveryKeyFileWithOperations(context.Background(), path, key, operations)
+	if !errors.Is(err, ErrPrivateFileInstalledUnconfirmed) || !errors.Is(err, unlinkFailure) {
+		t.Fatalf("write error = %v, want installed-unconfirmed staging cleanup", err)
+	}
+	if !result.Installed || result.CleanupConfirmed || !result.needsReconciliation() {
+		t.Fatalf("write result = %+v, want installed cleanup uncertainty", result)
+	}
+	staging, err := filepath.Glob(filepath.Join(directory, ".s3disk-recovery-key-*"))
+	if err != nil || len(staging) != 1 {
+		t.Fatalf("recovery-key staging = %v, %v; want one alias", staging, err)
+	}
+	loaded, err := readRecoveryKeyFile(path)
+	if err != nil {
+		t.Fatalf("readRecoveryKeyFile reconciliation: %v", err)
+	}
+	if loaded.keyID != material.keyID || loaded.key.ExportSecret() != key.ExportSecret() {
+		t.Fatal("reconciled recovery key differs from the installed material")
+	}
+	staging, err = filepath.Glob(filepath.Join(directory, ".s3disk-recovery-key-*"))
+	if err != nil || len(staging) != 0 {
+		t.Fatalf("recovery-key staging after read = %v, %v; want none", staging, err)
 	}
 }
 

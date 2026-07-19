@@ -94,9 +94,10 @@ s3disk share recovery-key generate \
 ```
 
 The output is canonical versioned JSON installed without replacement as a
-current-owner file with exactly `0600` permissions. The final path component
-must be absent and must not be a symlink; any existing file, directory, or
-symlink is refused. Parent components may include a safely resolvable symlink:
+current-owner file with exactly `0600` permissions and, on supported Unix
+filesystems, exactly one link. The final path component must be absent and must
+not be a symlink; any existing file, directory, or symlink is refused. Parent
+components may include a safely resolvable symlink:
 the command resolves the parent once before staging, then validates the
 resolved hierarchy's ownership, writable permissions, and supported ACLs.
 This directory check is a safety proof, not a promise that every parent has
@@ -113,10 +114,11 @@ command returns a stable uncertainty error and prints a `reconcile_required`
 hint containing only the output path, key ID, and outcome--never the recovery
 key. Treat that path as potentially installed and do not overwrite or delete it
 until an operator has reconciled the final file and any staging name.
-For an idempotent handoff retry, the CLI removes a reserved staging name left
-by an earlier hard-link install only after `os.SameFile` proves that it is
-another link to the exact verified final handoff; unrelated matching files are
-preserved.
+For an idempotent handoff or recovery-key retry, the CLI removes a reserved
+staging name left by an earlier hard-link install only after `os.SameFile`
+proves that it is another link to the exact final inode; unrelated matching
+files are preserved. It then syncs the directory, requires the final file to
+have one link, and only then reads and authenticates secret bytes.
 
 `share publish` uses this independent key to seal an A-only session manifest
 and exact root recovery WAL before its first S3 object operation. The manifest
@@ -128,12 +130,25 @@ bearer can still contain its signing access-key ID and a temporary session-token
 query value; treat the entire state directory as secret. Keep the recovery key
 outside both the source and state directory.
 
-This separation is pathname-based. Go's portable filesystem APIs cannot prove
-that a source entry is not a hard-link or bind-mount alias of the recovery key
-or sealed state. Do not place such aliases in the source tree; for unattended
-publishing, keep recovery material on a separately controlled filesystem and
-include an alias check in deployment policy. The CLI does not yet enforce a
-continuously revalidated forbidden-inode set.
+Path separation is reinforced at the publisher boundary. Immediately before
+every source scan, the CLI has `Publisher` open and pin the current filesystem
+identity of each then-existing protected file: the recovery key, sealed
+session, publication journal, root WAL, and handoff. The handoff alone may be
+absent initially; after it is first observed, disappearance fails closed. A
+selected source file with the same identity is rejected before its contents or
+chunks are read or uploaded. This catches hard links and direct file bind
+mounts where the platform reports the same identity, including every new scan
+performed by `Watch`. Unix secret-file reads and sealed-state updates also
+require a single link, so normal state rotation refuses an external hard link
+before the old inode can be replaced.
+
+This is not a complete mount or hostile-local-user boundary. Portable Go APIs
+do not enumerate mount identities, and a bind mount pinned to an old inode
+after canonical state replacement is not represented by the current protected
+path or by Unix link count. A same-UID process can also race filesystem changes
+and can ordinarily read A's secrets directly. Keep recovery material on
+separately controlled storage and forbid source-tree submounts in commercial
+deployment policy.
 
 ```sh
 s3disk share publish \

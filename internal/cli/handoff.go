@@ -331,25 +331,19 @@ func installOrVerifyHandoffWithOperations(
 	}
 
 	if errors.Is(writeErr, errPrivateFileExists) {
-		if err := verifyExactHandoff(absolute, encoded, expectedDigest); err != nil {
-			return errors.Join(ErrHandoffExists, err)
-		}
 		if result.needsReconciliation() {
 			return writeErr
 		}
-		cleanupErr := reconcileInstalledPrivateFileStaging(
+		if err := reconcileInstalledPrivateFileStaging(
 			ctx, resolvedPrivatePath(absolute), ".s3disk-handoff-*", operations,
-		)
-		syncErr := operations.syncDirectory(filepath.Dir(absolute))
-		if syncErr != nil {
-			syncErr = fmt.Errorf("s3disk: sync existing handoff directory: %w", syncErr)
+		); err != nil {
+			if errors.Is(err, ErrPrivateFileInstalledUnconfirmed) {
+				return errors.Join(ErrHandoffExists, err)
+			}
+			return errors.Join(ErrHandoffExists, ErrInvalidHandoff, err)
 		}
-		if cleanupErr != nil || syncErr != nil {
-			return errors.Join(
-				ErrPrivateFileInstalledUnconfirmed,
-				cleanupErr,
-				syncErr,
-			)
+		if err := verifyExactHandoff(absolute, encoded, expectedDigest); err != nil {
+			return errors.Join(ErrHandoffExists, err)
 		}
 		return nil
 	}

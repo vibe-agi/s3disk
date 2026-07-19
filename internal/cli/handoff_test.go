@@ -288,6 +288,62 @@ func TestInstallOrVerifyHandoffCarriesStagingCleanupAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestInstallOrVerifyHandoffRejectsExternalHardLinkAfterReservedCleanup(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	directory := t.TempDir()
+	path := filepath.Join(directory, "share.handoff")
+	value := newTestHandoff(t)
+	encoded, err := encodeHandoff(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(encoded)
+	digest := handoffDigest(encoded)
+	unlinkFailure := errors.New("injected staged unlink failure")
+	removeCalls := 0
+	operations := privateFileOperationsFor(installPrivateFileNoReplace)
+	operations.remove = func(path string) error {
+		removeCalls++
+		if removeCalls <= 2 {
+			return unlinkFailure
+		}
+		return os.Remove(path)
+	}
+	if err := installOrVerifyHandoffWithOperations(
+		context.Background(), path, value, digest, operations,
+	); !errors.Is(err, ErrPrivateFileInstalledUnconfirmed) {
+		t.Fatalf("first install error = %v, want installed-unconfirmed", err)
+	}
+	staging := privateHandoffStagingFiles(t, directory)
+	if len(staging) != 1 {
+		t.Fatalf("staging files = %v, want one", staging)
+	}
+	external := filepath.Join(t.TempDir(), "external-hard-link")
+	if err := os.Link(path, external); err != nil {
+		t.Skipf("hard links unavailable on this filesystem: %v", err)
+	}
+
+	err = installOrVerifyHandoffWithOperations(context.Background(), path, value, digest, operations)
+	if !errors.Is(err, ErrHandoffExists) || !errors.Is(err, ErrInvalidHandoff) ||
+		!errors.Is(err, s3disk.ErrCorruptObject) {
+		t.Fatalf("retry with external hard link error = %v, want ErrHandoffExists, ErrInvalidHandoff, and ErrCorruptObject", err)
+	}
+	if staging := privateHandoffStagingFiles(t, directory); len(staging) != 0 {
+		t.Fatalf("reserved staging aliases after reconciliation = %v, want none", staging)
+	}
+	if _, err := os.Stat(external); err != nil {
+		t.Fatalf("external hard link was removed: %v", err)
+	}
+	if err := os.Remove(external); err != nil {
+		t.Fatal(err)
+	}
+	if err := installOrVerifyHandoffWithOperations(
+		context.Background(), path, value, digest, operations,
+	); err != nil {
+		t.Fatalf("retry after external hard-link removal: %v", err)
+	}
+}
+
 func TestInstallOrVerifyHandoffRejectsDigestAndExistingContentMismatch(t *testing.T) {
 	t.Run("expected digest must bind desired bytes", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "share.handoff")

@@ -15,11 +15,39 @@ import (
 	"time"
 )
 
+const (
+	maxProtectedSourceFiles      = 64
+	maxProtectedSourcePathBytes  = 64 << 10
+	maxProtectedSourceTotalBytes = 1 << 20
+)
+
+// ProtectedSourceFile identifies a local regular file whose filesystem
+// identity must never appear in a published source tree. Stage pins every
+// existing configured file by an open handle immediately before scanning and
+// returns ErrProtectedSourceFile before reading or uploading a matching source
+// file. This detects hard links and direct file bind mounts when the platform's
+// os.SameFile implementation reports the same identity.
+//
+// AllowMissingInitially supports outputs which are created after the Publisher
+// is constructed. Once a Stage observes the file, its later disappearance is a
+// protection failure. Callers must serialize protected-file replacement with
+// Stage; this is not a security boundary against a hostile process running as
+// the same OS identity.
+type ProtectedSourceFile struct {
+	Path                  string
+	AllowMissingInitially bool
+}
+
 // PublisherOptions controls snapshot construction.
 type PublisherOptions struct {
 	Chunking        ChunkingOptions
 	StableReadTries int
 	Symlinks        SymlinkPolicy
+	// ProtectedSourceFiles prevents current filesystem aliases of sensitive
+	// local files from being included in a snapshot. Paths are defensively
+	// copied and made absolute by NewPublisher. Existing paths must name regular
+	// non-symlink files; errors never disclose the configured path.
+	ProtectedSourceFiles []ProtectedSourceFile
 	// DangerouslyAllowUncommissionedRepository permits publication through a
 	// low-level Repository which has no durable commissioning descriptor. This
 	// disables prefix/profile/chunking identity protection and is intended only
@@ -53,6 +81,7 @@ type Publisher struct {
 	trustedCheckpoint    *Watermark
 	allowTrustOnFirstUse bool
 	checkpointValidated  map[string]Watermark
+	protectedSourceSeen  map[string]bool
 }
 
 func NewPublisher(repository *Repository, options PublisherOptions) (*Publisher, error) {
@@ -128,13 +157,153 @@ func NewPublisher(repository *Repository, options PublisherOptions) (*Publisher,
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	protectedSourceFiles, err := normalizeProtectedSourceFiles(options.ProtectedSourceFiles)
+	if err != nil {
+		return nil, err
+	}
+	options.ProtectedSourceFiles = protectedSourceFiles
+	protectedSourceSeen, err := initiallyObservedProtectedSourceFiles(protectedSourceFiles)
+	if err != nil {
+		return nil, err
+	}
 	return &Publisher{
 		repository: repository, options: options,
 		referenceSigner: options.ReferenceSigner, referenceVerifier: options.ReferenceVerifier,
 		publicationJournal: options.PublicationJournal, trustedCheckpoint: options.TrustedCheckpoint,
 		allowTrustOnFirstUse: options.AllowTrustOnFirstUse,
 		checkpointValidated:  make(map[string]Watermark),
+		protectedSourceSeen:  protectedSourceSeen,
 	}, nil
+}
+
+func initiallyObservedProtectedSourceFiles(values []ProtectedSourceFile) (map[string]bool, error) {
+	seen := make(map[string]bool, len(values))
+	for index, value := range values {
+		if !value.AllowMissingInitially {
+			continue
+		}
+		_, err := os.Lstat(value.Path)
+		switch {
+		case err == nil:
+			seen[value.Path] = true
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return nil, fmt.Errorf(
+				"%w: configured file %d cannot be initially inspected",
+				ErrProtectedSourceFile, index+1,
+			)
+		}
+	}
+	return seen, nil
+}
+
+func normalizeProtectedSourceFiles(values []ProtectedSourceFile) ([]ProtectedSourceFile, error) {
+	if len(values) > maxProtectedSourceFiles {
+		return nil, fmt.Errorf(
+			"%w: protected source file count exceeds %d",
+			ErrResourceLimit, maxProtectedSourceFiles,
+		)
+	}
+	result := make([]ProtectedSourceFile, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	totalBytes := 0
+	for index, value := range values {
+		if value.Path == "" || strings.IndexByte(value.Path, 0) >= 0 || len(value.Path) > maxProtectedSourcePathBytes {
+			return nil, fmt.Errorf("%w: protected source file %d has an invalid path", ErrInvalidPath, index+1)
+		}
+		absolute, err := filepath.Abs(value.Path)
+		if err != nil {
+			return nil, fmt.Errorf("%w: protected source file %d path cannot be resolved", ErrInvalidPath, index+1)
+		}
+		absolute = filepath.Clean(absolute)
+		if len(absolute) > maxProtectedSourcePathBytes {
+			return nil, fmt.Errorf("%w: protected source file %d path exceeds the limit", ErrResourceLimit, index+1)
+		}
+		totalBytes += len(absolute)
+		if totalBytes > maxProtectedSourceTotalBytes {
+			return nil, fmt.Errorf("%w: protected source file paths exceed the total byte limit", ErrResourceLimit)
+		}
+		if _, duplicate := seen[absolute]; duplicate {
+			return nil, fmt.Errorf("%w: protected source file %d duplicates an earlier path", ErrInvalidPath, index+1)
+		}
+		seen[absolute] = struct{}{}
+		result = append(result, ProtectedSourceFile{
+			Path: absolute, AllowMissingInitially: value.AllowMissingInitially,
+		})
+	}
+	return result, nil
+}
+
+type protectedSourceIdentity struct {
+	handle *os.File
+	info   os.FileInfo
+}
+
+// captureProtectedSourceFiles runs after publication-journal recovery and
+// immediately before source traversal. That ordering pins the journal version
+// which can actually coexist with this scan rather than a version replaced by
+// the Stage preparation itself.
+func (publisher *Publisher) captureProtectedSourceFiles(ctx context.Context) ([]protectedSourceIdentity, error) {
+	identities := make([]protectedSourceIdentity, 0, len(publisher.options.ProtectedSourceFiles))
+	fail := func(err error) ([]protectedSourceIdentity, error) {
+		closeProtectedSourceFiles(identities)
+		return nil, err
+	}
+	for index, protected := range publisher.options.ProtectedSourceFiles {
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		linked, err := os.Lstat(protected.Path)
+		if errors.Is(err, os.ErrNotExist) {
+			if protected.AllowMissingInitially && !publisher.protectedSourceSeen[protected.Path] {
+				continue
+			}
+			return fail(fmt.Errorf("%w: configured file %d is missing", ErrProtectedSourceFile, index+1))
+		}
+		if err != nil {
+			return fail(fmt.Errorf("%w: configured file %d cannot be inspected", ErrProtectedSourceFile, index+1))
+		}
+		// Any observed pathname is no longer eligible for the initial-missing
+		// exception, even if its type or identity fails validation below.
+		publisher.protectedSourceSeen[protected.Path] = true
+		if linked.Mode()&os.ModeSymlink != 0 || !linked.Mode().IsRegular() {
+			return fail(fmt.Errorf("%w: configured file %d is not a regular non-symlink file", ErrProtectedSourceFile, index+1))
+		}
+		handle, err := os.Open(protected.Path)
+		if err != nil {
+			return fail(fmt.Errorf("%w: configured file %d cannot be opened", ErrProtectedSourceFile, index+1))
+		}
+		opened, statErr := handle.Stat()
+		current, currentErr := os.Lstat(protected.Path)
+		if statErr != nil || currentErr != nil || !opened.Mode().IsRegular() ||
+			current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+			!os.SameFile(linked, opened) || !os.SameFile(opened, current) {
+			_ = handle.Close()
+			return fail(fmt.Errorf(
+				"%w: configured file %d changed during inspection: %w",
+				ErrProtectedSourceFile, index+1, ErrUnstableFile,
+			))
+		}
+		duplicate := false
+		for _, identity := range identities {
+			if os.SameFile(opened, identity.info) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			_ = handle.Close()
+			continue
+		}
+		identities = append(identities, protectedSourceIdentity{handle: handle, info: opened})
+	}
+	return identities, nil
+}
+
+func closeProtectedSourceFiles(identities []protectedSourceIdentity) {
+	for _, identity := range identities {
+		_ = identity.handle.Close()
+	}
 }
 
 // StagedSnapshot contains a complete immutable snapshot that is not visible to
@@ -271,7 +440,12 @@ func (publisher *Publisher) stage(
 		return nil, fmt.Errorf("%w: signed publication disappeared below durable watermark", ErrRollbackDetected)
 	}
 
-	root, err := publisher.buildDirectorySelection(ctx, sourceRoot, ".", info, 0, selection)
+	protected, err := publisher.captureProtectedSourceFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer closeProtectedSourceFiles(protected)
+	root, err := publisher.buildDirectorySelection(ctx, sourceRoot, ".", info, 0, selection, protected)
 	if err != nil {
 		return nil, err
 	}
@@ -791,10 +965,6 @@ func newPathSelectionContext(ctx context.Context, values []string) (*pathSelecti
 	return root, nil
 }
 
-func (publisher *Publisher) buildDirectory(ctx context.Context, sourceRoot *os.Root, directory string, expected os.FileInfo, depth int) (Digest, error) {
-	return publisher.buildDirectorySelection(ctx, sourceRoot, directory, expected, depth, nil)
-}
-
 func (publisher *Publisher) buildDirectorySelection(
 	ctx context.Context,
 	sourceRoot *os.Root,
@@ -802,6 +972,7 @@ func (publisher *Publisher) buildDirectorySelection(
 	expected os.FileInfo,
 	depth int,
 	selection *pathSelection,
+	protected []protectedSourceIdentity,
 ) (Digest, error) {
 	if err := ctx.Err(); err != nil {
 		return Digest{}, err
@@ -903,7 +1074,7 @@ func (publisher *Publisher) buildDirectorySelection(
 		case info.Mode().IsRegular():
 			item.Type = EntryFile
 			var stableInfo os.FileInfo
-			item.Node, item.Size, stableInfo, err = publisher.buildFile(ctx, sourceRoot, childPath, info)
+			item.Node, item.Size, stableInfo, err = publisher.buildFile(ctx, sourceRoot, childPath, info, protected)
 			if err == nil {
 				item.Mode = uint32(stableInfo.Mode().Perm())
 				item.ModTimeUnixNano = stableInfo.ModTime().UnixNano()
@@ -914,7 +1085,7 @@ func (publisher *Publisher) buildDirectorySelection(
 			if childSelection != nil && !childSelection.includeAll {
 				nestedSelection = childSelection
 			}
-			item.Node, err = publisher.buildDirectorySelection(ctx, sourceRoot, childPath, info, depth+1, nestedSelection)
+			item.Node, err = publisher.buildDirectorySelection(ctx, sourceRoot, childPath, info, depth+1, nestedSelection, protected)
 			item.Size = 0
 			if nestedSelection != nil {
 				// This directory exists in the projection only as an ancestor.
@@ -965,7 +1136,13 @@ func (publisher *Publisher) buildDirectorySelection(
 	return publisher.repository.putManifest(ctx, "dir", manifest)
 }
 
-func (publisher *Publisher) buildFile(ctx context.Context, sourceRoot *os.Root, path string, expected os.FileInfo) (Digest, int64, os.FileInfo, error) {
+func (publisher *Publisher) buildFile(
+	ctx context.Context,
+	sourceRoot *os.Root,
+	path string,
+	expected os.FileInfo,
+	protected []protectedSourceIdentity,
+) (Digest, int64, os.FileInfo, error) {
 	for attempt := 0; attempt < publisher.options.StableReadTries; attempt++ {
 		file, err := sourceRoot.Open(path)
 		if err != nil {
@@ -979,6 +1156,12 @@ func (publisher *Publisher) buildFile(ctx context.Context, sourceRoot *os.Root, 
 		if !before.Mode().IsRegular() || !os.SameFile(expected, before) {
 			_ = file.Close()
 			return Digest{}, 0, nil, fmt.Errorf("%w: file identity changed before read: %q", ErrUnstableFile, path)
+		}
+		for _, identity := range protected {
+			if os.SameFile(before, identity.info) {
+				_ = file.Close()
+				return Digest{}, 0, nil, fmt.Errorf("%w: source entry %q", ErrProtectedSourceFile, path)
+			}
 		}
 		maximumRepresentableSize := int64(maxFileChunks) * int64(publisher.options.Chunking.MaxSize)
 		if before.Size() > maximumRepresentableSize {

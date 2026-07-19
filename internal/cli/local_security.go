@@ -60,6 +60,20 @@ type publishLocalPaths struct {
 	recoveryKey string
 }
 
+func protectedPublisherSourceFiles(
+	recoveryKey string,
+	handoff string,
+	shareDirectory string,
+) []s3disk.ProtectedSourceFile {
+	return []s3disk.ProtectedSourceFile{
+		{Path: recoveryKey},
+		{Path: filepath.Join(shareDirectory, publisherSessionFileName)},
+		{Path: filepath.Join(shareDirectory, publicationJournalFileName)},
+		{Path: filepath.Join(shareDirectory, rootRecoveryFileName)},
+		{Path: handoff, AllowMissingInitially: true},
+	}
+}
+
 func preflightPublishLocalPaths(ctx context.Context, options PublishOptions) (publishLocalPaths, error) {
 	if ctx == nil {
 		return publishLocalPaths{}, fmt.Errorf("context is required")
