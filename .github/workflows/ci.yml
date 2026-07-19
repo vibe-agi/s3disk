@@ -216,6 +216,7 @@ jobs:
             go version
             go env GOOS GOARCH GOVERSION CGO_ENABLED GOWORK GOFLAGS GOTOOLCHAIN
             go build -trimpath ./...
+            go test -exec=true ./...
           } 2>&1 | tee artifacts/cross-build.log
       - name: Archive cross-build evidence
         if: always()
@@ -293,6 +294,7 @@ jobs:
       - name: Protocol fuzz smoke tests
         run: |
           set -o pipefail
+          ./scripts/check-fuzz-wiring.sh 2>&1 | tee artifacts/fuzz-wiring.log
           go test ./ -run='^$' -fuzz='^FuzzDecodeReferenceNeverPanics$' \
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-reference.log
           go test ./ -run='^$' -fuzz='^FuzzVerifySignedReferenceNeverPanics$' \
@@ -307,6 +309,8 @@ jobs:
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-sealed-state.log
           go test ./internal/cli -run='^$' -fuzz='^FuzzDecodeRecoveryKeyFileNeverPanics$' \
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-recovery-key.log
+          go test ./internal/cli -run='^$' -fuzz='^FuzzDecodePublisherSessionNeverPanics$' \
+            -fuzztime=10s 2>&1 | tee artifacts/fuzz-publisher-session.log
           go test ./presignedshare -run='^$' -fuzz='^FuzzDecodeRootRecoveryRecordNeverPanics$' \
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-root-recovery.log
       - name: Third-party compliance

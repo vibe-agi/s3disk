@@ -24,6 +24,7 @@ go test -race ./...
 go vet ./...
 ./scripts/check-project-license.sh
 ./scripts/check-third-party.sh
+./scripts/check-fuzz-wiring.sh
 ./scripts/check-dco.sh HEAD
 ./scripts/test-dco.sh
 ./scripts/test-release-ref.sh

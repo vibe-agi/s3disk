@@ -968,6 +968,7 @@ go vet ./...
 ./scripts/check-model.sh
 ./scripts/check-project-license.sh
 ./scripts/check-third-party.sh
+./scripts/check-fuzz-wiring.sh
 ./scripts/test-release-ref.sh
 # On a Linux release runner with /dev/fuse:
 ./scripts/test-mount-linux.sh

@@ -188,6 +188,7 @@ unformatted=$(rg --files -g '*.go' -0 | xargs -0 gofmt -l)
 
 ./scripts/check-project-license.sh
 ./scripts/check-third-party.sh
+./scripts/check-fuzz-wiring.sh
 ./scripts/check-dco.sh HEAD
 ./scripts/test-dco.sh
 ./scripts/test-release-ref.sh
@@ -217,6 +218,8 @@ do
   echo "commercial release gate: build $target_os/$target_arch"
   GOOS="$target_os" GOARCH="$target_arch" CGO_ENABLED=0 \
     go build -trimpath ./...
+  GOOS="$target_os" GOARCH="$target_arch" CGO_ENABLED=0 \
+    go test -exec=true ./...
 done
 
 command -v govulncheck >/dev/null 2>&1 || \

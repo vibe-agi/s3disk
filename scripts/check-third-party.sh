@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+# Keep this audit read-only and independent of a caller's workspace or
+# toolchain auto-upgrade policy. Missing sums or dependencies must fail instead
+# of silently modifying the release input.
+GOWORK=off
+GOFLAGS=-mod=readonly
+GOTOOLCHAIN=local
+export GOWORK GOFLAGS GOTOOLCHAIN
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 cd "$project_dir"
@@ -12,9 +20,14 @@ compiled_packages=$(mktemp "${TMPDIR:-/tmp}/s3disk-compiled-packages.XXXXXX")
 expected_modules=$(mktemp "${TMPDIR:-/tmp}/s3disk-expected-modules.XXXXXX")
 normalized_upstream=$(mktemp "${TMPDIR:-/tmp}/s3disk-upstream-license.XXXXXX")
 normalized_bundled=$(mktemp "${TMPDIR:-/tmp}/s3disk-bundled-license.XXXXXX")
+original_go_mod=$(mktemp "${TMPDIR:-/tmp}/s3disk-go-mod.XXXXXX")
+original_go_sum=$(mktemp "${TMPDIR:-/tmp}/s3disk-go-sum.XXXXXX")
+cp go.mod "$original_go_mod"
+cp go.sum "$original_go_sum"
 cleanup() {
   rm -f "$actual_modules" "$unsorted_modules" "$target_modules" "$compiled_packages" \
-    "$expected_modules" "$normalized_upstream" "$normalized_bundled"
+    "$expected_modules" "$normalized_upstream" "$normalized_bundled" \
+    "$original_go_mod" "$original_go_sum"
 }
 trap cleanup EXIT INT TERM
 
@@ -209,4 +222,10 @@ do
   done
 done <third_party/modules.txt
 
-echo "third-party audit: 25 compiled modules reviewed; permissive license set unchanged"
+if ! cmp -s go.mod "$original_go_mod" || ! cmp -s go.sum "$original_go_sum"; then
+  echo "third-party audit: module files changed during a read-only audit" >&2
+  exit 1
+fi
+
+reviewed_module_count=$(wc -l <"$actual_modules" | tr -d ' ')
+echo "third-party audit: $reviewed_module_count compiled modules reviewed; permissive license set unchanged"
