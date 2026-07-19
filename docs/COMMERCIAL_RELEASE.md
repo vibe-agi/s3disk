@@ -3,6 +3,12 @@
 This checklist is deliberately fail-closed. “The tests pass” is not sufficient
 for a storage component that handles customer source data.
 
+The project is open source under Apache-2.0, which permits commercial use under
+the license terms. This gate does not narrow that copyright permission; it
+defines the additional engineering, operational, support, and evidence bar for
+maintainers who represent a build as commercially supported or production
+ready.
+
 ## Current blockers
 
 <!-- RELEASE-BLOCKER: stable-api-support-policy -->
@@ -74,14 +80,18 @@ for a storage component that handles customer source data.
   There is no repository-level KEK or repository-dedup mode and no certified key
   rotation or migration path. The local `DiskCache` also remains plaintext. The
   `publisherstate` now provides an independently keyed, bounded AES-256-GCM
-  envelope for protecting those recovery secrets, but it intentionally does
-  not provide storage freshness or rollback detection. Its bounded built-in
-  keyring can authenticate retained-key envelopes and rewrap them with an
-  active key, but does not install that result. The current CLI does not yet
-  persist the share key, publisher private signing key, or root capability
-  through that envelope and cannot resume the same share after A crashes;
-  durable CAS state, recovery-key provisioning and rotation operations,
-  backup, and zeroization remain product work.
+  envelope for protecting those recovery secrets, and the core
+  `FileSealedStateStore` provides protected crash-safe local CAS persistence.
+  `RootPublisher` can consume that store as an exact-byte recovery WAL. The
+  envelope intentionally does not provide freshness after a complete old file
+  is restored. Its bounded built-in keyring can authenticate retained-key
+  envelopes and rewrap them with an active key, but coordinated installation,
+  backup migration, and old-key retirement remain product operations. The
+  recovery-key CLI provisions a protected standalone key file, but `share
+  publish` does not yet persist the share key, publisher private signing key, or
+  root capability through this path and cannot resume the same share after A
+  crashes. CLI wiring, external monotonic anchoring, disaster-recovery drills,
+  backup policy, and zeroization remain release work.
 
 <!-- RELEASE-BLOCKER: trust-root-lifecycle -->
 
@@ -105,10 +115,23 @@ for a storage component that handles customer source data.
 <!-- RELEASE-BLOCKER: backend-fault-certification -->
 
 - MinIO exercises the S3 adapter, but no production provider/version matrix has
-  completed both the writable Store and anonymous presigned-GET compatibility
-  probes plus partition, timeout-after-write, throttling, credential-expiry,
+  completed the combined 31-check writable Store plus 14-check anonymous
+  presigned-GET commissioning envelope, independently sealed that unsigned
+  evidence, and passed partition, timeout-after-write, throttling, credential-expiry,
   bearer post-expiry rejection, stale-read, lifecycle-deletion, and recovery
   certification described below.
+
+<!-- RELEASE-BLOCKER: split-writer-presigner-commissioning -->
+
+- `Store.ProbeCommissioning` currently uses one configured `Store` identity for
+  writable canary operations, credentialed read-backs, cleanup, and GET
+  presigning. It therefore samples both semantic contracts at one endpoint but
+  cannot certify a production split between a writer and a separately scoped
+  GetObject-only signing principal; that signer cannot run the probe's canary
+  PUT/DELETE operations. A split-identity probe or independent harness, plus
+  archived IAM and routing evidence that both identities resolve to the same
+  bucket/origin, is required before claiming that least-privilege topology is
+  commercially certified.
 
 <!-- RELEASE-BLOCKER: s3-only-share-scale -->
 
@@ -121,14 +144,21 @@ for a storage component that handles customer source data.
 
 <!-- RELEASE-BLOCKER: root-revision-durable-anchor -->
 
-- `RootPublisher` authenticates and conditionally updates the current S3 root,
-  but it does not yet persist an A-side last-issued root revision in a protected
-  durable journal. A replayed, otherwise valid root after A restarts therefore
-  fails closed or can be repaired from a newer snapshot, but some valid-replay
-  orderings can cause denial of service and do not have a durable local
-  monotonic root-revision proof. Commercial multi-process/restart certification
-  requires a linearizable root-revision anchor plus replay and lost-response
-  recovery tests.
+- `RootPublisher` now accepts a `SealedStateStore` WAL that installs the exact
+  raw Store target before the mutable S3 write, including the one-time encrypted
+  ciphertext. It
+  reconciles pending-process crashes, lost S3 responses, and uncertain journal
+  CAS results; an existing target can be recovered with matching identity,
+  verifier, and closure but without a signer or presigner, while new targets
+  still require both and remain fixed to the original authorization expiry. The
+  current journal rejects an old root or a different authenticated root at the
+  same revision. This narrows but does not close the blocker: `share publish`
+  does not attach the WAL or retain all
+  required secrets, no distributed linearizable multi-host implementation is
+  certified, and coordinated replay of both a complete old journal and its
+  matching S3 root requires an independently protected monotonic anchor. CLI
+  recovery, anchor/backup operations, multi-process and multi-host stress, and
+  archived provider evidence remain required.
 
 <!-- RELEASE-BLOCKER: supply-chain-evidence-archive -->
 
@@ -161,8 +191,8 @@ for a storage component that handles customer source data.
 
 - A tested backup, restore, versioning, retention, replication, and disaster
   recovery procedure for mutable references, immutable objects, publisher
-  journals, consumer watermarks, and lost local trust state has not been
-  approved.
+  journals, sealed root WALs, external monotonic anchors, recovery keys,
+  consumer watermarks, and lost local trust state has not been approved.
 
 These are product decisions, not documentation defects. A release owner must
 accept or resolve each one explicitly.
@@ -174,8 +204,9 @@ accept or resolve each one explicitly.
 2. The approved project license is Apache-2.0. Keep the root `LICENSE` equal to
    the approved text, retain the project and upstream attributions in `NOTICE`,
    and require the contribution terms documented in `CONTRIBUTING.md`. Review
-   any future license or copyright-attribution change before publication; an
-   already granted Apache-2.0 license is not retroactively withdrawn.
+   any future license or copyright-attribution change before publication. Any
+   copy already distributed remains governed by the Apache-2.0 terms, including
+   all applicable conditions and termination provisions.
 3. Run `./scripts/check-third-party.sh`. Review every dependency change and
    regenerate `third_party/modules.txt`, notices, and license texts before merge.
 4. Include `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, and
@@ -219,17 +250,29 @@ accept or resolve each one explicitly.
   downgrade. Third-party enumeration covers both `CGO_ENABLED=0` and `1` for
   every declared build target so native cgo-only imports cannot silently bypass
   the attribution inventory.
-- Run `Repository.ProbeStoreCompatibilityWithOptions` with a commissioning
-  identity for every advertised backend/version/endpoint mode, then run the
-  longer failure suite. Require a caller deployment/config fingerprint,
-  evidence ID, and implementation version; reject an archived report unless
-  `fully_bound` is true and an independent controller has recomputed those
-  bindings and tamper-evidently sealed the report. The hashes are not
+- Run `s3store.Store.ProbeCommissioning` with the exact production endpoint,
+  bucket, prefix, addressing, TLS, and gateway route for every advertised
+  backend/version/endpoint mode, using a dedicated commissioning identity that
+  can execute both phases, then run the longer failure suite. This envelope is
+  not evidence that separate production writer and signer identities were both
+  exercised. Require one combined envelope containing
+  the current 31 writable and 14 presigned checks, explicit stage outcomes, and
+  both cleanup results. The presigned prefix is derived inside the normalized
+  repository prefix by default; explicit prefixes must remain in that namespace,
+  and the combined path currently uses the bounded ASCII route grammar. Verify
+  `--total-timeout` as the parent bound and `--timeout` as the presigned-phase
+  bound. Require the CLI's `--deployment-fingerprint`, `--evidence-id`, and
+  `--implementation-version` flags together; reject an archived
+  report unless `fully_bound` is true and an independent controller has
+  recomputed both prefix fingerprints and those bindings, then tamper-evidently
+  sealed the complete envelope. The run ID, timestamps, and hashes are not
   signatures and do not discover credential identity or server version.
   Archive the JSON-safe report and treat `configuration_error`,
   `permission_denied`, or `indeterminate` as “not certified,” not as proof of
-  provider incompatibility.
-  The commissioning probe covers nil-expected CAS, missing-key `If-Match`, one-
+  provider incompatibility. Cleanup does not change `Compatible` or a stage
+  outcome, but `cleanup.attention_required` still requires the approved
+  operational response.
+  The writable phase covers nil-expected CAS, missing-key `If-Match`, one-
   winner concurrent create and replacement, winner identity, ETag-only CAS,
   `GetOptions.MaxBytes`, immediate HEAD/GET visibility, current/stale conditional
   GET, and adapter input/output-buffer ownership. Also test concurrent
@@ -238,8 +281,8 @@ accept or resolve each one explicitly.
   credentials, throttling, lifecycle deletion, and recovery after partitions.
   Grant probe cleanup delete access only where its operational policy permits
   it.
-- Run `Store.ProbePresignedGetCompatibilityWithOptions` against the same exact
-  endpoint path with `TLSRootCAPEM`. Require the report's current 14 stable
+- In the same combined run, require the presigned phase to use the exact
+  endpoint path with `TLSRootCAPEM`. Require its current 14 stable
   checks (`RequiredChecks` is authoritative): two independently readable exact
   GET bearers, same fixed URL observing root replacement, current/stale ETag
   behavior, a same-signing-context expiry-query mutation, unsigned
@@ -260,7 +303,8 @@ accept or resolve each one explicitly.
   commissioned bucket/key scope and the exact production origin. It must have
   no PUT, DELETE, LIST, or bucket-administration authority. The library cannot
   derive this fact from a bearer URL or prove that the writer and signer target
-  the same bucket/origin.
+  the same bucket/origin. The current combined probe also cannot exercise this
+  split identity; retain the blocker above until a separate harness or API does.
 - Fail the gate without an archived BPA/IAM/public-access review covering the
   bucket, access points, ACLs, principal and resource policies, gateway/origin
   rules, and provider equivalents. Unsigned canary GET/PUT/DELETE denial is a
@@ -275,9 +319,13 @@ accept or resolve each one explicitly.
   and `NewReadOnlyRepositoryWithOptions`, with no credential provider or
   writable Store: private root/key handoff, selected projection, metadata
   refresh while a chunk is absent, lazy chunk read, same-root update, network
-  partition, restart watermark, fixed expiry, and automatic unmount. Network
-  traces must show that B contacts only the commissioned S3 origin and issues
-  GET only.
+  partition, restart watermark, fixed expiry, and automatic unmount. Application
+  requests must go only to the commissioned S3 origin and issue GET only.
+  Network traces may additionally contain controlled DNS resolution of that
+  origin; archive proof that DNS sees only the hostname and that there is no A,
+  broker, authorization-service, proxy, or other control-plane traffic. A
+  product claiming zero non-S3 egress needs a separately certified pinned
+  resolution/routing implementation, which is not currently present.
 - Require `strict-share-isolation-v1` on the commercial-target share path. Test
   a fresh random 256-bit key and dedicated prefix per share, domain-separated
   HKDF-SHA256, random per-message salt and GCM nonce, exact-key associated-data
@@ -349,6 +397,20 @@ accept or resolve each one explicitly.
   invoking a replacement signer. Keep publisher journal and consumer watermark
   state separate. Provision `RepositoryID`, checkpoints, and public keys
   outside S3.
+- Independently exercise `RootPublisherConfig.RecoveryJournal` at the encrypted
+  root boundary. Verify that `Pending` is durable before the mutable S3 write
+  and contains the exact ciphertext written to the raw Store; kill the process
+  before the write, after an applied write with its response lost, and after
+  applied journal CAS operations whose responses are lost. Restart with no
+  signer or presigner and prove that only the existing target is settled;
+  require both dependencies for
+  the next root. Test old-root replay, same-revision replacement, identity and
+  closure mismatch, corrupt or oversized state, fixed-expiry cancellation, and
+  direct plus marker-preserving encryption-wrapper rejection. Certify the
+  `SealedStateStore` CAS and durability semantics for every supported topology.
+  Separately test the external monotonic anchor and restore procedure because a
+  coordinated journal-plus-S3 replay is intentionally outside the local WAL's
+  freshness guarantee.
 - Stress repeated cache hits as well as cold reads. Verify same-digest
   singleflight coalescing and that `MaxConcurrentDownloads` bounds cache work,
   remote fetches, and hashing under contention. Also verify the weighted
@@ -402,9 +464,10 @@ accept or resolve each one explicitly.
   requirement.
 - The current CLI's A-side state directory is not same-share crash recovery: it
   does not retain the client key, publisher private signer, or root capability.
-  Do not certify resume until those secrets have an approved persistence,
-  wrapping, recovery, backup, rotation, and zeroization design and recovery
-  tests.
+  The library's sealed root WAL solves the exact pending-root write window, not
+  this secret-lifecycle integration. Do not certify CLI resume until those
+  secrets have an approved persistence, wrapping, recovery, backup, rotation,
+  and zeroization design and recovery tests.
 - Redacted formatting is not a memory boundary. The raw handoff contains a
   usable client key and bearer, and values may remain visible to reflection,
   debuggers, core dumps, or swap. There is no `mlock`, automatic handoff
@@ -422,12 +485,18 @@ accept or resolve each one explicitly.
   `RepositoryID`, or share; require a separate private cache directory for each
   share. Define secure deletion, single-process ownership, multi-user isolation,
   and behavior on a full disk.
-- Use `FilePublicationJournal` for publisher publication state and
-  `FileWatermarkStore` for consumer adoption state, with distinct private local
-  paths namespaced by repository/channel/role. Their CAS is cross-process on
-  Linux, Darwin with cgo, and Windows. Other local platforms fail closed until
-  their ACL model is certified; cross-host shared filesystems require separate
-  certification.
+- Use `FilePublicationJournal` for signed-reference publication state,
+  `FileSealedStateStore` plus an independently protected recovery key for the
+  root recovery WAL, and `FileWatermarkStore` for consumer adoption state. Keep
+  distinct private local paths and bindings namespaced by repository, share,
+  channel, and role. `FilePublicationJournal` and `FileWatermarkStore` provide
+  cross-process local CAS on Linux, Darwin with cgo, and Windows.
+  `FileSealedStateStore` has the stricter confidentiality contract and is
+  currently available only on Linux and Darwin with cgo; Windows deliberately
+  returns `ErrTrustStateUnsupported`. Other local platforms fail closed until
+  their ACL and secret-confidentiality models are certified. Cross-host shared
+  filesystems and distributed stores require separate linearizability, lock,
+  replace, durability, confidentiality, and rollback review.
 - Require every publisher for one repository/channel to share the same
   linearizable `PublicationJournalStore`. Independent local journals on
   multiple hosts do not guarantee monotonicity or prevent split brain. Do not

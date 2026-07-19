@@ -1,37 +1,131 @@
 # S3 backend commissioning
 
 “S3 compatible” is an API-family description, not a consistency or conditional-
-write guarantee. s3disk does not maintain a vendor allowlist. It commissions the
-exact endpoint, bucket, prefix, credentials, gateway/proxy path, encryption
-mode, and server version that production will use.
+write guarantee. s3disk does not maintain a vendor allowlist. The probe samples
+the configured Store route during the writable phase and the direct S3 origin
+during anonymous presigned requests; that phase deliberately disables proxies.
+The caller must bind the intended provider/server version, proxy topology,
+encryption mode, and other control-plane identity into an independently
+verified inventory; s3disk does not discover or authenticate them.
 
-## Probe API
+## Preferred combined API
 
 ```go
-report, err := repository.ProbeStoreCompatibilityWithOptions(ctx,
-	s3disk.StoreCompatibilityProbeOptions{
+report, err := store.ProbeCommissioning(ctx,
+	s3store.S3CommissioningProbeOptions{
+		RepositoryPrefix: "private/customer/commissioning",
 		// SHA-256 of the release controller's canonical, non-secret inventory
 		// for endpoint, bucket, region, addressing/TLS/proxy/encryption mode,
 		// SDK settings, and the non-secret IAM principal identifier.
 		DeploymentFingerprint: deploymentFingerprint,
 		EvidenceID:             "commissioning-20260718-001",
 		ImplementationVersion:  "s3disk-commercial-build+17",
+		PresignedGet: s3store.PresignedGetCompatibilityProbeOptions{
+			TLSRootCAPEM: commissionedTLSRoots,
+		},
 	})
 switch report.Status {
-case s3disk.StoreCompatibilityPassed:
+case s3store.S3CommissioningPassed:
 	// Eligible for the longer failure suite.
-case s3disk.StoreCompatibilityIncompatible:
-	// At least one Store-contract contradiction was observed.
-case s3disk.StoreCompatibilityConfigurationError:
+case s3store.S3CommissioningIncompatible:
+	// At least one nested contract contradiction was observed.
+case s3store.S3CommissioningConfigurationError:
 	// Fix bucket, region, endpoint, or addressing configuration, then rerun.
-case s3disk.StoreCompatibilityPermissionDenied:
+case s3store.S3CommissioningPermissionDenied:
 	// Fix commissioning IAM/bucket policy, then rerun.
-case s3disk.StoreCompatibilityIndeterminate:
+case s3store.S3CommissioningIndeterminate:
 	// Retry only after resolving timeout, throttling, 5xx, or network state.
 }
 ```
 
-The report has a contract version, explicit `single_client_finite_probe` scope,
+`Store.ProbeCommissioning` is the preferred entry point for the built-in S3
+adapter. It runs the current 31-check writable Store contract and the 14-check
+credential-free presigned-GET contract under one parent context and retains
+both nested reports in one schema-versioned envelope. A failed writable phase
+does not suppress the presigned phase while the shared context remains live.
+Each phase has an explicit `passed`, `failed`, or `not_run` outcome; `Complete`
+means both nested check sets completed and does not imply that they passed.
+`Compatible` is true only when both stages pass.
+
+Both stages currently use the same configured `Store` and credential provider.
+The presigned phase uses that identity to create, read back, and clean up its
+canaries as well as to construct the GET signing session. Consequently, the
+combined envelope is not evidence that a production writer and a separate
+GetObject-only signing principal were both exercised; a GetObject-only
+principal cannot perform the canary PUT/DELETE operations. Commercial use of
+that least-privilege split remains gated on an independent IAM/routing review
+and a split-identity probe or harness.
+
+The aggregate cleanup summary records each nested cleanup status plus whether
+current objects or historical versions may remain. Cleanup failure is an
+operational warning: it never changes `Compatible`, an individual stage
+outcome, or a semantic incompatibility verdict. A commercial workflow should
+still fail or require operator reconciliation when
+`cleanup.attention_required` is true, according to its retention policy.
+
+`RepositoryPrefix` is normalized by trimming leading and trailing `/`. When
+`PresignedGet.ObjectKeyPrefix` is empty, the combined API derives
+`<repository-prefix>/.s3disk/v1/probes/presigned-get`, or
+`.s3disk/v1/probes/presigned-get` for an empty repository prefix. An explicit
+presigned prefix must equal the repository prefix or be below it. Because the
+anonymous HTTP probe has a deliberately narrow route grammar, the combined
+route currently accepts only ASCII letters, digits, `.`, `_`, `-`, and `/`,
+with no `//`, `.` segment, or `..` segment. The resulting presigned prefix is
+limited to 768 bytes, so a derived repository prefix must also leave room for
+the suffix. An explicit presigned prefix additionally cannot start or end with
+`/`. This is narrower than the core Repository's general UTF-8 prefix support.
+
+The envelope never serializes either raw prefix. It records separate
+domain-separated SHA-256 fingerprints, whether the presigned prefix was
+derived, whether it remained repository-scoped, an RFC 3339 UTC process start
+time, cleanup-inclusive duration, and a fresh random 24-byte run identity
+encoded as 48 lowercase hexadecimal characters. Predictable prefixes remain
+subject to offline dictionary guessing.
+
+With no caller deadline and no explicit `TotalTimeout`, the combined active
+phases receive a seven-minute parent deadline. The writable phase independently
+defaults to five minutes, and the presigned phase retains its two-minute
+default; nested cleanup paths keep their own bounds and may extend wall time.
+`TotalTimeout` and `WritableStoreTimeout` are each capped at 30 minutes, and an
+earlier caller deadline wins. These limits work only when the Store and HTTP
+stack honor context cancellation.
+
+The combined envelope is audit metadata, not a signed attestation. Its
+`fully_bound` value means only that both prefix fingerprints, run ID, and all
+three validated caller declarations are syntactically present. An independent
+release controller must recompute the deployment and prefix bindings, attach
+trusted control-plane facts and receipt time, then sign or tamper-evidently seal
+the complete JSON before treating it as commercial evidence.
+
+After local preflight and Store construction succeed, `s3disk s3 doctor` emits
+exactly one combined JSON envelope to standard output even when a probe phase
+fails. Its `--prefix` is the repository prefix; the presigned probe uses the
+derived, repository-scoped namespace. `--timeout` bounds only the presigned
+phase, while `--total-timeout` bounds the combined run. The
+`--deployment-fingerprint`, `--evidence-id`, and `--implementation-version`
+flags must be supplied together or all omitted; a commercial evidence run
+should supply all three. A cleanup-attention warning is written to standard
+error without changing a successful semantic result. Preflight failures occur
+before a report exists; later human-readable errors remain on standard error
+and do not replace the structured report.
+
+The individual APIs remain useful for focused adapter development and failure
+isolation, but their separate results should not replace the combined envelope
+in a backend admission record.
+
+## Writable Store probe details
+
+```go
+report, err := repository.ProbeStoreCompatibilityWithOptions(ctx,
+	s3disk.StoreCompatibilityProbeOptions{
+		DeploymentFingerprint: deploymentFingerprint,
+		EvidenceID:             "commissioning-20260718-001",
+		ImplementationVersion:  "s3disk-commercial-build+17",
+	})
+```
+
+The writable report has a contract version, explicit
+`single_client_finite_probe` scope,
 random probe ID, stable check IDs and redacted reason codes, a concise detail
 and remediation hint, the in-process cause chain, and a separate cleanup result.
 Its `evidence` object records an RFC 3339 UTC start time, duration in
@@ -146,13 +240,14 @@ delete marker is created; that verifies current absence but does not purge the
 noncurrent version or the marker. The report therefore keeps
 `historical_versions_may_remain` conservative even after verified cleanup.
 
-The probe is write-capable and commissions A's exact publisher data-plane
-policy. B/C/D do not have a read-only IAM role: they hold only a fixed root GET
-bearer and authenticated exact-key GET bearers, with no `SecretAccessKey` or
-signer. Commission that independent anonymous path with
-`Store.ProbePresignedGetCompatibilityWithOptions` and the full S3-only lazy-read
-integration test below. Do not copy a result obtained through an administrator,
-different proxy, or different endpoint path into the production record.
+The writable probe commissions A's exact publisher data-plane policy. B/C/D do
+not have a read-only IAM role: they hold only a fixed root GET bearer and
+authenticated exact-key GET bearers, with no `SecretAccessKey` or signer. Use
+the combined API to commission that independent anonymous path in the same
+envelope; `Store.ProbePresignedGetCompatibilityWithOptions` remains the focused
+lower-level entry point. Also run the full S3-only lazy-read integration test
+below. Do not copy a result obtained through an administrator, different proxy,
+or different endpoint path into the production record.
 
 For AWS, set `s3store.Config.ExpectedBucketOwner` to the 12-digit owning account
 ID so every GET, HEAD, conditional PUT, and cleanup DELETE fails if endpoint or

@@ -30,8 +30,9 @@ The data flow is:
    encrypted authenticated channel reference.
 2. A resolves the exact object closure for that reference, creates exact-key
    presigned `GetObject` capabilities with one fixed absolute expiry, signs the
-   capability bundle, encrypts it, and conditionally creates or replaces one
-   mutable ciphertext root object in S3.
+   capability bundle, encrypts it, durably journals the exact ciphertext target,
+   and conditionally creates or replaces one mutable ciphertext root object in
+   S3.
 3. B polls the same root presigned URL with conditional `GET`, decrypts the root
    with the handed-off share key, and verifies its signature. The bundle
    contains only exact-key GET capabilities for the current closure.
@@ -51,9 +52,27 @@ re-resolves `signed-refs/v1` with the configured verifier and requires the
 generation, commit, root digest, and publication time to equal the Publisher
 result before it can mint any object capabilities.
 
+A production library composition gives
+`RootPublisherConfig.RecoveryJournal` a confidential, authenticated,
+linearizable `SealedStateStore`. The pending record is installed before the
+mutable S3 write and contains the exact raw Store bytes and CAS precondition,
+so recovery never has to regenerate presigned URLs or encryption randomness. It
+reconciles crashes and lost S3 or journal-CAS responses by reloading durable
+state and reading the exact root. A recovery-only process with the matching
+identity, verifier, and closure may settle that pending target without a signer
+or presigner, but it needs both before it can create another root.
+
 B's built-in reader performs `GET` only. It does not issue `LIST`, `HEAD`,
 `PUT`, `DELETE`, multipart, or bucket administration calls. It cannot broaden
 an exact object path or change the signed HTTP method.
+
+For a hostname endpoint, its private Go resolver may query the deployment's
+configured DNS infrastructure. DNS observes the S3 hostname but not the bearer
+path, query, headers, or object data. “S3-only” therefore means S3 is the only
+application-data, authorization, and control-plane peer between A and B/C/D;
+it is not a claim of literally zero non-S3 network egress. Such a profile would
+need independently controlled or pinned name resolution and routing, which the
+current Reader does not implement.
 
 The safe B configuration accepts exactly the built-in
 `*s3disk.Ed25519ReferenceVerifier`. It performs finite Ed25519 key lookup and
@@ -186,10 +205,16 @@ The root URL and every object capability in all revisions of one share use the
 same absolute authorization deadline. At the library level, a product that has
 securely persisted all required A-side share key, signing key, root capability,
 namespace, and deadline material can create a later presigning session only for
-that original deadline. The current CLI does not persist enough of those
-secrets and has no same-share resume command; restarting `share publish` creates
-a new share and handoff. The root URL handed to B never changes during one
-share.
+that original deadline. `RootPublisher` binds that deadline into its recovery
+identity and uses it as the deadline for root Store calls. An existing exact
+pending target can be recovered without signing again, but recovery cannot
+renew or extend the share and does not initiate a new write after local expiry.
+A conditional write already in flight at the boundary may still commit remotely
+after cancellation and remain ambiguous; recovery uses the exact pending WAL
+target to reconcile it. The current CLI does not persist enough of those
+secrets or attach the root recovery journal and has no same-share resume
+command; restarting `share publish` creates a new share and handoff. The root
+URL handed to B never changes during one share.
 
 After the deadline, `presignedshare.Reader` refuses reads locally without
 network I/O. A mount pins the reader's deadline when it starts and initiates a
@@ -230,11 +255,29 @@ valid root can make recovery fail closed, but cannot make that composition
 activate a generation below its watermark. Applications using `Reader`
 directly must not claim this cross-restart property.
 
-An A-side root update uses S3 conditional replacement. If a write response is
-lost, A reads the exact root key back: exact target bytes mean the operation
-was applied; another authenticated value is handled as a concurrent state; an
-unreadable or ambiguous observation fails closed. A missing root during an
-update is treated as rollback and is never silently recreated.
+An A-side root update uses S3 conditional replacement. With a recovery journal,
+A first installs a pending record containing the exact raw target (the exact
+ciphertext under `strict-share-isolation-v1`). If a write response is lost, A
+reads the exact root key back: exact target bytes mean the operation was
+applied; another authenticated value is handled as a concurrent state; an
+unreadable or ambiguous observation fails closed. Journal CAS response loss is
+likewise reconciled by loading and matching the exact durable record. A missing
+root during an update is treated as rollback and is never silently recreated.
+
+The journal's committed anchor rejects an older root or a different valid root
+at the same revision. It cannot detect coordinated replay of both the complete
+journal and the matching old S3 root; deployments with that threat require a
+separately protected monotonic receipt, audit service, or equivalent anchor.
+With client encryption, `RootPublisher` requires the raw unwrapped Store so it
+can encrypt once and journal the exact ciphertext. Known wrappers advertise the
+`ClientEncryptionApplied` marker; Go cannot detect an opaque custom wrapper that
+transforms bytes without preserving it.
+
+`RootPublisherRecovery.tla` separately checks the pending/committed ordering,
+crash and lost-response paths, competitor CAS, replay rejection, fixed expiry,
+and conditional recovery liveness. It assumes the latest complete journal is
+present after restart; whole-journal rollback, torn storage below the
+`SealedStateStore` contract, and disaster recovery remain outside the model.
 
 No asynchronous algorithm can guarantee current data during an arbitrary
 network partition. The contract is instead:
@@ -253,32 +296,53 @@ The executable model for these assumptions and properties is described in
 
 ## Commissioning an S3 implementation
 
-“S3 compatible” is not sufficient evidence. Commission both independent
-contracts against the exact endpoint, bucket, addressing mode, any A-side
-gateway path, credentials, encryption policy, and provider version used in
-production. The B-side built-in reader is deliberately direct and rejects
-forward proxies, custom dialers, and alternate-protocol transports:
+“S3 compatible” is not sufficient evidence. Commission both semantic contracts
+against the exact endpoint, bucket, addressing mode, A-side gateway path, and
+encryption policy used in production, and bind the intended provider version
+and non-secret identity inventory independently. The B-side built-in reader is
+deliberately direct and rejects forward proxies, custom dialers, and alternate-
+protocol transports:
 
 ```go
-storeReport, err := repository.ProbeStoreCompatibilityWithOptions(ctx, storeOptions)
-if err != nil {
-	return err
-}
-presignedReport, err := store.ProbePresignedGetCompatibilityWithOptions(ctx,
-	s3store.PresignedGetCompatibilityProbeOptions{
-		ObjectKeyPrefix: "private/commissioning/presigned-get",
-		TLSRootCAPEM:    commissionedTLSRoots, // required for every HTTPS origin
+report, err := store.ProbeCommissioning(ctx,
+	s3store.S3CommissioningProbeOptions{
+		RepositoryPrefix:      "private/commissioning",
+		DeploymentFingerprint: deploymentFingerprint,
+		EvidenceID:             "commissioning-20260718-001",
+		ImplementationVersion:  "commercial-build+17",
+		PresignedGet: s3store.PresignedGetCompatibilityProbeOptions{
+			TLSRootCAPEM: commissionedTLSRoots, // required for every HTTPS origin
+		},
 	})
 if err != nil {
 	return err
 }
-_ = storeReport
-_ = presignedReport
+if !report.Compatible || !report.Complete {
+	return errors.New("S3 commissioning did not pass")
+}
 ```
 
-The writable probe checks conditional create/replacement, concurrency,
+The combined envelope preserves separate `passed`, `failed`, or `not_run`
+outcomes for the 31-check writable Store phase and 14-check presigned-GET phase.
+An omitted presigned prefix is derived as
+`<repository-prefix>/.s3disk/v1/probes/presigned-get` and must remain below the
+same normalized repository namespace; the combined route grammar is bounded
+canonical ASCII rather than the core Repository's full UTF-8 prefix space.
+The parent timeout, writable-phase timeout, and both nested cleanup windows are
+independently bounded. Cleanup warnings do not change the compatibility
+verdict. Prefix fingerprints, run identity, timestamps, and caller declarations
+bind audit metadata but do not sign it; an independent controller must verify
+and seal the complete report.
+
+The combined call uses one configured `Store` identity for canary writes,
+credentialed read-backs, cleanup, and GET presigning. It therefore does not
+exercise a production split between the writer and a separate GetObject-only
+signer. That least-privilege topology requires independent IAM/routing evidence
+and a split-identity commissioning harness before commercial certification.
+
+The writable phase checks conditional create/replacement, concurrency,
 visibility, ETags, conditional GET, bounded reads, and adapter ownership. The
-presigned probe currently has 14 stable checks; `RequiredChecks` in the report
+presigned phase currently has 14 stable checks; `RequiredChecks` in the report
 is authoritative. They cover independently readable source and target bearers,
 a same-context shorter source control, reuse of one URL after replacement,
 dynamic `If-None-Match`, an expiry-query mutation, unsigned source/target GET
@@ -373,11 +437,14 @@ closure, and S3-only constraints.
   `net/http` cannot expose every illegal body on HEAD/bodyless statuses, chunk
   extension, or byte beyond declared framing, so an application-level probe
   pass alone is not a confidentiality or commercial-support result.
-- Keep A's publication journal and B's watermark in separate protected durable
-  storage. Neither is bootstrapped from an untrusted S3 object. The current CLI
-  does not persist the client key, publisher private signing key, or root
-  capability needed to resume the same share; define secure persistence,
-  recovery, backup, and zeroization before adding such a product feature.
+- Keep A's signed-reference publication journal, A's sealed root recovery WAL,
+  and B's watermark in separate protected durable storage. Neither is
+  bootstrapped from an untrusted S3 object. Back `RootPublisher` with a
+  linearizable `SealedStateStore`, and add an external monotonic anchor if
+  coordinated journal-plus-S3 rollback is in scope. The current CLI does not
+  persist the client key, publisher private signing key, or root capability
+  needed to resume the same share; define secure persistence, recovery, backup,
+  rotation, and zeroization before certifying CLI resume.
 - Protect the handoff, share key, bearer URLs, and cached plaintext from logs,
   command lines, crash reports, telemetry, and other local users. `DiskCache`
   is plaintext even though its S3 source objects are ciphertext; allocate a
@@ -386,5 +453,7 @@ closure, and S3-only constraints.
   client-side encryption or private handoff delivery.
 - Set S3 lifecycle and retention rules so immutable objects cannot disappear
   during the maximum supported share and recovery windows.
-- Run both compatibility probes and the partition/timeout/expiry/provider
-  matrix before claiming a commercial backend is supported.
+- Run the combined commissioning probe and the partition/timeout/expiry/provider
+  matrix before claiming a commercial backend is supported. Archive and
+  independently seal its unsigned envelope, and treat cleanup attention as an
+  operational gate rather than rewriting the semantic verdict.

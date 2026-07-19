@@ -32,9 +32,13 @@ dates in customer-facing terms.
 - Keep the commissioned bucket private. Block Public Access (BPA), bucket and
   access-point policies, ACLs, IAM permissions, gateway/origin rules, and any
   provider equivalents must deny anonymous access except through the exact
-  presigned operation. The compatibility probe samples unsigned GET, PUT, and
-  DELETE denial only against its two random canaries and selected origin; it
-  cannot audit the complete policy graph or every alternate endpoint. A
+  presigned operation. Prefer the combined `s3store.Store.ProbeCommissioning`
+  envelope so the 31-check writable and 14-check credential-free paths retain
+  one run identity and separate stage outcomes. The anonymous compatibility
+  phase samples unsigned GET, PUT, and DELETE denial only against its two random
+  canaries and selected origin; it cannot audit the complete policy graph or
+  every alternate endpoint. The report is unsigned caller-produced evidence,
+  not an attestation. A
   documented BPA/IAM/public-access review is a commercial-release gate even
   when the probe reports `Compatible`.
 - A SigV4 URL exposes an access-key ID and may expose a temporary session token.
@@ -68,7 +72,13 @@ dates in customer-facing terms.
   trippers, redirects, cookies, custom TLS callbacks, client certificates, and
   disabled certificate verification. It also strips caller `httptrace` values
   before transport use and uses a private resolver without an application
-  callback. Every HTTPS reader must receive bounded commissioned roots through
+  callback. For a hostname endpoint that resolver may still query the
+  deployment's configured DNS service; DNS can observe the S3 hostname but not
+  the bearer path, query, headers, or object content. Thus S3 is the only
+  application-data, authorization, and control-plane peer, not necessarily the
+  only network destination. A zero-non-S3-egress profile requires separately
+  certified pinned name resolution/routing, which is not implemented. Every
+  HTTPS reader must receive bounded commissioned roots through
   `ReaderConfig.TLSRootCAPEM`; they are parsed into Reader-owned certificate
   objects. This avoids platform system verifiers that may fetch AIA or
   revocation data outside the locked S3 dialer. The explicit
@@ -132,15 +142,18 @@ dates in customer-facing terms.
   never derive it from or replace it with the client share key, an S3 access
   key, customer content, or a password. Its built-in Protector provides a
   bounded HKDF-SHA256/AES-256-GCM envelope with key-ID and caller-binding
-  authentication, but no storage, KMS, CAS, freshness, rollback protection,
-  backup, or zeroization. The CLI does not yet persist its recovery state
-  through this API. A product integrating it must keep the recovery key in an
-  independently protected key file, OS keystore, or KMS and must add a durable
-  monotonic journal around sealed values; copying an old valid envelope remains
-  a successful replay at the cryptographic layer. `AESGCMKeyring` supports a
-  bounded active-plus-retained-key rewrap operation, but old keys cannot be
-  retired until every required live state and backup has been durably migrated
-  and verified.
+  authentication, but no storage, KMS, freshness, backup, or zeroization.
+  `FileSealedStateStore` adds protected crash-safe local CAS persistence on
+  Linux and Darwin with cgo and can be used as
+  `RootPublisherConfig.RecoveryJournal`; it deliberately fails closed on
+  Windows, and the cryptographic envelope still does not make an old complete
+  file detectably stale. The CLI does not yet persist its publishing state
+  through this API. Keep the recovery key in
+  an independently protected key file, OS keystore, or KMS and add an external
+  monotonic backup or audit anchor where coordinated rollback is in scope.
+  `AESGCMKeyring` supports a bounded active-plus-retained-key rewrap operation,
+  but old keys cannot be retired until every required live state and backup has
+  been durably migrated, installed, and verified.
 - Treat each prefix, `RepositoryID`, profile, and share key as one storage
   domain. Do not mix encrypted and plaintext repositories, different profiles,
   or ciphertext copied across prefixes. `InitializeRepository` creates or
@@ -250,8 +263,57 @@ dates in customer-facing terms.
   supported, a separate raw-wire HTTP/1.1 and HTTP/2 certification harness must
   test those cases; a passing library probe is not a confidentiality proof or
   a GA/support declaration.
+- The combined commissioning probe uses one configured A-side `Store` identity
+  for canary writes, credentialed read-backs, cleanup, and GET presigning. It
+  does not prove that a distinct production writer and GetObject-only signing
+  principal share the same bucket, origin, or route. A commercial deployment
+  requiring that split needs independent IAM/routing evidence and a
+  split-identity harness; the current combined report cannot replace it.
 - Consumers retain a last-known-good snapshot during transient failures. A
   network partition prevents any unconditional guarantee of freshness.
+
+## Root-publication recovery
+
+`RootPublisherConfig.RecoveryJournal` is optional for pre-release API
+compatibility, but a production publisher must provide a confidential,
+authenticated, linearizable `SealedStateStore`. The recovery record binds the
+repository, share, root and reference keys, fixed authorization expiry, root
+bearer digest, encryption witness, and publication policy. Before the mutable
+root is attempted, the journal durably records the exact raw Store target and
+its S3 CAS precondition. With client encryption, `RootPublisher` encrypts once
+and records that exact ciphertext; it does not recreate a URL or ciphertext
+after restart.
+
+Recovery reconciles process death after installing `Pending`, a lost S3 write
+response, and an uncertain journal CAS by reloading the journal and observing
+the exact root. A process with the matching identity, verifier, and closure but
+no signer or presigner may settle an already recorded target, which avoids
+depending on a live signing credential during that crash window. It cannot
+construct a later target without both dependencies. The original absolute
+authorization expiry is part of the identity and is also installed as the
+Store-call context deadline. Recovery never extends a share and does not start
+a new write after local expiry. A conditional write already in flight at the
+deadline may still be committed remotely after local cancellation and remain
+ambiguous; the exact pending WAL target is required to reconcile it.
+
+The current committed journal rejects an older S3 root and a different
+authenticated target at the same revision. It is not an independent freshness
+oracle: coordinated restoration of both an older complete journal and its
+matching S3 root is indistinguishable at this layer. Commercial deployments
+whose rollback threat includes local state or backup administration need a
+separately protected monotonic receipt, audit service, or equivalent anchor and
+tested restore procedures. A local `FileSealedStateStore` is suitable only for
+publishers sharing that protected local state and filesystem semantics; a
+multi-host writer needs a separately certified distributed linearizable
+implementation.
+
+When both recovery and client encryption are configured, pass the raw,
+unwrapped S3 Store. Known encryption wrappers advertise
+`ClientEncryptionApplied` and are rejected to prevent double encryption. Go
+cannot detect an opaque custom byte-transforming wrapper that hides that
+marker, so every commercial byte-transforming encryption wrapper must preserve
+it. The current `share publish` CLI still does not persist all share secrets or
+attach this WAL; its `--state-dir` is not same-share crash recovery.
 
 ## Signed-reference trust model
 

@@ -19,6 +19,11 @@ which it was opened.
 > the current tree as generally available production software. The model does
 > not prove the client-encryption primitives or confidentiality.
 
+s3disk is an Apache-2.0 open-source project. The license permits commercial
+use, modification, and redistribution subject to its terms; that permission is
+separate from this repository's pre-release status, support policy, and the
+commercial certification gates documented below.
+
 ## Packages
 
 - `github.com/vibe-agi/s3disk`: storage-independent publisher, consumer,
@@ -26,10 +31,14 @@ which it was opened.
 - `github.com/vibe-agi/s3disk/s3store`: AWS SDK v2 adapter for AWS S3 and
   compatible services.
 - `github.com/vibe-agi/s3disk/presignedshare`: expiring, signed root bundles
-  and a credential-free exact-key GET reader whose only runtime peer is S3.
+  and a credential-free exact-key GET reader whose only application-data,
+  authorization, and control-plane runtime peer is S3.
 - `github.com/vibe-agi/s3disk/publisherstate`: bounded cryptographic envelopes
-  for A-side recovery state, using an independent recovery key. It deliberately
-  does not provide persistence, CAS, freshness, rollback detection, or a KMS.
+  for A-side recovery state, using an independent recovery key. The package
+  deliberately does not provide persistence or a KMS; the core package's
+  `FileSealedStateStore` adds crash-safe local CAS persistence on Linux and
+  Darwin with cgo, but deliberately fails closed on Windows and cannot provide
+  freshness after coordinated rollback by itself.
 - `github.com/vibe-agi/s3disk/memstore`: in-memory store for tests.
 - `github.com/vibe-agi/s3disk/mount`: read-only FUSE adapter on Linux, macOS,
   and FreeBSD build targets. See [Compatibility](docs/COMPATIBILITY.md) before
@@ -60,6 +69,18 @@ s3disk s3 doctor \
   --path-style \
   --tls-ca /secure/provider-ca.pem
 ```
+
+For every invoked probe, the doctor writes one JSON `S3CommissioningReport`
+envelope covering both the 31-check writable Store contract and the 14-check
+credential-free presigned-GET contract, including failed probes. It records
+separate `passed`, `failed`, or `not_run` stage outcomes and a cleanup summary;
+cleanup warnings go to standard error and do not rewrite the compatibility
+verdict. `--deployment-fingerprint`, `--evidence-id`, and
+`--implementation-version` must be supplied together or omitted together;
+commercial records should supply all three. `--timeout` bounds the presigned
+phase, while `--total-timeout` bounds the combined run. Treat the envelope as
+finite, unsigned evidence and seal it in an independent release system before
+using it for a commercial backend decision.
 
 Then publish either the whole source with `--all`, as below, or selected
 relative paths by replacing it with repeated `--path path/to/item` flags:
@@ -93,7 +114,9 @@ hint containing only the output path, key ID, and outcome--never the recovery
 key. Treat that path as potentially installed and do not overwrite or delete it
 until an operator has reconciled the final file and any staging name. The
 current `share publish` command does not consume the recovery key yet, so
-same-share CLI recovery remains a release blocker.
+same-share CLI recovery remains a release blocker. This is a CLI integration
+limit: library users can give `RootPublisher` a `SealedStateStore` recovery WAL
+as described below.
 
 ```sh
 s3disk share publish \
@@ -221,6 +244,27 @@ periodic reconciliation. This safe automatic path resolves only the signed
 reference namespace and checks the complete Publisher-returned snapshot
 identity before minting capabilities.
 
+For restart-safe root publication, configure
+`RootPublisherConfig.RecoveryJournal` with a confidential, authenticated,
+linearizable `SealedStateStore`. Before any root write, `RootPublisher` records
+the exact bytes that will reach the raw Store, including the ciphertext it
+seals once when client encryption is enabled. Recovery reconciles a crash after
+the pending write, a lost S3 response, and an uncertain journal CAS without
+minting replacement URLs. A recovery-only process with the matching identity,
+verifier, and closure may settle an existing pending target without a signer or
+presigner; creating the next root still requires both. Every operation remains
+locally deadline-bounded by the share's original fixed authorization expiry and
+cannot extend it. A write already in flight at that boundary may still commit
+remotely and is reconciled from the exact pending WAL target.
+
+The journal is a write-ahead log and local monotonic anchor, not an independent
+freshness oracle. Replaying both the complete journal and its matching old S3
+root remains indistinguishable without a separately protected monotonic backup,
+audit receipt, or equivalent external anchor. With client encryption, pass the
+raw unwrapped Store: encryption wrappers must preserve the
+`ClientEncryptionApplied` marker, and Go cannot identify an opaque custom
+wrapper that transforms bytes while hiding that marker.
+
 Watch registration traverses directories in bounded batches and applies the
 protocol's path-depth, path-length, entry-name, and per-directory entry limits.
 It also refuses to register more than 100,000 directories and reports
@@ -241,6 +285,14 @@ B/C/D. A reader never contacts A, an authorization service, a callback, or any
 other control plane. A updates one mutable root object in S3; readers poll the
 same presigned root URL and lazily fetch only exact immutable objects named by
 an authenticated bundle.
+
+Normal hostname endpoints may still require the Reader's private Go resolver to
+query the deployment's configured DNS infrastructure. DNS sees the S3 endpoint
+hostname, not bearer paths, queries, headers, or object contents, and is not a
+publisher-to-reader data or control plane. A deployment requiring literally no
+non-S3 network egress must use independently controlled name resolution or add
+and certify a pinned-resolution/routing capability; the current Reader does not
+provide one.
 
 B has no `SecretAccessKey`, credential provider, or SigV4 signer. It cannot
 mint another request or broaden a key, method, bucket, or expiry. A SigV4
@@ -675,12 +727,17 @@ implement conditional `PUT` using `If-None-Match: *` and `If-Match: <ETag>`, as
 well as conditional `GET`. “S3 compatible” alone is not sufficient evidence.
 `Version.ETag` is the sole compare-and-swap token; an optional S3 Version ID is
 reported only for diagnostics because `PutObject` cannot condition on it.
-Run `Repository.ProbeStoreCompatibility` during provisioning for every
-supported vendor/version and endpoint mode before certifying it. The structured
-report distinguishes a proven semantic incompatibility from configuration or
-permission errors and an indeterminate timeout, throttle, 5xx, or transport failure. The existing
-`CheckStoreCompatibility` method remains as an error-only wrapper. The probe
-uses cryptographically random keys below the repository namespace. It checks
+For the built-in S3 adapter, prefer `Store.ProbeCommissioning` during
+provisioning for every supported vendor/version and endpoint mode. Its combined
+envelope preserves both the 31-check writable Store result and the 14-check
+credential-free presigned-GET result. The nested structured reports distinguish
+a proven semantic incompatibility from configuration or permission errors and
+an indeterminate timeout, throttle, 5xx, or transport failure. The lower-level
+`Repository.ProbeStoreCompatibilityWithOptions`,
+`Store.ProbePresignedGetCompatibilityWithOptions`, and error-only
+`CheckStoreCompatibility` APIs remain available for focused testing. The
+writable probe uses cryptographically random keys below the repository
+namespace. It checks
 conditional create and replacement, missing-key `If-Match`, nil-expected CAS
 create semantics, exactly one winner under concurrent `PutIfAbsent`, first-
 writer CAS, and replacement CAS, winner identity, stable opaque ETags and
@@ -703,35 +760,52 @@ valid version token. Named retryable 409 responses such as
 indeterminate, rather than being reported as provider incompatibility.
 
 ```go
-report, err := repository.ProbeStoreCompatibilityWithOptions(ctx,
-	s3disk.StoreCompatibilityProbeOptions{
+report, err := store.ProbeCommissioning(ctx,
+	s3store.S3CommissioningProbeOptions{
+		RepositoryPrefix:      "private/customer/commissioning",
 		DeploymentFingerprint: deploymentFingerprint, // canonical non-secret config SHA-256
 		EvidenceID:             "commissioning-20260718-001",
 		ImplementationVersion:  "commercial-build+17",
+		PresignedGet: s3store.PresignedGetCompatibilityProbeOptions{
+			TLSRootCAPEM: commissionedTLSRoots,
+		},
 	})
 if err != nil {
-	var diagnosis *s3disk.StoreCompatibilityError
+	var diagnosis *s3store.S3CommissioningError
 	if errors.As(err, &diagnosis) {
-		log.Printf("S3 check %s (%s): %s; hint: %s",
-			diagnosis.CheckID, diagnosis.Reason, diagnosis.Detail, diagnosis.Hint)
+		log.Printf("S3 commissioning status=%s writable=%s presigned=%s",
+			diagnosis.Status, diagnosis.WritableStoreOutcome,
+			diagnosis.PresignedGetOutcome)
 	}
 	return err
 }
-log.Printf("S3 contract v%d scope=%s passed; cleanup=%s",
-	report.ContractVersion, report.Scope, report.Cleanup.Status)
+log.Printf("S3 commissioning schema=%d scope=%s passed; cleanup_attention=%t",
+	report.SchemaVersion, report.Scope, report.Cleanup.AttentionRequired)
 ```
 
-The options API adds UTC start time, cleanup-inclusive duration, a
-domain-separated repository-prefix fingerprint, and validated caller binding
-fields to the JSON report. It never serializes the raw prefix. The legacy
-`ProbeStoreCompatibility` method remains available but its report has
-`fully_bound: false`. With no caller deadline, both forms apply a five-minute
-active-probe timeout; independently bounded cleanup may add up to five seconds.
-Invalid option syntax is rejected before Store I/O. Context limits still rely
-on the Store honoring cancellation.
+The combined API adds UTC start time, cleanup-inclusive duration, a random run
+ID, two domain-separated prefix fingerprints, and validated caller binding
+fields to the JSON envelope. It never serializes either raw prefix. When the
+presigned prefix is omitted it is derived inside the normalized repository
+namespace as `.s3disk/v1/probes/presigned-get`; an explicit value must remain
+inside that namespace. Because the exact anonymous HTTP route uses a narrower
+syntax, the combined repository prefix is currently restricted to bounded
+ASCII routes containing only letters, digits, `.`, `_`, `-`, and `/`, with no
+`//`, `.` segment, or `..` segment. The resulting presigned prefix may contain
+at most 768 bytes, so a derived repository prefix must leave room for the
+suffix; the repository prefix itself may be empty.
 
-These hashes are neither signatures nor automatic discovery of endpoint,
-bucket, credential identity, or server version. Build the deployment digest
+With no caller deadline, the combined active phases receive a seven-minute
+overall deadline and the writable phase retains its independent five-minute
+default; each nested probe and cleanup also keeps its own tighter bound. Invalid
+options are rejected before Store I/O. Context limits still rely on the Store
+honoring cancellation. `Complete` means both nested check sets completed,
+independently of whether they passed. Cleanup state is operational evidence and
+never changes `Compatible` or a stage outcome.
+
+These hashes and the complete combined report are neither signatures nor
+automatic discovery of endpoint, bucket, credential identity, or server
+version. Build the deployment digest
 from one canonical non-secret inventory, then have an independent release
 controller recompute it and tamper-evidently sign or seal the complete report.
 Never place access keys, tokens, private certificates, or other secrets in the
@@ -765,6 +839,13 @@ the writable Store contract and the anonymous presigned-GET path. A pass under
 a broader or differently routed identity is not evidence that the production
 path works. Content hashing detects corruption; signed references and signed
 root bundles authenticate the selected commit. See [Security](SECURITY.md).
+
+The combined probe uses that one configured Store identity for canary writes,
+credentialed read-backs, cleanup, and GET presigning. It does not exercise or
+certify a split between the production writer and a separately scoped
+GetObject-only signing principal. That least-privilege topology still requires
+an independent IAM/routing review and a split-identity commissioning harness,
+which is a documented release blocker.
 
 The presigned-path report is finite evidence, not a provider certification or
 mathematical proof. It samples unsigned public-policy access, exact signed GET
@@ -833,6 +914,9 @@ process in [`SECURITY.md`](SECURITY.md), not through a public issue.
 ## License
 
 s3disk is open-source software licensed under the [Apache License
-2.0](LICENSE). Third-party terms and required attributions are listed
+2.0](LICENSE), including for commercial use subject to that license. This is a
+license, not a warranty, support commitment, or statement that the current
+preview has passed the commercial release gate. Third-party terms and required
+attributions are listed
 separately in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
 [`NOTICE`](NOTICE).

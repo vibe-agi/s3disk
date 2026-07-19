@@ -34,7 +34,7 @@ upgrade/rollback product matrix.
 
 | Component | Target | Current status | Commercial requirement |
 | --- | --- | --- | --- |
-| Core and `s3store` | Go-supported OS/architecture | Core protocols are portable Go; protected local state/cache paths are enabled on Linux, Windows, and Darwin with cgo; other targets fail closed because their ACL semantics are not certified; the checked-in CI workflow runs native tests on Ubuntu, macOS, and Windows | Review CI evidence for the exact release and test every additionally advertised target |
+| Core and `s3store` | Go-supported OS/architecture | Core protocols are portable Go; protected publication-journal, watermark, and cache paths are enabled on Linux, Windows, and Darwin with cgo, while the confidentiality-bearing `FileSealedStateStore` is limited to Linux and Darwin with cgo and deliberately fails closed on Windows; other targets fail closed where their ACL semantics are not certified; the checked-in CI workflow runs native tests on Ubuntu, macOS, and Windows | Review CI evidence for the exact release and test every additionally advertised target; do not advertise sealed recovery-WAL support on Windows |
 | `mount` | Linux | FUSE implementation and an actual `/dev/fuse` E2E test are present; the commercial gate requires both | Run the gate on Linux for every release and certify each advertised distribution/kernel; the current macOS development host has not executed this test |
 | `mount` | macOS | Builds through go-fuse; requires a separately installed macFUSE runtime | Do not bundle, download, or automate macFUSE installation in commercial software without written permission; a native FSKit/File Provider adapter is preferred for a packaged product |
 | `mount` | FreeBSD | Build-tagged implementation present | Compile-only status; no production support until dedicated kernel/runtime E2E coverage exists |
@@ -78,13 +78,16 @@ timeout, throttling, 5xx, and transport failure are `indeterminate` rather than
 false evidence against a provider. See
 [S3 backend commissioning](S3_COMPATIBILITY.md).
 
-For archived commercial evidence, use
-`Repository.ProbeStoreCompatibilityWithOptions`. It adds validated caller
-deployment/build identifiers, a domain-separated repository-prefix digest,
-UTC start time, and cleanup-inclusive duration without serializing the raw
-prefix. `fully_bound` is a syntactic completeness flag, not authentication;
-an independent controller must recompute the expected bindings and sign or
-tamper-evidently seal the report.
+For archived commercial evidence from the built-in S3 adapter, use
+`s3store.Store.ProbeCommissioning`; its parent envelope retains both this
+31-check writable report and the 14-check credential-free presigned-GET report.
+`Repository.ProbeStoreCompatibilityWithOptions` remains the focused writable
+sub-probe for custom Store adapters and fault isolation. Both forms add
+validated caller deployment/build identifiers and redacted timing/prefix
+bindings without serializing the raw prefix. `fully_bound` is a syntactic
+completeness flag, not authentication; an independent controller must
+recompute the expected bindings and sign or tamper-evidently seal the complete
+combined report.
 
 The report scope is explicitly `single_client_finite_probe`. A pass can reject
 bad endpoint behavior but cannot certify cross-client/gateway-node histories;
