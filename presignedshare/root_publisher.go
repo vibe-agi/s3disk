@@ -154,10 +154,20 @@ func (publisher RootPublisher) RecoveryEnabled() bool {
 	return configuredInterface(publisher.recoveryJournal)
 }
 
-// NewRootPublisher validates configuration without Store I/O. Signer identity
-// and presigner expiry accessors are metadata contracts and must be local and
-// side-effect free in custom implementations.
+// NewRootPublisher validates configuration without Store I/O. RootCapability
+// must have been minted by an in-process exact GetObject presigner; an imported
+// bearer is accepted only by RestoreRootPublisher after an identity-bound
+// recovery journal has been authenticated. Signer identity and presigner expiry
+// accessors are metadata contracts and must be local and side-effect free in
+// custom implementations.
 func NewRootPublisher(config RootPublisherConfig) (*RootPublisher, error) {
+	return newRootPublisher(config, false)
+}
+
+// newRootPublisher centralizes configuration validation. allowImportedBearer
+// is deliberately private: RestoreRootPublisher is the only public path which
+// may construct this temporary, not-yet-authorized recovery candidate.
+func newRootPublisher(config RootPublisherConfig, allowImportedBearer bool) (*RootPublisher, error) {
 	if !configuredInterface(config.Store) {
 		return nil, fmt.Errorf("%w: root Store is required", s3disk.ErrStoreMisconfigured)
 	}
@@ -219,8 +229,9 @@ func NewRootPublisher(config RootPublisherConfig) (*RootPublisher, error) {
 	if !signedReference && !config.DangerouslyAllowUnsignedReference {
 		return nil, fmt.Errorf("%w: root publication requires a signed repository reference", ErrUntrustedBundle)
 	}
-	if !validObjectKey(config.RootKey) || !config.RootCapability.Configured() ||
-		config.RootCapability.provenance != capabilityProvenanceExactGET ||
+	validRootProvenance := config.RootCapability.provenance == capabilityProvenanceExactGET ||
+		(allowImportedBearer && config.RootCapability.provenance == capabilityProvenanceImportedBearer)
+	if !validObjectKey(config.RootKey) || !config.RootCapability.Configured() || !validRootProvenance ||
 		config.RootCapability.exactKey != config.RootKey {
 		return nil, fmt.Errorf("%w: root is not a safely minted exact-GET capability", ErrInvalidBundle)
 	}

@@ -62,6 +62,18 @@ state and reading the exact root. A recovery-only process with the matching
 identity, verifier, and closure may settle that pending target without a signer
 or presigner, but it needs both before it can create another root.
 
+Before an application declares the rest of its A-side session state resumable,
+it calls `RootPublisher.PrepareRecovery`. This persists a canonical Prepared
+record (revision zero, no pending or committed root) without accessing S3. A
+restart parses the originally exported bearer and uses `RestoreRootPublisher`,
+which accepts that imported capability only after the existing sealed WAL has
+matched the complete share identity, bearer digest, fixed expiry, trust root,
+security flags, and client-encryption witness. It validates pending bytes and
+signed references locally with an offline verifier before privately restoring
+exact-GET provenance. It never creates an absent WAL or probes the root Store.
+The ordinary constructor and bundle builders remain strict and reject imported
+bearers.
+
 B's built-in reader performs `GET` only. It does not issue `LIST`, `HEAD`,
 `PUT`, `DELETE`, multipart, or bucket administration calls. It cannot broaden
 an exact object path or change the signed HTTP method.
@@ -205,10 +217,12 @@ The root URL and every object capability in all revisions of one share use the
 same absolute authorization deadline. At the library level, a product that has
 securely persisted all required A-side share key, signing key, root capability,
 namespace, and deadline material can create a later presigning session only for
-that original deadline. `RootPublisher` binds that deadline into its recovery
-identity and uses it as the deadline for root Store calls. An existing exact
-pending target can be recovered without signing again, but recovery cannot
-renew or extend the share and does not initiate a new write after local expiry.
+that original deadline. `PrepareRecovery` binds the original bearer before the
+application commits its session manifest, and `RestoreRootPublisher` requires
+that exact sealed binding before accepting the imported bearer.
+`RootPublisher` uses the same deadline for root Store calls. An existing exact
+pending target can be recovered without signing again, but recovery cannot renew
+or extend the share and does not initiate a new write after local expiry.
 A conditional write already in flight at the boundary may still commit remotely
 after cancellation and remain ambiguous; recovery uses the exact pending WAL
 target to reconcile it. The current CLI does not persist enough of those
@@ -273,11 +287,18 @@ can encrypt once and journal the exact ciphertext. Known wrappers advertise the
 `ClientEncryptionApplied` marker; Go cannot detect an opaque custom wrapper that
 transforms bytes without preserving it.
 
-`RootPublisherRecovery.tla` separately checks the pending/committed ordering,
-crash and lost-response paths, competitor CAS, replay rejection, fixed expiry,
-and conditional recovery liveness. It assumes the latest complete journal is
-present after restart; whole-journal rollback, torn storage below the
-`SealedStateStore` contract, and disaster recovery remain outside the model.
+`RootPublisherRecovery.tla` starts after a Prepared record is already durable,
+then checks Prepared-to-pending/committed ordering, crash-time loss of volatile
+bearer provenance, validated imported-bearer admission without storage effects,
+one rejected attempt without authority, absence of local root writes before
+admission, lost-response paths, competitor CAS, replay rejection, fixed expiry,
+and conditional recovery liveness. A later admission action represents a new
+matching input, never reclassification of the rejected input. Prepared-file
+installation/CAS faults, URL parsing, bearer-digest and encryption-witness
+validation are refined by the Go fault tests rather than multiplied into the
+finite model. The model assumes the latest complete journal is present after
+restart; whole-journal rollback, torn storage below the `SealedStateStore`
+contract, and disaster recovery remain outside the model.
 
 No asynchronous algorithm can guarantee current data during an arbitrary
 network partition. The contract is instead:

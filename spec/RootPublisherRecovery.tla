@@ -2,18 +2,33 @@
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 (***************************************************************************
-Small executable model of one RootPublisher recovery journal.  The local
-journal contains a durable committed root plus, while a CAS is unresolved, an
-immutable exact target and its expected base.  remoteHistory is the abstract
-linearizable S3 root-key CAS history.  intentHistory is a proof-only ghost set
-showing that every local or competing write had a matching durable intent
-before it entered that history; an implementation need not retain completed
-intents forever.
+Small executable model of one RootPublisher recovery journal.  Genesis is the
+canonical revision-zero Prepared/absent-root sentinel; after the first write,
+the local journal contains a durable committed root plus, while a CAS is
+unresolved, an immutable exact target and its expected base.  remoteHistory is
+the abstract linearizable S3 root-key CAS history.  intentHistory is a
+proof-only ghost set showing that every local or competing write had a matching
+durable intent before it entered that history; an implementation need not
+retain completed intents forever.
 
-CrashRestart destroys only volatile attempt/response/proof state.  Complete
-local-journal rollback, replay of an older journal file, and physical loss of
-the journal disk are deliberately outside this model and require independent
-sealed-state backup and disaster-recovery controls.
+rootBearerOperational abstracts provenance admission, not URL syntax.  A fresh
+publisher starts with an in-process exact-GET bearer.  CrashRestart revokes that
+volatile proof.  RestoreImportedBearer represents successful validation of the
+imported bearer against the complete sealed WAL identity; RejectImportedBearer
+represents one missing, expired, malformed, or mismatched attempt.  A later
+RestoreImportedBearer is a separate attempt with matching material; the model
+does not reclassify the rejected input.  Go tests cover those concrete
+validation cases without multiplying this model by URL, digest, encryption-
+witness, and namespace values.
+
+Init begins after PrepareRecovery has durably installed the Prepared sentinel.
+The absent-WAL, initial journal CAS, response-loss, and concurrent preparation
+paths are refined by Go fault tests rather than modeled as remote-root states.
+
+CrashRestart destroys volatile attempt/response/proof state and exact-bearer
+provenance.  Complete local-journal rollback, replay of an older journal file,
+and physical loss of the journal disk are deliberately outside this model and
+require independent sealed-state backup and disaster-recovery controls.
 ***************************************************************************)
 
 CONSTANTS Digests, MaxRevision, FixedExpiry
@@ -68,7 +83,7 @@ Outcomes ==
      "applied-response-received", "applied-response-lost",
      "competitor-won", "current-returned", "lower-replay-returned",
      "equal-fork-returned", "replay-rejected", "remote-proven",
-     "committed"}
+     "committed", "restore-accepted", "restore-rejected"}
 
 VARIABLES
     journalCommitted,
@@ -86,13 +101,15 @@ VARIABLES
     environmentStable,
     now,
     authorizationExpiry,
-    crashesRemaining
+    crashesRemaining,
+    rootBearerOperational
 
 vars ==
     <<journalCommitted, journalPending, competitorPending, intentHistory,
       remoteHistory, volatileAttempt, volatileObservation, volatileProof,
       volatileOutcome, replayRejected, networkUp, storeUp,
-      environmentStable, now, authorizationExpiry, crashesRemaining>>
+      environmentStable, now, authorizationExpiry, crashesRemaining,
+      rootBearerOperational>>
 
 RemoteRoot == remoteHistory[Len(remoteHistory)].root
 
@@ -139,9 +156,11 @@ Init ==
     /\ now = 0
     /\ authorizationExpiry = FixedExpiry
     /\ crashesRemaining = 1
+    /\ rootBearerOperational = TRUE
 
 RecordPublisherIntent(digest) ==
     /\ digest \in Digests
+    /\ rootBearerOperational
     /\ journalPending = NoPending
     /\ journalCommitted.revision < MaxRevision
     /\ RemoteRoot = journalCommitted
@@ -152,7 +171,7 @@ RecordPublisherIntent(digest) ==
     /\ UNCHANGED <<journalCommitted, competitorPending, remoteHistory,
                     volatileAttempt, volatileObservation, volatileProof,
                     replayRejected, networkUp, storeUp, environmentStable,
-                    now, authorizationExpiry, crashesRemaining>>
+                    now, authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 (***************************************************************************
 The competitor represents another correctly journaled publisher.  Its own
@@ -173,10 +192,11 @@ RecordCompetitorIntent(digest) ==
                     volatileAttempt, volatileObservation, volatileProof,
                     volatileOutcome, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 LoadPendingExactTarget ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = NoPending
     /\ volatileAttempt' = journalPending
     /\ volatileOutcome' = "loaded"
@@ -184,10 +204,11 @@ LoadPendingExactTarget ==
                     intentHistory, remoteHistory, volatileObservation,
                     volatileProof, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 LocalCASReady ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = journalPending
     /\ volatileObservation = NoRoot
     /\ volatileProof = NoRoot
@@ -206,7 +227,7 @@ CASAppliedResponseReceived ==
     /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
                     intentHistory, volatileAttempt, volatileProof,
                     replayRejected, networkUp, storeUp, environmentStable,
-                    now, authorizationExpiry, crashesRemaining>>
+                    now, authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 CASAppliedResponseLost ==
     /\ LocalCASReady
@@ -219,7 +240,7 @@ CASAppliedResponseLost ==
     /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
                     intentHistory, volatileAttempt, volatileObservation,
                     volatileProof, replayRejected, storeUp, environmentStable,
-                    now, authorizationExpiry, crashesRemaining>>
+                    now, authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 CompetitorCASWins ==
     /\ journalPending # NoPending
@@ -237,10 +258,11 @@ CompetitorCASWins ==
                     intentHistory, volatileAttempt, volatileObservation,
                     volatileProof, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 ObserveNetworkFault ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = journalPending
     /\ ~networkUp
     /\ volatileOutcome # "network-fault"
@@ -249,10 +271,11 @@ ObserveNetworkFault ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, replayRejected,
                     networkUp, storeUp, environmentStable, now,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 ObserveStoreFault ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = journalPending
     /\ networkUp
     /\ ~storeUp
@@ -262,10 +285,11 @@ ObserveStoreFault ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, replayRejected,
                     networkUp, storeUp, environmentStable, now,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 ReturnCurrentRemoteRoot ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = journalPending
     /\ volatileObservation = NoRoot
     /\ RemoteRoot.revision = journalPending.target.revision
@@ -277,10 +301,11 @@ ReturnCurrentRemoteRoot ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileProof, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 ReturnLowerReplay ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = journalPending
     /\ volatileObservation = NoRoot
     /\ RemoteRoot.revision = journalPending.target.revision
@@ -293,11 +318,12 @@ ReturnLowerReplay ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileProof, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 ReturnEqualRevisionFork(digest) ==
     /\ digest \in Digests
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileAttempt = journalPending
     /\ volatileObservation = NoRoot
     /\ RemoteRoot.revision = journalPending.target.revision
@@ -312,10 +338,11 @@ ReturnEqualRevisionFork(digest) ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileProof, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 RejectInvalidObservation ==
     /\ volatileObservation # NoRoot
+    /\ rootBearerOperational
     /\ ~ObservationIsProvable(volatileObservation)
     /\ volatileObservation' = NoRoot
     /\ volatileOutcome' = "replay-rejected"
@@ -323,20 +350,22 @@ RejectInvalidObservation ==
     /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileProof, networkUp, storeUp, environmentStable,
-                    now, authorizationExpiry, crashesRemaining>>
+                    now, authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 ProveRemoteRoot ==
     /\ ObservationIsProvable(volatileObservation)
+    /\ rootBearerOperational
     /\ volatileProof' = volatileObservation
     /\ volatileOutcome' = "remote-proven"
     /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, replayRejected, networkUp, storeUp,
                     environmentStable, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 FinalizeCommitted ==
     /\ journalPending # NoPending
+    /\ rootBearerOperational
     /\ volatileProof # NoRoot
     /\ volatileProof = RemoteRoot
     /\ DirectSuccessor(journalPending.base, volatileProof)
@@ -349,23 +378,42 @@ FinalizeCommitted ==
     /\ volatileOutcome' = "committed"
     /\ UNCHANGED <<competitorPending, intentHistory, remoteHistory,
                     replayRejected, networkUp, storeUp, environmentStable,
-                    now, authorizationExpiry, crashesRemaining>>
+                    now, authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 CrashRestart ==
     /\ crashesRemaining > 0
-    /\ journalPending # NoPending
-    /\ \/ volatileAttempt # NoPending
-       \/ volatileObservation # NoRoot
-       \/ volatileProof # NoRoot
-       \/ volatileOutcome # "none"
+    /\ rootBearerOperational
     /\ volatileAttempt' = NoPending
     /\ volatileObservation' = NoRoot
     /\ volatileProof' = NoRoot
     /\ volatileOutcome' = "none"
     /\ crashesRemaining' = crashesRemaining - 1
+    /\ rootBearerOperational' = FALSE
     /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
                     intentHistory, remoteHistory, replayRejected, networkUp,
                     storeUp, environmentStable, now, authorizationExpiry>>
+
+RestoreImportedBearer ==
+    /\ ~rootBearerOperational
+    /\ now < authorizationExpiry
+    /\ rootBearerOperational' = TRUE
+    /\ volatileOutcome' = "restore-accepted"
+    /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
+                    intentHistory, remoteHistory, volatileAttempt,
+                    volatileObservation, volatileProof, replayRejected,
+                    networkUp, storeUp, environmentStable, now,
+                    authorizationExpiry, crashesRemaining>>
+
+RejectImportedBearer ==
+    /\ ~rootBearerOperational
+    /\ volatileOutcome # "restore-rejected"
+    /\ volatileOutcome' = "restore-rejected"
+    /\ UNCHANGED <<journalCommitted, journalPending, competitorPending,
+                    intentHistory, remoteHistory, volatileAttempt,
+                    volatileObservation, volatileProof, replayRejected,
+                    networkUp, storeUp, environmentStable, now,
+                    authorizationExpiry, crashesRemaining,
+                    rootBearerOperational>>
 
 PartitionNetwork ==
     /\ ~environmentStable
@@ -375,7 +423,7 @@ PartitionNetwork ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, volatileOutcome,
                     replayRejected, storeUp, environmentStable, now,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 RestoreNetwork ==
     /\ ~environmentStable
@@ -385,7 +433,7 @@ RestoreNetwork ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, volatileOutcome,
                     replayRejected, storeUp, environmentStable, now,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 SetStoreUnavailable ==
     /\ ~environmentStable
@@ -395,7 +443,7 @@ SetStoreUnavailable ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, volatileOutcome,
                     replayRejected, networkUp, environmentStable, now,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 SetStoreAvailable ==
     /\ ~environmentStable
@@ -405,7 +453,7 @@ SetStoreAvailable ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, volatileOutcome,
                     replayRejected, networkUp, environmentStable, now,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 StabilizeEnvironment ==
     /\ ~environmentStable
@@ -416,7 +464,7 @@ StabilizeEnvironment ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, volatileOutcome,
                     replayRejected, now, authorizationExpiry,
-                    crashesRemaining>>
+                    crashesRemaining, rootBearerOperational>>
 
 AdvanceTime ==
     /\ now < authorizationExpiry
@@ -425,7 +473,7 @@ AdvanceTime ==
                     intentHistory, remoteHistory, volatileAttempt,
                     volatileObservation, volatileProof, volatileOutcome,
                     replayRejected, networkUp, storeUp, environmentStable,
-                    authorizationExpiry, crashesRemaining>>
+                    authorizationExpiry, crashesRemaining, rootBearerOperational>>
 
 LocalCASOutcome ==
     CASAppliedResponseReceived \/ CASAppliedResponseLost
@@ -446,6 +494,8 @@ Next ==
     \/ ProveRemoteRoot
     \/ FinalizeCommitted
     \/ CrashRestart
+    \/ RestoreImportedBearer
+    \/ RejectImportedBearer
     \/ PartitionNetwork
     \/ RestoreNetwork
     \/ SetStoreUnavailable
@@ -464,6 +514,7 @@ requires the fixed authorization window to remain unexpired.
 FairSpec ==
     /\ Spec
     /\ WF_vars(StabilizeEnvironment)
+    /\ WF_vars(RestoreImportedBearer)
     /\ WF_vars(LoadPendingExactTarget)
     /\ WF_vars(LocalCASOutcome)
     /\ WF_vars(ReturnCurrentRemoteRoot)
@@ -489,6 +540,7 @@ TypeOK ==
     /\ now \in 0..authorizationExpiry
     /\ authorizationExpiry = FixedExpiry
     /\ crashesRemaining \in 0..1
+    /\ rootBearerOperational \in BOOLEAN
 
 JournalPendingIsExactAndAnchored ==
     journalPending = NoPending
@@ -577,7 +629,34 @@ CrashClearsOnlyVolatileAndPreservesJournal ==
            /\ authorizationExpiry' = authorizationExpiry
            /\ volatileAttempt' = NoPending
            /\ volatileObservation' = NoRoot
-           /\ volatileProof' = NoRoot ]_vars
+           /\ volatileProof' = NoRoot
+           /\ ~rootBearerOperational' ]_vars
+
+BearerAdmissionPrecedesLocalRecovery ==
+    [][ ~rootBearerOperational
+        => /\ journalCommitted' = journalCommitted
+           /\ journalPending' = journalPending
+           /\ volatileAttempt' = volatileAttempt
+           /\ volatileObservation' = volatileObservation
+           /\ volatileProof' = volatileProof ]_vars
+
+BearerAdmissionHasNoStorageEffect ==
+    [][ (~rootBearerOperational /\ rootBearerOperational')
+        => /\ journalCommitted' = journalCommitted
+           /\ journalPending' = journalPending
+           /\ competitorPending' = competitorPending
+           /\ intentHistory' = intentHistory
+           /\ remoteHistory' = remoteHistory
+           /\ authorizationExpiry' = authorizationExpiry ]_vars
+
+RejectStepDoesNotAdmitAuthority ==
+    [][ (volatileOutcome # "restore-rejected"
+         /\ volatileOutcome' = "restore-rejected")
+        => ~rootBearerOperational' ]_vars
+
+NoLocalRootWriteBeforeBearerAdmission ==
+    [][ (~rootBearerOperational /\ remoteHistory' # remoteHistory)
+        => remoteHistory'[Len(remoteHistory')].writer = "competitor" ]_vars
 
 NoRemoteWriteWhileNetworkOrStoreUnavailable ==
     [][ (~networkUp \/ ~storeUp)

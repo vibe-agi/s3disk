@@ -90,6 +90,10 @@ PendingWithoutProofCannotChangeOrClear
 PendingClearsOnlyAfterMatchingRemoteProof
 InvalidReplayCannotAdvanceJournal
 CrashClearsOnlyVolatileAndPreservesJournal
+BearerAdmissionPrecedesLocalRecovery
+BearerAdmissionHasNoStorageEffect
+RejectStepDoesNotAdmitAuthority
+NoLocalRootWriteBeforeBearerAdmission
 NoRemoteWriteWhileNetworkOrStoreUnavailable
 ExpiryIsFixedAndNeverExtended
 NoRemoteWriteAtOrAfterExpiry'
@@ -235,7 +239,8 @@ require_share_distinct_actions "$root_recovery_log" \
   CASAppliedResponseReceived CASAppliedResponseLost CompetitorCASWins \
   ObserveNetworkFault ObserveStoreFault ReturnCurrentRemoteRoot \
   ReturnLowerReplay ReturnEqualRevisionFork RejectInvalidObservation \
-  ProveRemoteRoot FinalizeCommitted CrashRestart PartitionNetwork \
+  ProveRemoteRoot FinalizeCommitted CrashRestart RestoreImportedBearer \
+  RejectImportedBearer PartitionNetwork \
   RestoreNetwork SetStoreUnavailable SetStoreAvailable \
   StabilizeEnvironment AdvanceTime
 

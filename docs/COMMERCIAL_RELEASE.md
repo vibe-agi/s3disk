@@ -83,6 +83,10 @@ ready.
   envelope for protecting those recovery secrets, and the core
   `FileSealedStateStore` provides protected crash-safe local CAS persistence.
   `RootPublisher` can consume that store as an exact-byte recovery WAL. The
+  library can now install an S3-free Prepared record before a session is marked
+  resumable, then authenticate that sealed record before privately re-admitting
+  the original exported root bearer after restart. Ordinary constructors remain
+  strict, and absent or mismatched state fails before root Store I/O. The
   envelope intentionally does not provide freshness after a complete old file
   is restored. Its bounded built-in keyring can authenticate retained-key
   envelopes and rewrap them with an active key, but coordinated installation,
@@ -151,7 +155,9 @@ ready.
 
 - `RootPublisher` now accepts a `SealedStateStore` WAL that installs the exact
   raw Store target before the mutable S3 write, including the one-time encrypted
-  ciphertext. It
+  ciphertext. `PrepareRecovery` also installs a canonical identity-bound record
+  before any root write, and `RestoreRootPublisher` can authenticate that record
+  before re-admitting the original imported bearer without S3 I/O. It
   reconciles pending-process crashes, lost S3 responses, and uncertain journal
   CAS results; an existing target can be recovered with matching identity,
   verifier, and closure but without a signer or presigner, while new targets

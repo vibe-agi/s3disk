@@ -15,6 +15,658 @@ import (
 	"github.com/vibe-agi/s3disk/publisherstate"
 )
 
+func TestRootPublisherPreparedRecoveryAllowsExplicitBearerRestore(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	journal := newRootTestRecoveryJournal()
+	config := fixture.config(fixture.base, 1)
+	config.RecoveryJournal = journal
+	publisher, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.PrepareRecovery(context.Background()); err != nil {
+		t.Fatalf("PrepareRecovery: %v", err)
+	}
+	if _, err := RestoreRootPublisher(context.Background(), config); !errors.Is(err, ErrRootRecoveryState) {
+		t.Fatalf("RestoreRootPublisher exact-capability error = %v, want ErrRootRecoveryState", err)
+	}
+
+	imported := rootRecoveryImportBearer(t, fixture.rootCapability)
+	restoreConfig := config
+	restoreConfig.RootCapability = imported
+	if _, err := NewRootPublisher(restoreConfig); !errors.Is(err, ErrInvalidBundle) {
+		t.Fatalf("ordinary NewRootPublisher imported-bearer error = %v, want ErrInvalidBundle", err)
+	}
+	restored, err := RestoreRootPublisher(context.Background(), restoreConfig)
+	if err != nil {
+		t.Fatalf("RestoreRootPublisher: %v", err)
+	}
+	if !restored.RecoveryEnabled() || !restored.CanBuildNewRoot() {
+		t.Fatalf(
+			"restored publisher status = recovery %v, can_build %v",
+			restored.RecoveryEnabled(),
+			restored.CanBuildNewRoot(),
+		)
+	}
+	record := journal.decoded(t)
+	if record.HighestRevision != 0 || record.Committed != nil || record.Pending != nil {
+		t.Fatalf("prepared recovery record = %+v, want idle revision zero", record)
+	}
+}
+
+func TestRootPublisherPrepareRecoveryIsIdempotentAcrossJournalCASResponseLoss(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	journal := newRootTestRecoveryJournal()
+	journal.loseNextResponse(false)
+	store := &rootRecoveryRejectingCountingStore{}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+	config := fixture.config(store, 1)
+	config.RecoveryJournal = journal
+	config.Signer = signer
+	config.Presigner = presigner
+	publisher, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := publisher.PrepareRecovery(context.Background()); err != nil {
+		t.Fatalf("PrepareRecovery after applied journal CAS response loss: %v", err)
+	}
+	if journal.compareAndSwapCallCount != 1 {
+		t.Fatalf("first PrepareRecovery journal CAS calls = %d, want 1", journal.compareAndSwapCallCount)
+	}
+	if err := publisher.PrepareRecovery(context.Background()); err != nil {
+		t.Fatalf("idempotent PrepareRecovery: %v", err)
+	}
+	if journal.compareAndSwapCallCount != 1 {
+		t.Fatalf("idempotent PrepareRecovery added a journal CAS: calls = %d", journal.compareAndSwapCallCount)
+	}
+	if calls := store.callCount(); calls != 0 {
+		t.Fatalf("PrepareRecovery made %d root Store calls", calls)
+	}
+	if calls := signer.callCount(); calls != 0 {
+		t.Fatalf("PrepareRecovery made %d signer calls", calls)
+	}
+	if calls := presigner.callCount(); calls != 0 {
+		t.Fatalf("PrepareRecovery made %d presigner calls", calls)
+	}
+	record := journal.decoded(t)
+	if record.HighestRevision != 0 || record.Committed != nil || record.Pending != nil {
+		t.Fatalf("idempotently prepared record = %+v, want idle revision zero", record)
+	}
+}
+
+func TestRestoreRootPublisherRejectsMissingEmptyAndMismatchedRecoveryBeforeOperationalIO(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	validJournal := newRootTestRecoveryJournal()
+	prepareConfig := fixture.config(fixture.base, 1)
+	prepareConfig.RecoveryJournal = validJournal
+	preparer, err := NewRootPublisher(prepareConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preparer.PrepareRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	imported := rootRecoveryImportBearer(t, fixture.rootCapability)
+	wrongBearerExact, err := newTestCapability(
+		fixture.rootKey,
+		"https://objects.example.test/bucket/root?X-Amz-Signature=different-root-secret",
+		nil,
+		fixture.expiry,
+		CapabilityOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongBearer := rootRecoveryImportBearer(t, wrongBearerExact)
+	wrongExpiryExact, err := newTestCapability(
+		fixture.rootKey,
+		fixture.rootCapability.rawURL,
+		nil,
+		fixture.expiry.Add(-time.Minute),
+		CapabilityOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongExpiry := rootRecoveryImportBearer(t, wrongExpiryExact)
+	wrongShare, err := GenerateShareID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyRevision := s3disk.SealedStateRevision{1}
+
+	tests := []struct {
+		name       string
+		journal    s3disk.SealedStateStore
+		capability Capability
+		shareID    ShareID
+		wantCAS    int
+	}{
+		{name: "no recovery journal", capability: imported, shareID: fixture.shareID},
+		{name: "absent recovery state", journal: newRootTestRecoveryJournal(), capability: imported, shareID: fixture.shareID},
+		{
+			name: "empty persisted recovery state",
+			journal: &rootRecoveryLoadResultJournal{
+				found: true, revision: emptyRevision,
+			},
+			capability: imported,
+			shareID:    fixture.shareID,
+		},
+		{name: "wrong bearer", journal: validJournal, capability: wrongBearer, shareID: fixture.shareID, wantCAS: 1},
+		{name: "wrong share", journal: validJournal, capability: imported, shareID: wrongShare, wantCAS: 1},
+		{name: "wrong expiry", journal: validJournal, capability: wrongExpiry, shareID: fixture.shareID, wantCAS: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &rootRecoveryRejectingCountingStore{}
+			signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+			presigner := &rootTestPresigner{
+				expiry: test.capability.expiresAt,
+				origin: "https://objects.example.test",
+			}
+			config := fixture.config(store, 1)
+			config.RecoveryJournal = test.journal
+			config.RootCapability = test.capability
+			config.ShareID = test.shareID
+			config.Signer = signer
+			config.Presigner = presigner
+
+			if _, err := RestoreRootPublisher(context.Background(), config); !errors.Is(err, ErrRootRecoveryState) {
+				t.Fatalf("RestoreRootPublisher error = %v, want ErrRootRecoveryState", err)
+			}
+			if calls := store.callCount(); calls != 0 {
+				t.Fatalf("rejected restore made %d root Store calls", calls)
+			}
+			if calls := signer.callCount(); calls != 0 {
+				t.Fatalf("rejected restore made %d signer calls", calls)
+			}
+			if calls := presigner.callCount(); calls != 0 {
+				t.Fatalf("rejected restore made %d presigner calls", calls)
+			}
+			if loadJournal, ok := test.journal.(*rootRecoveryLoadResultJournal); ok && loadJournal.compareAndSwapCalls != 0 {
+				t.Fatalf("rejected restore made %d journal writes", loadJournal.compareAndSwapCalls)
+			}
+			if rootJournal, ok := test.journal.(*rootTestRecoveryJournal); ok &&
+				rootJournal.compareAndSwapCallCount != test.wantCAS {
+				t.Fatalf(
+					"rejected restore changed journal CAS count = %d, want %d",
+					rootJournal.compareAndSwapCallCount,
+					test.wantCAS,
+				)
+			}
+		})
+	}
+}
+
+func TestRestoreRootPublisherAuthenticatesPendingWithoutSigningPresigningOrRootStoreIO(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	closure := fixture.publish(t, "pending imported-bearer restore")
+	journal := newRootTestRecoveryJournal()
+	initialStore := &rootRecoveryFaultStore{
+		base: fixture.base, journal: journal, rejectWrites: true,
+	}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+	config := fixture.config(initialStore, 1)
+	config.RecoveryJournal = journal
+	config.Signer = signer
+	config.Presigner = presigner
+	publisher, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.Create(context.Background(), closure); !errors.Is(err, ErrRootPublishIndeterminate) {
+		t.Fatalf("Create pending target error = %v, want ErrRootPublishIndeterminate", err)
+	}
+	if record := journal.decoded(t); record.Pending == nil {
+		t.Fatal("failed root write did not leave an authenticated pending target")
+	}
+	signCalls := signer.callCount()
+	presignCalls := presigner.callCount()
+
+	restoreStore := &rootRecoveryRejectingCountingStore{}
+	restoreConfig := config
+	restoreConfig.Store = restoreStore
+	restoreConfig.RootCapability = rootRecoveryImportBearer(t, fixture.rootCapability)
+	restoreConfig.Signer = nil
+	restoreConfig.Presigner = nil
+	restored, err := RestoreRootPublisher(context.Background(), restoreConfig)
+	if err != nil {
+		t.Fatalf("RestoreRootPublisher pending target: %v", err)
+	}
+	if restored.CanBuildNewRoot() || !restored.RecoveryEnabled() {
+		t.Fatalf(
+			"pending-only restore status = can_build %v, recovery %v",
+			restored.CanBuildNewRoot(),
+			restored.RecoveryEnabled(),
+		)
+	}
+	if restoreStore.callCount() != 0 || signer.callCount() != signCalls || presigner.callCount() != presignCalls {
+		t.Fatalf(
+			"pending restore operational calls = Store %d, Sign %d->%d, PresignGet %d->%d",
+			restoreStore.callCount(), signCalls, signer.callCount(), presignCalls, presigner.callCount(),
+		)
+	}
+}
+
+func TestPreparedRootPublisherCanCreateItsFirstRoot(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	closure := fixture.publish(t, "first root after prepare")
+	journal := newRootTestRecoveryJournal()
+	config := fixture.config(fixture.base, 1)
+	config.RecoveryJournal = journal
+	publisher, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.PrepareRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	prepared := journal.decoded(t)
+	if prepared.HighestRevision != 0 || prepared.Committed != nil || prepared.Pending != nil {
+		t.Fatalf("prepared recovery record = %+v, want idle revision zero", prepared)
+	}
+
+	publication, err := publisher.Create(context.Background(), closure)
+	if err != nil {
+		t.Fatalf("Create after PrepareRecovery: %v", err)
+	}
+	if !publication.Updated || publication.Revision != 1 || publication.Snapshot != closure.Snapshot {
+		t.Fatalf("first prepared publication = %+v", publication)
+	}
+	record := journal.decoded(t)
+	if record.HighestRevision != 1 || record.Pending != nil || record.Committed == nil || record.Committed.Revision != 1 {
+		t.Fatalf("first prepared committed record = %+v", record)
+	}
+}
+
+func TestRestoredRootPublisherCanUpdateCommittedRoot(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	first := fixture.publish(t, "root before restore")
+	journal := newRootTestRecoveryJournal()
+	config := fixture.config(fixture.base, 1)
+	config.RecoveryJournal = journal
+	publisher, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.PrepareRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if publication, err := publisher.Create(context.Background(), first); err != nil || publication.Revision != 1 {
+		t.Fatalf("initial Create = %+v, %v", publication, err)
+	}
+
+	restoreConfig := config
+	restoreConfig.RootCapability = rootRecoveryImportBearer(t, fixture.rootCapability)
+	restored, err := RestoreRootPublisher(context.Background(), restoreConfig)
+	if err != nil {
+		t.Fatalf("RestoreRootPublisher: %v", err)
+	}
+	second := fixture.publish(t, "root after restore")
+	publication, err := restored.Update(context.Background(), second)
+	if err != nil {
+		t.Fatalf("restored Update: %v", err)
+	}
+	if !publication.Updated || publication.Revision != 2 || publication.Snapshot != second.Snapshot {
+		t.Fatalf("restored publication = %+v", publication)
+	}
+	record := journal.decoded(t)
+	if record.HighestRevision != 2 || record.Pending != nil || record.Committed == nil || record.Committed.Revision != 2 {
+		t.Fatalf("restored committed record = %+v", record)
+	}
+}
+
+func TestRootPublisherPrepareAndRestoreRejectEndedContextsBeforeIO(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	var typedNil *rootRecoveryNilContext
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	contexts := []struct {
+		name     string
+		ctx      context.Context
+		canceled bool
+	}{
+		{name: "typed nil", ctx: typedNil},
+		{name: "pre-canceled", ctx: canceled, canceled: true},
+	}
+
+	for _, test := range contexts {
+		t.Run("Prepare/"+test.name, func(t *testing.T) {
+			journal := &rootRecoveryRejectingCountingJournal{}
+			store := &rootRecoveryRejectingCountingStore{}
+			signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+			presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+			config := fixture.config(store, 1)
+			config.RecoveryJournal = journal
+			config.Signer = signer
+			config.Presigner = presigner
+			publisher, err := NewRootPublisher(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = publisher.PrepareRecovery(test.ctx)
+			if err == nil || (test.canceled && !errors.Is(err, context.Canceled)) {
+				t.Fatalf("PrepareRecovery error = %v", err)
+			}
+			assertNoRootRecoveryOperationalIO(t, store, journal, signer, presigner)
+		})
+
+		t.Run("Restore/"+test.name, func(t *testing.T) {
+			journal := &rootRecoveryRejectingCountingJournal{}
+			store := &rootRecoveryRejectingCountingStore{}
+			signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+			presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+			config := fixture.config(store, 1)
+			config.RecoveryJournal = journal
+			config.RootCapability = rootRecoveryImportBearer(t, fixture.rootCapability)
+			config.Signer = signer
+			config.Presigner = presigner
+
+			_, err := RestoreRootPublisher(test.ctx, config)
+			if err == nil || (test.canceled && !errors.Is(err, context.Canceled)) {
+				t.Fatalf("RestoreRootPublisher error = %v", err)
+			}
+			assertNoRootRecoveryOperationalIO(t, store, journal, signer, presigner)
+		})
+	}
+}
+
+func TestRestoreRootPublisherRejectsCustomVerifierEvenWithDangerousOptIn(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	builtIn, ok := fixture.verifier.(*s3disk.Ed25519ReferenceVerifier)
+	if !ok {
+		t.Fatalf("fixture verifier = %T", fixture.verifier)
+	}
+	customVerifier := &rootPublisherCountingVerifier{Ed25519ReferenceVerifier: builtIn}
+	journal := newRootTestRecoveryJournal()
+	prepareConfig := fixture.config(fixture.base, 1)
+	prepareConfig.RecoveryJournal = journal
+	prepareConfig.Verifier = customVerifier
+	prepareConfig.DangerouslyAllowCustomReferenceVerifier = true
+	preparer, err := NewRootPublisher(prepareConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preparer.PrepareRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, revision := rootRecoveryJournalState(t, journal)
+
+	loadJournal := &rootRecoveryIgnoringContextJournal{data: data, revision: revision, found: true}
+	store := &rootRecoveryRejectingCountingStore{}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+	restoreConfig := prepareConfig
+	restoreConfig.Store = store
+	restoreConfig.RecoveryJournal = loadJournal
+	restoreConfig.RootCapability = rootRecoveryImportBearer(t, fixture.rootCapability)
+	restoreConfig.Signer = signer
+	restoreConfig.Presigner = presigner
+	customVerifier.calls = 0
+
+	if _, err := RestoreRootPublisher(context.Background(), restoreConfig); !errors.Is(err, ErrUntrustedBundle) {
+		t.Fatalf("custom-verifier RestoreRootPublisher error = %v, want ErrUntrustedBundle", err)
+	}
+	if customVerifier.calls != 0 {
+		t.Fatalf("rejected custom verifier calls = %d, want 0", customVerifier.calls)
+	}
+	if loadJournal.callCount() != 0 || loadJournal.compareAndSwapCallCount() != 0 {
+		t.Fatalf(
+			"custom-verifier rejection reached journal: loads=%d cas=%d",
+			loadJournal.callCount(),
+			loadJournal.compareAndSwapCallCount(),
+		)
+	}
+	if store.callCount() != 0 || signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatal("custom-verifier rejection reached root Store, signer, or presigner")
+	}
+}
+
+func TestRestoreRootPublisherRechecksContextAfterJournalLoad(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	journal := newRootTestRecoveryJournal()
+	prepareConfig := fixture.config(fixture.base, 1)
+	prepareConfig.RecoveryJournal = journal
+	preparer, err := NewRootPublisher(prepareConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preparer.PrepareRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, revision := rootRecoveryJournalState(t, journal)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loadJournal := &rootRecoveryIgnoringContextJournal{
+		data: data, revision: revision, found: true, afterLoad: cancel,
+	}
+	store := &rootRecoveryRejectingCountingStore{}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+	restoreConfig := prepareConfig
+	restoreConfig.Store = store
+	restoreConfig.RecoveryJournal = loadJournal
+	restoreConfig.RootCapability = rootRecoveryImportBearer(t, fixture.rootCapability)
+	restoreConfig.Signer = signer
+	restoreConfig.Presigner = presigner
+
+	if _, err := RestoreRootPublisher(ctx, restoreConfig); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RestoreRootPublisher after load cancellation error = %v, want context.Canceled", err)
+	}
+	if loadJournal.callCount() != 1 || loadJournal.compareAndSwapCallCount() != 0 {
+		t.Fatalf("journal calls = loads %d, cas %d", loadJournal.callCount(), loadJournal.compareAndSwapCallCount())
+	}
+	if store.callCount() != 0 || signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatal("post-load context cancellation reached root Store, signer, or presigner")
+	}
+}
+
+func TestRootPublisherPrepareRecoveryRechecksContextAfterJournalLoad(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	journal := &rootRecoveryIgnoringContextJournal{afterLoad: cancel}
+	store := &rootRecoveryRejectingCountingStore{}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+	config := fixture.config(store, 1)
+	config.RecoveryJournal = journal
+	config.Signer = signer
+	config.Presigner = presigner
+	publisher, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := publisher.PrepareRecovery(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("PrepareRecovery after load cancellation error = %v, want context.Canceled", err)
+	}
+	if journal.callCount() != 1 || journal.compareAndSwapCallCount() != 0 {
+		t.Fatalf("journal calls = loads %d, cas %d", journal.callCount(), journal.compareAndSwapCallCount())
+	}
+	if store.callCount() != 0 || signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatal("post-load PrepareRecovery cancellation reached root Store, signer, or presigner")
+	}
+}
+
+func TestRestoreRootPublisherRechecksFixedExpiryAfterJournalLoad(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	expiresAt := time.Now().Add(2 * time.Second).UTC().Round(0)
+	exact, err := newTestCapability(
+		fixture.rootKey,
+		fixture.rootCapability.rawURL,
+		nil,
+		expiresAt,
+		CapabilityOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &rootRecoveryRejectingCountingStore{}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: expiresAt, origin: "https://objects.example.test"}
+	journal := newRootTestRecoveryJournal()
+	config := fixture.config(store, 1)
+	config.RootCapability = exact
+	config.Presigner = presigner
+	config.Signer = signer
+	config.RecoveryJournal = journal
+	preparer, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preparer.PrepareRecovery(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, revision := rootRecoveryJournalState(t, journal)
+	loadJournal := &rootRecoveryIgnoringContextJournal{
+		data: data, revision: revision, found: true,
+		afterLoad: func() {
+			if wait := time.Until(expiresAt) + 25*time.Millisecond; wait > 0 {
+				time.Sleep(wait)
+			}
+		},
+	}
+	restoreConfig := config
+	restoreConfig.RecoveryJournal = loadJournal
+	restoreConfig.RootCapability = rootRecoveryImportBearer(t, exact)
+
+	_, restoreErr := RestoreRootPublisher(context.Background(), restoreConfig)
+	if restoreErr == nil || (!errors.Is(restoreErr, s3disk.ErrAccessDenied) &&
+		!errors.Is(restoreErr, context.DeadlineExceeded)) {
+		t.Fatalf("post-load expiry error = %v, want access denied or authorization deadline", restoreErr)
+	}
+	if time.Now().Before(expiresAt) {
+		t.Fatal("expiry journal hook returned before the fixed authorization deadline")
+	}
+	if loadJournal.callCount() != 1 || loadJournal.compareAndSwapCallCount() != 0 {
+		t.Fatalf("journal calls = loads %d, cas %d", loadJournal.callCount(), loadJournal.compareAndSwapCallCount())
+	}
+	if store.callCount() != 0 || signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatal("post-load expiry reached root Store, signer, or presigner")
+	}
+}
+
+func TestBuildSnapshotBundleStillRejectsImportedRootBearerBeforeSigning(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	closure := fixture.publish(t, "ordinary build with imported root")
+	imported := rootRecoveryImportBearer(t, fixture.rootCapability)
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+
+	_, err := BuildSnapshotBundle(context.Background(), SnapshotBundleInput{
+		RootKey: fixture.rootKey, RootCapability: imported,
+		RepositoryPrefix: fixture.repositoryPrefix, ShareID: fixture.shareID,
+		Revision: 1, Closure: closure, Presigner: presigner,
+	}, signer, fixture.verifier)
+	if !errors.Is(err, ErrInvalidBundle) {
+		t.Fatalf("BuildSnapshotBundle imported-root error = %v, want ErrInvalidBundle", err)
+	}
+	if signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatal("imported-root rejection reached signer or presigner")
+	}
+}
+
+func TestConcurrentEncryptedPrepareRecoveryConvergesOnOneValidIdentity(t *testing.T) {
+	fixture := newRootPublisherFixture(t)
+	profile := newRootPublisherEncryptionProfile(t, fixture)
+	baseJournal := newRootTestRecoveryJournal()
+	journal := newRootRecoveryConcurrentPrepareJournal(baseJournal)
+	store := &rootRecoveryRejectingCountingStore{}
+	signer := &rootRecoveryCountingSigner{delegate: fixture.signer}
+	presigner := &rootTestPresigner{expiry: fixture.expiry, origin: "https://objects.example.test"}
+	config := fixture.config(store, 1)
+	config.ClientEncryption = profile
+	config.RecoveryJournal = journal
+	config.Signer = signer
+	config.Presigner = presigner
+	first, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewRootPublisher(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	results := make(chan error, 2)
+	go func() { results <- first.PrepareRecovery(ctx) }()
+	go func() { results <- second.PrepareRecovery(ctx) }()
+	for index := 0; index < 2; index++ {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent PrepareRecovery %d: %v", index, err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("concurrent PrepareRecovery context: %v", err)
+	}
+	witnesses := journal.clientEncryptionWitnesses()
+	if len(witnesses) != 2 || len(witnesses[0]) == 0 || len(witnesses[1]) == 0 ||
+		bytes.Equal(witnesses[0], witnesses[1]) {
+		t.Fatalf("concurrent encrypted witnesses were not two distinct candidates: count=%d", len(witnesses))
+	}
+	if baseJournal.compareAndSwapCallCount != 2 {
+		t.Fatalf("concurrent journal CAS calls = %d, want 2", baseJournal.compareAndSwapCallCount)
+	}
+	record := baseJournal.decoded(t)
+	if record.HighestRevision != 0 || record.Committed != nil || record.Pending != nil ||
+		len(record.ClientEncryptionWitness) == 0 {
+		t.Fatalf("converged prepared recovery record = %+v", record)
+	}
+	if store.callCount() != 0 || signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatal("concurrent PrepareRecovery reached root Store, signer, or presigner")
+	}
+}
+
+func rootRecoveryImportBearer(t *testing.T, capability Capability) Capability {
+	t.Helper()
+	bearer, err := capability.ExportBearer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(bearer)
+	imported, err := ParseBearer(bearer, CapabilityOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return imported
+}
+
+func rootRecoveryJournalState(
+	t *testing.T,
+	journal s3disk.SealedStateStore,
+) ([]byte, s3disk.SealedStateRevision) {
+	t.Helper()
+	data, revision, found, err := journal.Load(context.Background())
+	if err != nil || !found || len(data) == 0 || revision.IsZero() {
+		t.Fatalf("prepared journal state = found %v, bytes %d, revision %s, error %v", found, len(data), revision, err)
+	}
+	return data, revision
+}
+
+func assertNoRootRecoveryOperationalIO(
+	t *testing.T,
+	store *rootRecoveryRejectingCountingStore,
+	journal *rootRecoveryRejectingCountingJournal,
+	signer *rootRecoveryCountingSigner,
+	presigner *rootTestPresigner,
+) {
+	t.Helper()
+	if store.callCount() != 0 || journal.callCount() != 0 || signer.callCount() != 0 || presigner.callCount() != 0 {
+		t.Fatalf(
+			"unexpected I/O: Store=%d journal=%d signer=%d presigner=%d",
+			store.callCount(), journal.callCount(), signer.callCount(), presigner.callCount(),
+		)
+	}
+}
+
 func TestRootPublisherRecoveryPersistsPendingBeforeWriteAndRestartsWithoutBuildDependencies(t *testing.T) {
 	fixture := newRootPublisherFixture(t)
 	closure := fixture.publish(t, "recover-before-write")
@@ -1089,6 +1741,233 @@ func (*rootRecoveryNilContext) Done() <-chan struct{}       { return nil }
 func (*rootRecoveryNilContext) Err() error                  { return nil }
 func (*rootRecoveryNilContext) Value(any) any               { return nil }
 
+type rootRecoveryRejectingCountingStore struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (store *rootRecoveryRejectingCountingStore) Get(
+	context.Context,
+	string,
+	s3disk.GetOptions,
+) (s3disk.Object, error) {
+	store.recordCall()
+	return s3disk.Object{}, s3disk.ErrStoreUnavailable
+}
+
+func (store *rootRecoveryRejectingCountingStore) Head(context.Context, string) (s3disk.Version, error) {
+	store.recordCall()
+	return s3disk.Version{}, s3disk.ErrStoreUnavailable
+}
+
+func (store *rootRecoveryRejectingCountingStore) PutIfAbsent(
+	context.Context,
+	string,
+	[]byte,
+) (s3disk.Version, error) {
+	store.recordCall()
+	return s3disk.Version{}, s3disk.ErrStoreUnavailable
+}
+
+func (store *rootRecoveryRejectingCountingStore) CompareAndSwap(
+	context.Context,
+	string,
+	*s3disk.Version,
+	[]byte,
+) (s3disk.Version, error) {
+	store.recordCall()
+	return s3disk.Version{}, s3disk.ErrStoreUnavailable
+}
+
+func (store *rootRecoveryRejectingCountingStore) recordCall() {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.calls++
+}
+
+func (store *rootRecoveryRejectingCountingStore) callCount() int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.calls
+}
+
+type rootRecoveryCountingSigner struct {
+	delegate s3disk.ReferenceSigner
+	mu       sync.Mutex
+	calls    int
+}
+
+func (signer *rootRecoveryCountingSigner) RepositoryID() s3disk.RepositoryID {
+	return signer.delegate.RepositoryID()
+}
+
+func (signer *rootRecoveryCountingSigner) KeyID() string { return signer.delegate.KeyID() }
+
+func (signer *rootRecoveryCountingSigner) Sign(ctx context.Context, message []byte) ([]byte, error) {
+	signer.mu.Lock()
+	signer.calls++
+	signer.mu.Unlock()
+	return signer.delegate.Sign(ctx, message)
+}
+
+func (signer *rootRecoveryCountingSigner) callCount() int {
+	signer.mu.Lock()
+	defer signer.mu.Unlock()
+	return signer.calls
+}
+
+type rootRecoveryRejectingCountingJournal struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (journal *rootRecoveryRejectingCountingJournal) Load(
+	context.Context,
+) ([]byte, s3disk.SealedStateRevision, bool, error) {
+	journal.recordCall()
+	return nil, s3disk.SealedStateRevision{}, false, errors.New("test: unexpected recovery journal Load")
+}
+
+func (journal *rootRecoveryRejectingCountingJournal) CompareAndSwap(
+	context.Context,
+	*s3disk.SealedStateRevision,
+	[]byte,
+) (s3disk.SealedStateRevision, error) {
+	journal.recordCall()
+	return s3disk.SealedStateRevision{}, errors.New("test: unexpected recovery journal CompareAndSwap")
+}
+
+func (journal *rootRecoveryRejectingCountingJournal) recordCall() {
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	journal.calls++
+}
+
+func (journal *rootRecoveryRejectingCountingJournal) callCount() int {
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	return journal.calls
+}
+
+// rootRecoveryIgnoringContextJournal emulates a storage implementation which
+// finishes one Load after its caller has been canceled or its fixed
+// authorization has expired. Restore must recheck both boundaries itself.
+type rootRecoveryIgnoringContextJournal struct {
+	data       []byte
+	revision   s3disk.SealedStateRevision
+	found      bool
+	loadErr    error
+	afterLoad  func()
+	mu         sync.Mutex
+	loads      int
+	compareCAS int
+}
+
+func (journal *rootRecoveryIgnoringContextJournal) Load(
+	context.Context,
+) ([]byte, s3disk.SealedStateRevision, bool, error) {
+	journal.mu.Lock()
+	journal.loads++
+	data := bytes.Clone(journal.data)
+	revision := journal.revision
+	found := journal.found
+	loadErr := journal.loadErr
+	afterLoad := journal.afterLoad
+	journal.mu.Unlock()
+	if afterLoad != nil {
+		afterLoad()
+	}
+	return data, revision, found, loadErr
+}
+
+func (journal *rootRecoveryIgnoringContextJournal) CompareAndSwap(
+	context.Context,
+	*s3disk.SealedStateRevision,
+	[]byte,
+) (s3disk.SealedStateRevision, error) {
+	journal.mu.Lock()
+	journal.compareCAS++
+	journal.mu.Unlock()
+	return s3disk.SealedStateRevision{}, errors.New("test: unexpected recovery journal CompareAndSwap")
+}
+
+func (journal *rootRecoveryIgnoringContextJournal) callCount() int {
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	return journal.loads
+}
+
+func (journal *rootRecoveryIgnoringContextJournal) compareAndSwapCallCount() int {
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	return journal.compareCAS
+}
+
+type rootRecoveryConcurrentPrepareJournal struct {
+	base      *rootTestRecoveryJournal
+	ready     chan struct{}
+	mu        sync.Mutex
+	absent    int
+	witnesses [][]byte
+}
+
+func newRootRecoveryConcurrentPrepareJournal(base *rootTestRecoveryJournal) *rootRecoveryConcurrentPrepareJournal {
+	return &rootRecoveryConcurrentPrepareJournal{base: base, ready: make(chan struct{})}
+}
+
+func (journal *rootRecoveryConcurrentPrepareJournal) Load(
+	ctx context.Context,
+) ([]byte, s3disk.SealedStateRevision, bool, error) {
+	data, revision, found, err := journal.base.Load(ctx)
+	if err != nil || found {
+		return data, revision, found, err
+	}
+	journal.mu.Lock()
+	journal.absent++
+	if journal.absent == 2 {
+		close(journal.ready)
+	}
+	ready := journal.ready
+	journal.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, s3disk.SealedStateRevision{}, false, ctx.Err()
+	case <-ready:
+		return data, revision, false, nil
+	}
+}
+
+func (journal *rootRecoveryConcurrentPrepareJournal) CompareAndSwap(
+	ctx context.Context,
+	expected *s3disk.SealedStateRevision,
+	next []byte,
+) (s3disk.SealedStateRevision, error) {
+	record, target, err := decodeRootRecoveryRecord(next)
+	clear(target)
+	if err != nil {
+		return s3disk.SealedStateRevision{}, err
+	}
+	journal.mu.Lock()
+	journal.witnesses = append(journal.witnesses, bytes.Clone(record.ClientEncryptionWitness))
+	journal.mu.Unlock()
+	return journal.base.CompareAndSwap(ctx, expected, next)
+}
+
+func (journal *rootRecoveryConcurrentPrepareJournal) clientEncryptionWitnesses() [][]byte {
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	witnesses := make([][]byte, len(journal.witnesses))
+	for index := range journal.witnesses {
+		witnesses[index] = bytes.Clone(journal.witnesses[index])
+	}
+	return witnesses
+}
+
 var _ s3disk.SealedStateStore = (*rootTestRecoveryJournal)(nil)
 var _ s3disk.SealedStateStore = (*rootRecoveryLoadResultJournal)(nil)
 var _ s3disk.Store = (*rootRecoveryFaultStore)(nil)
+var _ s3disk.Store = (*rootRecoveryRejectingCountingStore)(nil)
+var _ s3disk.ReferenceSigner = (*rootRecoveryCountingSigner)(nil)
+var _ s3disk.SealedStateStore = (*rootRecoveryRejectingCountingJournal)(nil)
+var _ s3disk.SealedStateStore = (*rootRecoveryIgnoringContextJournal)(nil)
+var _ s3disk.SealedStateStore = (*rootRecoveryConcurrentPrepareJournal)(nil)

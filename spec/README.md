@@ -262,18 +262,28 @@ for the durable local intent.
 
 `RootPublisherRecovery.tla` is a smaller executable refinement focused on the
 same-share A-side recovery journal used by `RootPublisher`. Its durable state
-is `Committed{revision,targetDigest}` plus either no pending operation or one
+starts with the canonical revision-zero Prepared sentinel, then becomes
+`Committed{revision,targetDigest}` plus either no pending operation or one
 immutable `Pending{base,expectedBase,target,expiresAt}`. The remote S3 root is
 an append-only abstract CAS history. Each local write, and the independently
 journaled competing publisher write used to exercise a CAS loser, carries the
 exact durable intent that existed before that history entry was appended.
+The model starts after `PrepareRecovery` has successfully installed that
+sentinel; absent-state rejection, the initial journal CAS, response loss, and
+concurrent encrypted-witness candidates are covered by Go fault tests.
 
 The model separately exercises a received CAS response, an applied response
 whose reply is lost, a correctly journaled competitor winning the CAS,
 network and store failures, lower-revision replay, equal-revision/different-
 digest replay, and a crash/restart. A crash clears the volatile attempt,
-response, and proof while preserving the complete journal. Recovery may load
-only the exact pending target. Pending cannot be rewritten or cleared until a
+response, proof, and exact-bearer provenance while preserving the complete
+journal. Successful imported-bearer admission restores local authority only
+after the sealed identity is abstractly validated and has no journal or remote
+storage effect; one rejected attempt grants no authority. A later restore action
+represents a separate matching input rather than reclassifying the rejected
+one. While authority is absent, an advancing remote history can only be an
+independently journaled competitor write, never a local root write. Recovery
+may load only the exact pending target. Pending cannot be rewritten or cleared until a
 validated current remote successor has been proved; finalization adopts that
 successor, including a competitor winner. Committed revision is monotonic and
 an equal revision cannot change digest. The authorization expiry is fixed,
@@ -282,9 +292,13 @@ or after expiry.
 
 `RootPublisherRecovery.cfg` checks those safety obligations without timing
 assumptions. `RootPublisherRecoveryLiveness.cfg` adds only weak fairness for
-the recovery steps and environment stabilization. Its conditional liveness
-claim says an unresolved local pending intent eventually resolves when the
-network and store remain stable and the fixed authorization has not expired.
+validated bearer admission, the recovery steps, and environment stabilization.
+Its conditional liveness claim says an unresolved local pending intent
+eventually resolves when the network and store remain stable and the fixed
+authorization has not expired. Weak fairness of the abstract admission action
+also assumes that the matching original bearer and recovery key remain
+available; safety still holds when they are missing or rejected, but progress
+does not.
 Fault/replay injection stops after stabilization and the small model bounds
 crashes to one, so it does not silently claim progress through an infinite
 fault or crash schedule.
@@ -293,14 +307,18 @@ The abstraction assumes the durable journal presented after restart is the
 latest complete journal. Whole-journal rollback/replay, loss of the journal
 disk, torn persistence below the sealed-state-store contract, backup restore,
 and multi-site disaster recovery are outside the model and require separate
-operational and storage evidence.
+operational and storage evidence. The finite model treats successful admission
+as one abstract validation action; concrete URL syntax, bearer digest, namespace,
+fixed-expiry, security-flag, and encryption-witness mismatches are refined by Go
+fault tests rather than added as a state-space product. It likewise does not
+model the initial Prepared-file CAS itself.
 
 With the pinned TLC 1.8.0 jar and one worker, the checked bounds produce:
 
 | Configuration | Generated states | Distinct states | Depth |
 | --- | ---: | ---: | ---: |
-| `RootPublisherRecovery.cfg` | 407,241 | 69,525 | 22 |
-| `RootPublisherRecoveryLiveness.cfg` | 66,761 | 11,045 | 17 |
+| `RootPublisherRecovery.cfg` | 399,571 | 80,980 | 23 |
+| `RootPublisherRecoveryLiveness.cfg` | 65,015 | 12,820 | 18 |
 
 This publisher state machine models commit-advancing `Publish` intents. It does
 not model authentication-envelope-only `ResignReference` operations: an

@@ -324,11 +324,13 @@ func (publisher *RootPublisher) validateRootRecoveryRecord(ctx context.Context, 
 		}
 		clear(opened)
 	}
-	if record.Committed == nil {
-		if record.Pending == nil {
-			return fmt.Errorf("%w: persisted state has no committed or pending root", ErrRootRecoveryState)
+	if record.Committed == nil && record.Pending == nil {
+		if record.HighestRevision != 0 || len(target) != 0 {
+			return fmt.Errorf("%w: invalid prepared state", ErrRootRecoveryState)
 		}
-	} else {
+		return nil
+	}
+	if record.Committed != nil {
 		committed := record.Committed
 		if committed.Revision == 0 || committed.LogicalDigest.IsZero() || committed.ReferenceGeneration == 0 ||
 			committed.ReferenceCommit.IsZero() || validateRootVersion(s3disk.Version{
@@ -375,6 +377,153 @@ func (publisher *RootPublisher) validateRootRecoveryRecord(ctx context.Context, 
 		return fmt.Errorf("%w: pending target binding mismatch", ErrRootRecoveryState)
 	}
 	return nil
+}
+
+// PrepareRecovery durably binds this publisher's exact root bearer, share
+// identity, fixed authorization expiry, trust root, and client-encryption
+// profile before any root object needs to be written to S3. It is idempotent:
+// an existing valid prepared, pending, or committed record is left unchanged.
+//
+// Call this before persisting a resumable publishing-session manifest. The
+// resulting sealed record is what lets RestoreRootPublisher distinguish an
+// originally exact-GET capability from an arbitrary imported bearer after a
+// process restart. RecoveryJournal must be configured.
+func (publisher *RootPublisher) PrepareRecovery(ctx context.Context) error {
+	if publisher == nil {
+		return fmt.Errorf("%w: nil root publisher", s3disk.ErrStoreMisconfigured)
+	}
+	if !configuredInterface(ctx) {
+		return fmt.Errorf("presignedshare: recovery preparation context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if publisher.gate == nil || !publisher.rootCapability.Configured() ||
+		publisher.rootCapability.provenance != capabilityProvenanceExactGET ||
+		!configuredInterface(publisher.store) || !configuredInterface(publisher.verifier) {
+		return fmt.Errorf("%w: root publisher is not initialized", s3disk.ErrStoreMisconfigured)
+	}
+	if !configuredInterface(publisher.recoveryJournal) {
+		return fmt.Errorf("%w: recovery journal is required", ErrRootRecoveryState)
+	}
+	if !publisher.rootCapability.expiresAt.After(time.Now()) {
+		return fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+	authorizationCtx, cancelAuthorization := context.WithDeadline(ctx, publisher.rootCapability.expiresAt)
+	defer cancelAuthorization()
+	ctx = authorizationCtx
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-publisher.gate:
+	}
+	defer func() { publisher.gate <- struct{}{} }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !publisher.rootCapability.expiresAt.After(time.Now()) {
+		return fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+
+	loaded, err := publisher.loadRootRecovery(ctx)
+	if err != nil {
+		return err
+	}
+	defer loaded.clear()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !publisher.rootCapability.expiresAt.After(time.Now()) {
+		return fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+	if loaded.found {
+		return nil
+	}
+	prepared, err := publisher.saveRootRecovery(ctx, loaded, loaded.record, nil)
+	prepared.clear()
+	if errors.Is(err, ErrRootPublishConflict) {
+		// A second publisher may have won the first CAS with a logically
+		// equivalent but byte-distinct encrypted witness. Re-read and accept any
+		// state which passes the complete identity and recovery validation; do
+		// not weaken saveRootRecovery's exact response-loss reconciliation.
+		observed, loadErr := publisher.loadRootRecovery(ctx)
+		if loadErr != nil {
+			return loadErr
+		}
+		defer observed.clear()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			return fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+		}
+		if observed.found {
+			return nil
+		}
+	}
+	if err == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			return fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+		}
+	}
+	return err
+}
+
+// RestoreRootPublisher authenticates an existing sealed recovery journal
+// before promoting an imported root bearer back to exact-GET provenance. It
+// performs no root Store I/O and never mints, signs, or writes S3 data during
+// construction. RecoveryJournal is mandatory and must already contain a valid
+// prepared, pending, or committed record created by an exact publisher.
+//
+// RootCapability must come from ParseBearer. Ordinary in-process capabilities
+// continue to use NewRootPublisher. Any missing, corrupt, expired, or
+// identity-mismatched recovery state fails closed.
+func RestoreRootPublisher(ctx context.Context, config RootPublisherConfig) (*RootPublisher, error) {
+	if !configuredInterface(ctx) {
+		return nil, fmt.Errorf("presignedshare: root restore context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !configuredInterface(config.RecoveryJournal) {
+		return nil, fmt.Errorf("%w: recovery journal is required", ErrRootRecoveryState)
+	}
+	if config.RootCapability.provenance != capabilityProvenanceImportedBearer {
+		return nil, fmt.Errorf("%w: restore requires an imported root bearer", ErrRootRecoveryState)
+	}
+	if !s3disk.IsOfflineReferenceVerifier(config.Verifier) {
+		return nil, fmt.Errorf("%w: restore requires an offline reference verifier", ErrUntrustedBundle)
+	}
+
+	publisher, err := newRootPublisher(config, true)
+	if err != nil {
+		return nil, err
+	}
+	authorizationCtx, cancelAuthorization := context.WithDeadline(ctx, publisher.rootCapability.expiresAt)
+	defer cancelAuthorization()
+	loaded, err := publisher.loadRootRecovery(authorizationCtx)
+	if err != nil {
+		return nil, err
+	}
+	defer loaded.clear()
+	if !loaded.found {
+		return nil, fmt.Errorf("%w: prepared recovery state is absent", ErrRootRecoveryState)
+	}
+	if err := authorizationCtx.Err(); err != nil {
+		return nil, err
+	}
+	if !publisher.rootCapability.expiresAt.After(time.Now()) {
+		return nil, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+
+	// This is the sole provenance upgrade. loadRootRecovery has already checked
+	// the sealed identity, exact bearer digest, fixed expiry, trust root,
+	// namespace, security flags, encryption witness, and any pending target.
+	publisher.rootCapability.provenance = capabilityProvenanceExactGET
+	return publisher, nil
 }
 
 func rootCapabilityRecoveryDigest(capability Capability) (s3disk.Digest, error) {

@@ -257,6 +257,18 @@ locally deadline-bounded by the share's original fixed authorization expiry and
 cannot extend it. A write already in flight at that boundary may still commit
 remotely and is reconciled from the exact pending WAL target.
 
+If the surrounding application also persists A's share session, call
+`RootPublisher.PrepareRecovery` before marking that session resumable or
+exposing its handoff. This installs an identity-bound, revision-zero Prepared
+record without S3 I/O. After a crash, import the original root bearer with
+`ParseBearer` and pass it to `RestoreRootPublisher`; restore authenticates the
+existing sealed record and its fixed expiry before it privately re-admits that
+bearer for publication. A missing, corrupt, expired, or mismatched record fails
+closed without creating recovery state or touching the root Store. Ordinary
+`NewRootPublisher` and bundle builders continue to reject imported bearers.
+Restore requires the built-in offline reference verifier so recovery validation
+cannot invoke an application-defined network verifier.
+
 The journal is a write-ahead log and local monotonic anchor, not an independent
 freshness oracle. Replaying both the complete journal and its matching old S3
 root remains indistinguishable without a separately protected monotonic backup,
