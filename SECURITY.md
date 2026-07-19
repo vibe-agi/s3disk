@@ -128,6 +128,16 @@ dates in customer-facing terms.
   The built-in CLI additionally requires an owner/ACL-validated parent
   hierarchy and a current-owner regular file with exact mode `0600`; unsupported
   local ACL platforms fail closed.
+- `publisherstate.RecoveryKey` is a separate 256-bit A-side recovery secret;
+  never derive it from or replace it with the client share key, an S3 access
+  key, customer content, or a password. Its built-in Protector provides a
+  bounded HKDF-SHA256/AES-256-GCM envelope with key-ID and caller-binding
+  authentication, but no storage, KMS, CAS, freshness, rollback protection,
+  backup, or zeroization. The CLI does not yet persist its recovery state
+  through this API. A product integrating it must keep the recovery key in an
+  independently protected key file, OS keystore, or KMS and must add a durable
+  monotonic journal around sealed values; copying an old valid envelope remains
+  a successful replay at the cryptographic layer.
 - Treat each prefix, `RepositoryID`, profile, and share key as one storage
   domain. Do not mix encrypted and plaintext repositories, different profiles,
   or ciphertext copied across prefixes. `InitializeRepository` creates or

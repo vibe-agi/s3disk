@@ -73,9 +73,13 @@ for a storage component that handles customer source data.
   or authenticate it as part of root adoption.
   There is no repository-level KEK or repository-dedup mode and no certified key
   rotation or migration path. The local `DiskCache` also remains plaintext. The
-  current CLI does not persist/wrap the share key, publisher private signing key,
-  or root capability and cannot resume the same share after A crashes; secure
-  recovery, backup, and zeroization remain product work.
+  `publisherstate` now provides an independently keyed, bounded AES-256-GCM
+  envelope for protecting those recovery secrets, but it intentionally does
+  not provide storage freshness or rollback detection. The current CLI does
+  not yet persist the share key, publisher private signing key, or root
+  capability through that envelope and cannot resume the same share after A
+  crashes; durable CAS state, recovery-key provisioning, backup, and
+  zeroization remain product work.
 
 <!-- RELEASE-BLOCKER: trust-root-lifecycle -->
 

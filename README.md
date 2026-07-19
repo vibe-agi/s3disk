@@ -27,6 +27,9 @@ which it was opened.
   compatible services.
 - `github.com/vibe-agi/s3disk/presignedshare`: expiring, signed root bundles
   and a credential-free exact-key GET reader whose only runtime peer is S3.
+- `github.com/vibe-agi/s3disk/publisherstate`: bounded cryptographic envelopes
+  for A-side recovery state, using an independent recovery key. It deliberately
+  does not provide persistence, CAS, freshness, rollback detection, or a KMS.
 - `github.com/vibe-agi/s3disk/memstore`: in-memory store for tests.
 - `github.com/vibe-agi/s3disk/mount`: read-only FUSE adapter on Linux, macOS,
   and FreeBSD build targets. See [Compatibility](docs/COMPATIBILITY.md) before
