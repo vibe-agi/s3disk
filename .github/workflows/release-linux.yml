@@ -1,0 +1,621 @@
+name: Commercial Linux release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_version:
+        description: "Unpublished v0/v1 SemVer to certify (for example v1.2.3)"
+        required: true
+        type: string
+      candidate_commit:
+        description: "Full lowercase commit SHA; must equal the selected branch head"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commercial-release-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.26.5"
+  GOVULNCHECK_VERSION: "v1.6.0"
+  GOWORK: "off"
+  GOFLAGS: "-mod=readonly"
+  GOTOOLCHAIN: "local"
+  S3DISK_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'candidate' || 'release' }}
+  S3DISK_RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_version || github.ref_name }}
+  S3DISK_RELEASE_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_commit || github.sha }}
+
+jobs:
+  native-release-evidence:
+    name: Release native tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.S3DISK_RELEASE_COMMIT }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind workflow event to the exact release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$S3DISK_RELEASE_COMMIT" ]]
+          if [[ "$S3DISK_RELEASE_MODE" == candidate ]]; then
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+            [[ "$GITHUB_REF_TYPE" == branch ]]
+            [[ "$S3DISK_RELEASE_COMMIT" == "$GITHUB_SHA" ]] || {
+              echo "candidate_commit must equal the selected branch head $GITHUB_SHA" >&2
+              exit 1
+            }
+          else
+            [[ "$GITHUB_EVENT_NAME" == push ]]
+            [[ "$GITHUB_REF_TYPE" == tag ]]
+            [[ "$S3DISK_RELEASE_VERSION" == "$GITHUB_REF_NAME" ]]
+          fi
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Run and record native release tests
+        shell: bash
+        env:
+          GOWORK: "off"
+          GOFLAGS: "-mod=readonly"
+        run: |
+          set -euo pipefail
+          [[ "$(go env GOVERSION)" == "go$GO_VERSION" ]] || {
+            echo "native release job requires go$GO_VERSION" >&2
+            exit 1
+          }
+          mkdir -p artifacts
+          {
+            printf 'release_mode=%s\n' "$S3DISK_RELEASE_MODE"
+            printf 'release_version=%s\n' "$S3DISK_RELEASE_VERSION"
+            printf 'expected_commit=%s\n' "$S3DISK_RELEASE_COMMIT"
+            git rev-parse HEAD
+            git tag --points-at HEAD
+            go version
+            go env GOOS GOARCH GOVERSION GOWORK GOFLAGS
+            uname -a
+          } 2>&1 | tee artifacts/environment.log
+          go test ./... -count=1 -timeout=120s -json 2>&1 | tee artifacts/native-tests.json
+      - name: Require Darwin trust-state ACL tests
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          [[ "$(go env CGO_ENABLED)" == 1 ]] || {
+            echo "Darwin trust-state tests require CGO_ENABLED=1" >&2
+            exit 1
+          }
+          ./scripts/run-required-go-test.sh . TestDarwinTrustStateRevalidatesExtendedACLs 60s
+          ./scripts/run-required-go-test.sh . TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
+      - name: Require Windows trust-state security tests
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./scripts/run-required-go-test.sh . TestFileWatermarkStoreRejectsWindowsWritableDirectoryACL 60s
+          ./scripts/run-required-go-test.sh . TestFileWatermarkStoreRejectsWindowsDirectoryReparsePoint 60s
+      - name: Archive successful native release evidence
+        if: success()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-native-success-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          # GitHub caps public-repository retention at 90 days. The release
+          # owner must export this evidence to the commercial archive.
+          retention-days: 90
+      - name: Archive failed native release diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-native-failed-diagnostics-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          # GitHub caps public-repository retention at 90 days. The release
+          # owner must export this evidence to the commercial archive.
+          retention-days: 90
+
+  linux-fuse-release-gate:
+    name: Linux FUSE commercial release gate
+    needs: native-release-evidence
+    # These labels MUST select an owner-controlled, one-job ephemeral runner
+    # that is destroyed after the job. It must expose /dev/fuse and a dedicated
+    # Docker daemon through a per-job socket below RUNNER_TEMP. A persistent
+    # runner, host daemon, shared Docker socket or ad-hoc apt/go install is not
+    # acceptable commercial release evidence.
+    runs-on: [self-hosted, linux, s3disk-release, fuse]
+    # Configure this environment with required reviewers, prevent self-review
+    # and administrator bypass. Expose the signer/verifier paths and both
+    # runner-isolation acknowledgements as protected variables. The paths must
+    # resolve to root-owned files below root-owned, non-writable directories.
+    environment: commercial-release
+    env:
+      S3DISK_RELEASE_SIGNERS_FILE: ${{ vars.S3DISK_RELEASE_SIGNERS_FILE }}
+      S3DISK_RELEASE_OPENPGP_PROGRAM: ${{ vars.S3DISK_RELEASE_OPENPGP_PROGRAM }}
+      S3DISK_RELEASE_RUNNER_EPHEMERAL: ${{ vars.S3DISK_RELEASE_RUNNER_EPHEMERAL }}
+      S3DISK_RELEASE_DOCKER_ISOLATED: ${{ vars.S3DISK_RELEASE_DOCKER_ISOLATED }}
+    timeout-minutes: 60
+    steps:
+      - name: Require an ephemeral runner and isolated Docker daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_uid=$(id -u)
+          [[ "$runner_uid" != 0 ]] || {
+            echo "commercial release jobs must run as a non-root user" >&2
+            exit 1
+          }
+          [[ "$S3DISK_RELEASE_RUNNER_EPHEMERAL" == true ]] || {
+            echo "commercial release runner must be declared one-job ephemeral" >&2
+            exit 1
+          }
+          [[ "$S3DISK_RELEASE_DOCKER_ISOLATED" == true ]] || {
+            echo "commercial release Docker daemon must be declared job-isolated" >&2
+            exit 1
+          }
+          case "${DOCKER_HOST:-}" in
+            unix:///*) docker_socket=${DOCKER_HOST#unix://} ;;
+            *)
+              echo "DOCKER_HOST must select an absolute per-job Unix socket" >&2
+              exit 1
+              ;;
+          esac
+          [[ -S "$docker_socket" ]] || {
+            echo "DOCKER_HOST does not resolve to a Unix socket" >&2
+            exit 1
+          }
+          runner_temp_real=$(realpath -e -- "$RUNNER_TEMP")
+          docker_socket_real=$(realpath -e -- "$docker_socket")
+          case "$docker_socket_real" in
+            "$runner_temp_real"/*) ;;
+            *)
+              echo "Docker socket must resolve below RUNNER_TEMP" >&2
+              exit 1
+              ;;
+          esac
+          socket_parent=$(dirname -- "$docker_socket_real")
+          socket_owner=$(stat -c '%u' -- "$docker_socket_real")
+          socket_mode=$(stat -c '%a' -- "$docker_socket_real")
+          [[ "$socket_owner" == "$runner_uid" ]] || {
+            echo "Docker socket must be owned by the non-root runner user" >&2
+            exit 1
+          }
+          (( (8#$socket_mode & 0077) == 0 )) || {
+            echo "Docker socket must not grant group or other permissions" >&2
+            exit 1
+          }
+          inspected_directory=$socket_parent
+          while :; do
+            directory_owner=$(stat -c '%u' -- "$inspected_directory")
+            directory_mode=$(stat -c '%a' -- "$inspected_directory")
+            [[ "$directory_owner" == "$runner_uid" ]] || {
+              echo "every Docker socket directory below RUNNER_TEMP must be runner-owned" >&2
+              exit 1
+            }
+            (( (8#$directory_mode & 0022) == 0 )) || {
+              echo "Docker socket directories must not be group- or world-writable" >&2
+              exit 1
+            }
+            [[ "$inspected_directory" != "$runner_temp_real" ]] || break
+            inspected_directory=$(dirname -- "$inspected_directory")
+          done
+          for shared_socket in /var/run/docker.sock /run/docker.sock; do
+            [[ ! -S "$shared_socket" ]] || {
+              echo "shared Docker socket is forbidden: $shared_socket" >&2
+              exit 1
+            }
+          done
+          docker version >/dev/null
+          docker_security_options=$(docker info --format '{{json .SecurityOptions}}')
+          grep -Fq 'name=rootless' <<<"$docker_security_options" || {
+            echo "commercial release Docker daemon must run in rootless mode" >&2
+            exit 1
+          }
+      - name: Check out exact release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.S3DISK_RELEASE_COMMIT }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind workflow event to the exact release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$S3DISK_RELEASE_COMMIT" ]]
+          if [[ "$S3DISK_RELEASE_MODE" == candidate ]]; then
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+            [[ "$GITHUB_REF_TYPE" == branch ]]
+            [[ "$S3DISK_RELEASE_COMMIT" == "$GITHUB_SHA" ]] || {
+              echo "candidate_commit must equal the selected branch head $GITHUB_SHA" >&2
+              exit 1
+            }
+          else
+            [[ "$GITHUB_EVENT_NAME" == push ]]
+            [[ "$GITHUB_REF_TYPE" == tag ]]
+            [[ "$S3DISK_RELEASE_VERSION" == "$GITHUB_REF_NAME" ]]
+          fi
+      - name: Record release environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(go env GOVERSION)" == "go$GO_VERSION" ]] || {
+            echo "Linux release gate requires go$GO_VERSION" >&2
+            exit 1
+          }
+          evidence_dir="$RUNNER_TEMP/s3disk-release-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ ! -e "$evidence_dir" ]] || {
+            echo "refusing stale release evidence directory: $evidence_dir" >&2
+            exit 1
+          }
+          mkdir "$evidence_dir"
+          chmod 700 "$evidence_dir"
+          echo "S3DISK_RELEASE_EVIDENCE_DIR=$evidence_dir" >>"$GITHUB_ENV"
+          record_go_env_digest() {
+            local name=$1
+            local value digest
+            value=$(go env "$name")
+            digest=$(printf '%s' "$value" | sha256sum | awk '{ print $1 }')
+            printf '%s_sha256=%s\n' "$name" "$digest"
+          }
+          {
+            printf 'release_mode=%s\n' "$S3DISK_RELEASE_MODE"
+            printf 'release_version=%s\n' "$S3DISK_RELEASE_VERSION"
+            printf 'expected_commit=%s\n' "$S3DISK_RELEASE_COMMIT"
+            git rev-parse HEAD
+            git show -s --format=fuller HEAD
+            git tag --points-at HEAD
+            git status --porcelain=v1 --untracked-files=all --ignored=matching
+            go version
+            go env GOOS GOARCH GOVERSION
+            # Proxy URLs can contain userinfo and the private-module settings
+            # can reveal customer/internal names. Bind evidence to their exact
+            # values without archiving the values themselves.
+            for go_env_name in GOPROXY GOSUMDB GONOSUMDB GOPRIVATE GOWORK GOFLAGS; do
+              record_go_env_digest "$go_env_name"
+            done
+            go list -m all
+            govulncheck -version
+            docker version
+            docker compose version
+            java -version
+            uname -a
+            test -c /dev/fuse
+            sha256sum testdata/minio.compose.yml
+          } 2>&1 | tee "$evidence_dir/release-environment.log"
+      - name: Run fail-closed commercial release gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir=${S3DISK_RELEASE_EVIDENCE_DIR:?}
+          expected_evidence_dir="$RUNNER_TEMP/s3disk-release-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ "$evidence_dir" == "$expected_evidence_dir" && -d "$evidence_dir" && ! -L "$evidence_dir" ]]
+          ./scripts/check-release.sh 2>&1 | tee "$evidence_dir/release-gate.log"
+      - name: Require successful release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir=${S3DISK_RELEASE_EVIDENCE_DIR:?}
+          expected_evidence_dir="$RUNNER_TEMP/s3disk-release-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ "$evidence_dir" == "$expected_evidence_dir" && -d "$evidence_dir" && ! -L "$evidence_dir" ]]
+          checksum_file="$evidence_dir/release-evidence.sha256"
+          success_file="$evidence_dir/release-gate-success.json"
+          reference_file="$evidence_dir/release-reference.json"
+          environment_log="$evidence_dir/release-environment.log"
+          gate_log="$evidence_dir/release-gate.log"
+          [[ -f "$checksum_file" && ! -L "$checksum_file" ]]
+          [[ -f "$success_file" && ! -L "$success_file" ]]
+          [[ -f "$reference_file" && ! -L "$reference_file" ]]
+          [[ -f "$environment_log" && ! -L "$environment_log" ]]
+          [[ -f "$gate_log" && ! -L "$gate_log" ]]
+          if find "$evidence_dir" -type l -print -quit | grep -q .; then
+            echo "release evidence must not contain symbolic links" >&2
+            exit 1
+          fi
+          checksum_lines=$(awk 'END { print NR }' "$checksum_file")
+          if [[ "$S3DISK_RELEASE_MODE" == candidate ]]; then
+            checksum_matches=$(grep -Ec '^[0-9a-f]{64}  (release-reference\.json|release-gate-success\.json)$' "$checksum_file" || true)
+            [[ "$checksum_lines" == 2 && "$checksum_matches" == 2 ]]
+            [[ "$(grep -Ec '  release-reference\.json$' "$checksum_file" || true)" == 1 ]]
+            [[ "$(grep -Ec '  release-gate-success\.json$' "$checksum_file" || true)" == 1 ]]
+          else
+            checksum_matches=$(grep -Ec '^[0-9a-f]{64}  (release-reference\.json|release-tag-verification\.status|release-gate-success\.json)$' "$checksum_file" || true)
+            [[ "$checksum_lines" == 3 && "$checksum_matches" == 3 ]]
+            [[ "$(grep -Ec '  release-reference\.json$' "$checksum_file" || true)" == 1 ]]
+            [[ "$(grep -Ec '  release-tag-verification\.status$' "$checksum_file" || true)" == 1 ]]
+            [[ "$(grep -Ec '  release-gate-success\.json$' "$checksum_file" || true)" == 1 ]]
+          fi
+          (cd "$evidence_dir" && sha256sum --check --strict release-evidence.sha256)
+          jq -e \
+            --arg mode "$S3DISK_RELEASE_MODE" \
+            --arg version "$S3DISK_RELEASE_VERSION" \
+            --arg commit "$S3DISK_RELEASE_COMMIT" \
+            'type == "object" and
+             .schema_version == 1 and
+             .mode == $mode and
+             .version == $version and
+             .commit == $commit and
+             (.tree | type == "string") and
+             (.tree | test("^([0-9a-f]{40}|[0-9a-f]{64})$"))' \
+            "$success_file" >/dev/null
+          success_tree=$(jq -r '.tree' "$success_file")
+          jq -e \
+            --arg mode "$S3DISK_RELEASE_MODE" \
+            --arg version "$S3DISK_RELEASE_VERSION" \
+            --arg commit "$S3DISK_RELEASE_COMMIT" \
+            --arg tree "$success_tree" \
+            'type == "object" and
+             .schema_version == 2 and
+             .mode == $mode and .version == $version and
+             .commit == $commit and .tree == $tree and
+             (if $mode == "candidate" then
+                .tag_object == "" and .signer_scheme == "" and
+                .signer_signing_fingerprint == "" and
+                .signer_primary_fingerprint == "" and
+                .signature_created_unix == "" and
+                .signer_allowlist_sha256 == "" and
+                .openpgp_verifier_sha256 == ""
+              else
+                (.tag_object | test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
+                .signer_scheme == "openpgp" and
+                (.signer_signing_fingerprint | test("^([0-9A-F]{40}|[0-9A-F]{64})$")) and
+                (.signer_primary_fingerprint | test("^([0-9A-F]{40}|[0-9A-F]{64})$")) and
+                (.signature_created_unix | test("^[1-9][0-9]*$")) and
+                (.signer_allowlist_sha256 | test("^[0-9a-f]{64}$")) and
+                (.openpgp_verifier_sha256 | test("^[0-9a-f]{64}$"))
+              end)' \
+            "$reference_file" >/dev/null
+
+          workflow_manifest_tmp=$(mktemp "$evidence_dir/.workflow-evidence.XXXXXX")
+          workflow_files=(
+            release-reference.json
+            release-gate-success.json
+            release-evidence.sha256
+            release-environment.log
+            release-gate.log
+          )
+          if [[ "$S3DISK_RELEASE_MODE" == release ]]; then
+            workflow_files+=(release-tag-verification.status)
+          fi
+          (cd "$evidence_dir" && sha256sum "${workflow_files[@]}") >"$workflow_manifest_tmp"
+          mv "$workflow_manifest_tmp" "$evidence_dir/workflow-evidence.sha256"
+
+          expected_count=6
+          if [[ "$S3DISK_RELEASE_MODE" == release ]]; then
+            expected_count=7
+          fi
+          observed_count=0
+          while IFS= read -r -d '' evidence_path; do
+            observed_count=$((observed_count + 1))
+            [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || {
+              echo "release evidence contains a non-regular entry: $evidence_path" >&2
+              exit 1
+            }
+            evidence_name=${evidence_path##*/}
+            case "$evidence_name" in
+              release-reference.json|release-gate-success.json|release-evidence.sha256|release-environment.log|release-gate.log|workflow-evidence.sha256)
+                ;;
+              release-tag-verification.status)
+                [[ "$S3DISK_RELEASE_MODE" == release ]] || {
+                  echo "candidate evidence unexpectedly contains tag verification" >&2
+                  exit 1
+                }
+                ;;
+              *)
+                echo "release evidence contains an unexpected entry: $evidence_name" >&2
+                exit 1
+                ;;
+            esac
+          done < <(find "$evidence_dir" -mindepth 1 -maxdepth 1 -print0)
+          [[ "$observed_count" == "$expected_count" ]] || {
+            echo "release evidence contains $observed_count entries; want exactly $expected_count" >&2
+            exit 1
+          }
+      - name: Archive successful release evidence
+        if: success()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: commercial-release-success-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/s3disk-release-evidence-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          # Export to the long-lived commercial evidence archive before expiry.
+          retention-days: 90
+      - name: Archive failed release diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: commercial-release-failed-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/s3disk-release-evidence-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          # Export to the long-lived commercial evidence archive before expiry.
+          retention-days: 90
+
+  candidate-promotion-approval:
+    name: Approve certified candidate for promotion
+    needs: linux-fuse-release-gate
+    if: ${{ success() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Configure required reviewers, prevent self-review and disable
+    # administrator bypass. This approval occurs only after the untrusted
+    # candidate has completed the isolated Linux release gate.
+    environment: commercial-release-promotion
+    env:
+      EXPECTED_RELEASE_VERSION: ${{ inputs.candidate_version }}
+      EXPECTED_RELEASE_COMMIT: ${{ inputs.candidate_commit }}
+      SOURCE_ARTIFACT_NAME: commercial-release-success-${{ github.sha }}-${{ github.run_attempt }}
+      APPROVED_ARTIFACT_NAME: approved-release-candidate-${{ github.sha }}-${{ github.run_attempt }}
+    steps:
+      - name: Download successful release evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.SOURCE_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/s3disk-approved-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Validate candidate evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/s3disk-approved-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          checksum_file="$evidence_dir/release-evidence.sha256"
+          success_file="$evidence_dir/release-gate-success.json"
+          reference_file="$evidence_dir/release-reference.json"
+          workflow_manifest="$evidence_dir/workflow-evidence.sha256"
+
+          [[ "$EXPECTED_RELEASE_VERSION" =~ ^v(0|1)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "candidate_version is not canonical v0/v1 SemVer" >&2
+            exit 1
+          }
+          if [[ "$EXPECTED_RELEASE_VERSION" == *-* ]]; then
+            prerelease=${EXPECTED_RELEASE_VERSION#*-}
+            IFS=. read -r -a prerelease_identifiers <<<"$prerelease"
+            for identifier in "${prerelease_identifiers[@]}"; do
+              if [[ "$identifier" =~ ^[0-9]+$ && "$identifier" != 0 && "$identifier" == 0* ]]; then
+                echo "numeric prerelease identifiers must not have leading zeroes" >&2
+                exit 1
+              fi
+            done
+          fi
+          [[ "$EXPECTED_RELEASE_COMMIT" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || {
+            echo "candidate_commit must be a full lowercase commit object ID" >&2
+            exit 1
+          }
+          [[ "$EXPECTED_RELEASE_COMMIT" == "$GITHUB_SHA" ]] || {
+            echo "candidate_commit no longer matches the dispatched branch head" >&2
+            exit 1
+          }
+          [[ -f "$checksum_file" && ! -L "$checksum_file" ]] || {
+            echo "missing regular release-evidence.sha256" >&2
+            exit 1
+          }
+          [[ -f "$success_file" && ! -L "$success_file" ]] || {
+            echo "missing regular release-gate-success.json" >&2
+            exit 1
+          }
+          [[ -f "$reference_file" && ! -L "$reference_file" ]] || {
+            echo "missing regular release-reference.json" >&2
+            exit 1
+          }
+          [[ -f "$workflow_manifest" && ! -L "$workflow_manifest" ]] || {
+            echo "missing regular workflow-evidence.sha256" >&2
+            exit 1
+          }
+          if find "$evidence_dir" -type l -print -quit | grep -q .; then
+            echo "release evidence must not contain symbolic links" >&2
+            exit 1
+          fi
+          observed_count=0
+          while IFS= read -r -d '' evidence_path; do
+            observed_count=$((observed_count + 1))
+            [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || {
+              echo "candidate evidence contains a non-regular entry: $evidence_path" >&2
+              exit 1
+            }
+            evidence_name=${evidence_path##*/}
+            case "$evidence_name" in
+              release-reference.json|release-gate-success.json|release-evidence.sha256|release-environment.log|release-gate.log|workflow-evidence.sha256)
+                ;;
+              *)
+                echo "candidate evidence contains an unexpected entry: $evidence_name" >&2
+                exit 1
+                ;;
+            esac
+          done < <(find "$evidence_dir" -mindepth 1 -maxdepth 1 -print0)
+          [[ "$observed_count" == 6 ]] || {
+            echo "candidate evidence contains $observed_count entries; want exactly 6" >&2
+            exit 1
+          }
+
+          checksum_lines=$(awk 'END { print NR }' "$checksum_file")
+          checksum_matches=$(grep -Ec '^[0-9a-f]{64}  (release-reference\.json|release-gate-success\.json)$' "$checksum_file" || true)
+          [[ "$checksum_lines" == 2 && "$checksum_matches" == 2 ]] || {
+            echo "candidate checksum manifest must contain exactly the two approved relative paths" >&2
+            exit 1
+          }
+          [[ "$(grep -Ec '  release-reference\.json$' "$checksum_file" || true)" == 1 ]]
+          [[ "$(grep -Ec '  release-gate-success\.json$' "$checksum_file" || true)" == 1 ]]
+          (
+            cd "$evidence_dir"
+            sha256sum --check --strict release-evidence.sha256
+          )
+          workflow_checksum_lines=$(awk 'END { print NR }' "$workflow_manifest")
+          workflow_checksum_matches=$(grep -Ec \
+            '^[0-9a-f]{64}  (release-reference\.json|release-gate-success\.json|release-evidence\.sha256|release-environment\.log|release-gate\.log)$' \
+            "$workflow_manifest" || true)
+          [[ "$workflow_checksum_lines" == 5 && "$workflow_checksum_matches" == 5 ]] || {
+            echo "workflow evidence manifest has unexpected paths" >&2
+            exit 1
+          }
+          for workflow_path in \
+            release-reference.json release-gate-success.json \
+            release-evidence.sha256 release-environment.log release-gate.log
+          do
+            [[ "$(grep -Ec "  ${workflow_path//./\\.}$" "$workflow_manifest" || true)" == 1 ]]
+          done
+          (cd "$evidence_dir" && sha256sum --check --strict workflow-evidence.sha256)
+
+          jq -e \
+            --arg version "$EXPECTED_RELEASE_VERSION" \
+            --arg commit "$EXPECTED_RELEASE_COMMIT" \
+            'type == "object" and
+             .schema_version == 1 and
+             .mode == "candidate" and
+             .version == $version and
+             .commit == $commit and
+             (.tree | type == "string") and
+             (.tree | test("^([0-9a-f]{40}|[0-9a-f]{64})$"))' \
+            "$success_file" >/dev/null
+          success_tree=$(jq -r '.tree' "$success_file")
+          jq -e \
+            --arg version "$EXPECTED_RELEASE_VERSION" \
+            --arg commit "$EXPECTED_RELEASE_COMMIT" \
+            --arg tree "$success_tree" \
+            'type == "object" and
+             .schema_version == 2 and .mode == "candidate" and
+             .version == $version and .commit == $commit and .tree == $tree and
+             .tag_object == "" and .signer_scheme == "" and
+             .signer_signing_fingerprint == "" and
+             .signer_primary_fingerprint == "" and
+             .signature_created_unix == "" and
+             .signer_allowlist_sha256 == "" and
+             .openpgp_verifier_sha256 == ""' \
+            "$reference_file" >/dev/null
+
+          evidence_manifest_sha=$(sha256sum "$workflow_manifest" | awk '{ print $1 }')
+          jq -n \
+            --arg version "$EXPECTED_RELEASE_VERSION" \
+            --arg commit "$EXPECTED_RELEASE_COMMIT" \
+            --arg tree "$(jq -r '.tree' "$success_file")" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg workflow_evidence_sha256 "$evidence_manifest_sha" \
+            '{schema_version: 1,
+              mode: "candidate",
+              version: $version,
+              commit: $commit,
+              tree: $tree,
+              source_run_id: $run_id,
+              source_run_attempt: $run_attempt,
+              workflow_evidence_sha256: $workflow_evidence_sha256}' \
+            >"$evidence_dir/commercial-release-promotion.json"
+      - name: Archive approved release candidate
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.APPROVED_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/s3disk-approved-candidate-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          # Export to the long-lived commercial evidence archive before expiry.
+          retention-days: 90

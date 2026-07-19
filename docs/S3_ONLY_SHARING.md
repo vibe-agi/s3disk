@@ -1,0 +1,355 @@
+# S3-only expiring sharing
+
+This document defines the credential and network boundary for an expiring
+share. It is a protocol requirement, not an optional deployment topology.
+
+## Non-negotiable boundary
+
+After B receives the initial share material, S3 is the only runtime medium
+between publisher A and readers B/C/D. A reader never calls A, an authorization
+broker, a callback endpoint, or another control-plane service. It does not need
+network reachability to A.
+
+The initial handoff is deliberately out of band. It contains the secret root
+GET bearer, a random 256-bit client-encryption key for this share, and bindings
+such as repository prefix, signed-reference key, share ID, `RepositoryID`,
+publisher verification key configuration, and trusted checkpoint. It contains
+no `SecretAccessKey`, credential provider, or reusable SigV4 signer, although
+the root bearer can expose an access-key ID and temporary session token. The
+entire handoff is secret material; the product embedding this library owns its
+private authenticated delivery. Extending a share requires a new key, handoff,
+and remount; it is not an in-band renewal protocol.
+
+The data flow is:
+
+1. A creates a dedicated random share prefix and encryption key, then publishes
+   the selected projection as encrypted immutable objects with keyed opaque
+   physical IDs and advances its encrypted authenticated channel reference.
+2. A resolves the exact object closure for that reference, creates exact-key
+   presigned `GetObject` capabilities with one fixed absolute expiry, signs the
+   capability bundle, encrypts it, and conditionally creates or replaces one
+   mutable ciphertext root object in S3.
+3. B polls the same root presigned URL with conditional `GET`, decrypts the root
+   with the handed-off share key, and verifies its signature. The bundle
+   contains only exact-key GET capabilities for the current closure.
+4. B decrypts manifests through those S3 URLs and fetches and decrypts a file
+   chunk only when a caller reads bytes intersecting that chunk.
+5. A publishes later revisions by replacing the same encrypted S3 root object.
+   B learns them through S3 polling; no direct A-to-B notification exists or is
+   needed.
+
+For the automatic A-side chain, pass the `Snapshot` returned by
+`Publisher.PublishSelected` to
+`RootPublisher.CreatePublishedSnapshot`. For continuous publication, call
+`RootPublisher.UpdatePublishedSnapshot` from `WatchOptions.AfterPublished`.
+That hook is acknowledged only after the root update succeeds; failure is
+reported and the same generation is retried by reconciliation. The helper
+re-resolves `signed-refs/v1` with the configured verifier and requires the
+generation, commit, root digest, and publication time to equal the Publisher
+result before it can mint any object capabilities.
+
+B's built-in reader performs `GET` only. It does not issue `LIST`, `HEAD`,
+`PUT`, `DELETE`, multipart, or bucket administration calls. It cannot broaden
+an exact object path or change the signed HTTP method.
+
+The safe B configuration accepts exactly the built-in
+`*s3disk.Ed25519ReferenceVerifier`. It performs finite Ed25519 key lookup and
+verification in process. A custom verifier is rejected before
+`RepositoryID` or `Verify` can run. The explicitly named
+`DangerouslyAllowCustomReferenceVerifier` escape hatch exists for non-sharing
+integrations, but using it invalidates the S3-only claim: a custom method can
+contact A or any other endpoint. The same default is enforced independently by
+`presignedshare.Decode`, `presignedshare.Reader`, and `s3disk.Consumer`.
+`DecodeOptions.DangerouslyAllowCustomReferenceVerifier` is the corresponding
+low-level opt-out and has the same bearer-exfiltration risk because `Verify`
+receives signed bundle bytes containing every exact capability.
+
+## What “B has no S3 key” means
+
+B does not receive `SecretAccessKey`, a reusable credential provider, or a
+SigV4 signer. It therefore cannot mint a request for another key, method,
+bucket, or expiry.
+
+B does receive the separate client-side share key. That key decrypts and
+authenticates ciphertext already obtainable through the exact S3 bearers; it
+does not sign S3 requests, list a bucket, or grant access to another object.
+
+A standard SigV4 presigned URL is itself a bearer secret. Its query string
+normally reveals the non-secret access-key ID inside `X-Amz-Credential`; when A
+uses temporary credentials it also normally contains an `X-Amz-Security-Token`.
+Those fields are necessary for S3 to validate the bearer and cannot be hidden
+from a holder of an ordinary presigned URL. They do not provide the secret
+signing key, but the complete URL can be replayed for its exact operation until
+it expires. Root links, bundle bodies, process memory, and diagnostics must
+therefore be protected as secrets.
+
+`presignedshare.Capability` redacts bearer material from ordinary formatting
+and JSON. Export is possible only through the explicit `ExportBearer` method.
+The built-in safe mint path is `s3store.PresignSession`; an unchecked custom
+presigner requires APIs whose names begin with `Dangerously` and is outside the
+built-in provider proof boundary.
+
+## Client-side encryption boundary
+
+The implemented commercial-target sharing profile is
+`strict-share-isolation-v1`:
+
+- `GenerateClientEncryptionKey` obtains a fresh random 256-bit key for every
+  share. `NewClientEncryptionProfile` uses domain-separated HKDF-SHA256 with the
+  `RepositoryID` to derive independent encryption and opaque-index masters.
+- Every envelope carries a fresh random 16-byte HKDF salt that derives an
+  independent AES-256 key, then AES-GCM uses a fresh random nonce. Authenticated
+  associated data contains the salt, `RepositoryID`, and exact logical/store
+  object key, including its prefix. Copying ciphertext to another key or prefix,
+  or opening it under another repository identity, fails authentication.
+  The fixed envelope overhead is 52 bytes: 8-byte format header, 16-byte salt,
+  12-byte nonce, and 16-byte tag. Per-message key derivation prevents mutable
+  root/reference replacements from accumulating under one AES-GCM key's
+  2^32-message operational bound.
+  Associated data does not bind bucket, account, origin, region, S3 version,
+  expiry, `ShareID`, or the textual profile name; signed capabilities, IAM, TLS,
+  and provider commissioning enforce those separate boundaries.
+- HMAC-SHA256 over the immutable object kind and logical plaintext digest
+  produces its opaque physical ID. The root, mutable signed reference,
+  manifests, and chunks are ciphertext in S3; protocol namespaces, object
+  kinds, counts, and access timing remain observable. The unpadded envelope has
+  fixed 52-byte overhead, so ciphertext size reveals the exact protected body
+  length.
+- Stable HMAC IDs preserve lazy loading and S3 deduplication only within one
+  share. Every independent share uses a different random key and dedicated
+  prefix, so cross-share ciphertext and physical IDs are not reused at S3.
+  Encryption keys are not derived from plaintext; convergent encryption is
+  forbidden. The HMAC input does not contain prefix or `ShareID`, and the
+  constructors cannot enforce per-share key/profile uniqueness. Reusing one
+  profile across prefixes would repeat opaque suffixes and reveal equality.
+
+The profile must be configured consistently on A's `Repository` and
+`RootPublisher` and on B's `Reader` and read-only `Repository`. Treat the
+prefix, `RepositoryID`, profile, and share key as one inseparable storage
+domain. Do not use one prefix for plaintext and encrypted modes, point a
+different profile at it, or combine objects from different prefixes/profiles.
+Resolved closures contain an internal keyed profile binding, so
+`RootPublisher` rejects an unencrypted, encrypted, or wrong-key Repository
+mismatch before presigning or writing a root. Writable Repository construction
+also refuses external self-reported encryption boundaries. The current AEAD
+fails closed when the key, repository identity, or exact object key is wrong,
+but there is no repository initialization record that can detect every
+accidental prefix/profile mismatch before access.
+
+S3 credential compromise does not become harmless. Within its IAM scope an
+attacker can list opaque keys if allowed, download ciphertext, overwrite or
+delete it, cause denial of service, and observe sizes and timing. AEAD, hashes,
+signatures, and watermarks detect corruption or rollback; they cannot restore
+availability. Without the share key the attacker cannot decrypt object bodies
+through this profile. If the share key or private handoff leaks,
+confidentiality of that share is lost for ciphertext the attacker can obtain,
+and plaintext already read or copied cannot be revoked.
+
+`DiskCache` receives data after decryption and keys it by logical chunk digest;
+it is neither encrypted nor bound to a share, profile, or `RepositoryID`. Give
+every share a separate private cache directory. Reusing a directory permits
+local cross-share plaintext equality and cache hits even though S3 objects are
+isolated. Protect and erase it as customer data. Enforce SSE-S3 or SSE-KMS as
+defense in depth for server-side media, backups, and operations; SSE does not
+replace the client-side profile. Repository initialization, repository-level
+KEK and repository-dedup modes, key rotation, and migration are not implemented
+yet.
+
+## Fixed expiry and mount lifecycle
+
+The root URL and every object capability in all revisions of one share use the
+same absolute authorization deadline. At the library level, a product that has
+securely persisted all required A-side share key, signing key, root capability,
+namespace, and deadline material can create a later presigning session only for
+that original deadline. The current CLI does not persist enough of those
+secrets and has no same-share resume command; restarting `share publish` creates
+a new share and handoff. The root URL handed to B never changes during one
+share.
+
+After the deadline, `presignedshare.Reader` refuses reads locally without
+network I/O. A mount pins the reader's deadline when it starts and initiates a
+bounded automatic unmount at expiry. Physical unmount is best effort because
+an operating-system FUSE unmount can block or fail. Expiry is therefore a
+lifecycle and authorization boundary, not DRM: it cannot erase bytes already
+read by an application or retained in an enabled plaintext disk cache, revoke a
+leaked share key, or make captured ciphertext undecryptable to its holder.
+
+A new authorization period requires a new random share key, newly presigned
+root capability, private handoff, and mount. There is intentionally no refresh-
+token, broker callback, or publisher connection.
+
+The key is per share, not per recipient. B/C/D given the same handoff have the
+same symmetric key and bearer authority; the system cannot attribute their
+reads or revoke only one of them, and any holder can copy the handoff. Create a
+separate share, prefix, random key, root, and handoff whenever recipients need
+independent attribution or revocation.
+
+## Consistency and failure model
+
+The safety argument depends on the commissioned S3 endpoint providing atomic,
+linearizable operations for each object key and correct `If-None-Match` and
+`If-Match` behavior. Immutable objects retain SHA-256 logical digests for
+integrity but use share-keyed HMAC-SHA256 physical IDs; AES-GCM additionally
+binds every ciphertext to its repository identity and exact object key. The
+authenticated channel reference, signed root bundle, generation, commit, share
+ID, exact repository bindings, and durable consumer watermark prevent mixing,
+rollback, and same-generation split brain.
+
+`Reader`'s accepted root revision is process-local; it is not by itself a
+cross-restart rollback journal. The commercial mount composition therefore
+requires `Consumer` with a protected durable `FileWatermarkStore` and an
+out-of-band trusted checkpoint. After restart, a fresh Reader uses the same
+fixed root bearer to fetch the current S3 root, while Consumer verifies the
+durable generation/commit ancestry before exposing a view. Replaying an older
+valid root can make recovery fail closed, but cannot make that composition
+activate a generation below its watermark. Applications using `Reader`
+directly must not claim this cross-restart property.
+
+An A-side root update uses S3 conditional replacement. If a write response is
+lost, A reads the exact root key back: exact target bytes mean the operation
+was applied; another authenticated value is handled as a concurrent state; an
+unreadable or ambiguous observation fails closed. A missing root during an
+update is treated as rollback and is never silently recreated.
+
+No asynchronous algorithm can guarantee current data during an arbitrary
+network partition. The contract is instead:
+
+- safety: B keeps one coherent last-known-good snapshot and never fabricates a
+  mixture of revisions, regardless of delay, loss, duplication, or reordering;
+- monotonicity: a process and its durable watermark never accept a lower
+  generation, and conflicting commits at one generation fail closed;
+- conditional liveness: if A finishes publishing, S3 remains reachable and
+  linearizable, B keeps polling, and authorization has not expired, B
+  eventually observes the newer root and converges;
+- no bounded freshness claim is made while the network or S3 is unavailable.
+
+The executable model for these assumptions and properties is described in
+[`../spec/README.md`](../spec/README.md).
+
+## Commissioning an S3 implementation
+
+“S3 compatible” is not sufficient evidence. Commission both independent
+contracts against the exact endpoint, bucket, addressing mode, any A-side
+gateway path, credentials, encryption policy, and provider version used in
+production. The B-side built-in reader is deliberately direct and rejects
+forward proxies, custom dialers, and alternate-protocol transports:
+
+```go
+storeReport, err := repository.ProbeStoreCompatibilityWithOptions(ctx, storeOptions)
+if err != nil {
+	return err
+}
+presignedReport, err := store.ProbePresignedGetCompatibilityWithOptions(ctx,
+	s3store.PresignedGetCompatibilityProbeOptions{
+		ObjectKeyPrefix: "private/commissioning/presigned-get",
+		TLSRootCAPEM:    commissionedTLSRoots, // required for every HTTPS origin
+	})
+if err != nil {
+	return err
+}
+_ = storeReport
+_ = presignedReport
+```
+
+The writable probe checks conditional create/replacement, concurrency,
+visibility, ETags, conditional GET, bounded reads, and adapter ownership. The
+presigned probe currently has 14 stable checks; `RequiredChecks` in the report
+is authoritative. They cover independently readable source and target bearers,
+a same-context shorter source control, reuse of one URL after replacement,
+dynamic `If-None-Match`, an expiry-query mutation, unsigned source/target GET
+and source zero/nonempty PUT/DELETE policy controls, eleven named unsigned
+method/path override headers, exact-path and HEAD mutations, and signed
+zero/nonempty PUT mutations. Full bytes plus ETag/Version ID read-backs and
+correct bearer revalidations cover both canaries around the negative families.
+Observable bounded bodies, status, headers, and trailers are checked for
+cross-canary payload/version disclosure and exact authority unique to the other
+bearer (raw URL, signature, capability-header values, and an absent foreign
+path/key). Informational 1xx or encoded negative responses cannot pass.
+
+These are named samples, not proof of arbitrary query, header, method, payload,
+historical-version, public-policy, bucket, or origin binding. A distinct host is
+not fabricated from a same-origin two-canary probe. Go's HTTP client also cannot
+expose illegal bodies on HEAD/bodyless statuses, chunk extensions, or bytes
+beyond declared framing. The report retains all of those limitations, plus
+post-expiry and future provider/network states. Stable check IDs and redacted
+reason classes let an operator distinguish semantic incompatibility from
+permission, endpoint, throttling, timeout, and network failures.
+
+These are finite black-box probes. A pass can disprove observed
+incompatibilities but cannot mathematically prove every future provider,
+gateway, partition, policy, or upgrade state. The short probe also does not
+wait until the bearer expires; production certification must separately sample
+post-expiry rejection and repeat tests after material backend changes.
+
+## Current scaling boundaries
+
+The current root is one flat signed bundle, limited to 65,536 exact
+capabilities and 64 MiB encoded bytes. Every accepted revision must preserve
+the exact capabilities required by older open handles. The reader retains the
+deduplicated union within explicit count and byte budgets; if accepting a new
+revision would exceed a budget, it keeps the current coherent view and rejects
+that revision rather than silently breaking an old handle.
+
+This behavior is safe but means a high-churn, long-lived share can stop
+advancing before expiry and require a remount. A sharded capability index is a
+future scale feature and must preserve the same exact-key, fixed-expiry, signed
+closure, and S3-only constraints.
+
+## Deployment checklist
+
+- Deliver the root bearer, random share key, share bindings, verification trust,
+  and initial checkpoint through a private authenticated out-of-band product
+  flow. Treat the complete handoff as a secret.
+- Give S3 credentials only to A. Do not construct a credentialed `s3store.Store`
+  on B; build B's repository with `presignedshare.Reader` and
+  `s3disk.NewReadOnlyRepositoryWithOptions`, using the same client-encryption
+  profile at both decryption boundaries.
+- Give every share a dedicated random prefix, `RepositoryID`, and encryption
+  key. Never reuse a prefix across plaintext/encrypted modes or different
+  profiles. Do not claim repository-level rotation, migration, or deduplication
+  until those missing facilities are implemented and certified.
+- Use HTTPS with certificate verification. Literal loopback HTTP exists only
+  for local MinIO tests. B's reader constructs an internal direct transport;
+  environment/application proxies, custom dialers, redirects, cookies, custom
+  TLS callbacks, caller certificate pools, client certificates, insecure or
+  caller-selected TLS algorithms, and alternate-protocol round trippers are
+  rejected. Caller `httptrace` values are stripped before a capability request
+  reaches `net/http`. Every HTTPS deployment provides bounded commissioned PEM
+  roots in `ReaderConfig.TLSRootCAPEM`; Reader parses fresh certificate objects
+  into an internal callback-free pool. This avoids operating-system trust
+  evaluation that may perform non-S3 network fetches.
+  `DangerouslyAllowSystemTrustStore` explicitly gives up the strict S3-only
+  guarantee and must not be enabled on B/C/D. Those roots are trusted
+  configuration and a malicious root can authenticate an S3 impersonator.
+- Prefer two A-side principals against the same commissioned bucket and
+  endpoint: a writer for immutable publication and root CAS, and a separate
+  `s3:GetObject`-only principal used only to construct `PresignSession`. This
+  limits damage if a gateway ever mishandles HTTP-method binding. The library's
+  abstract Store/Presigner interfaces cannot prove that both configurations
+  target the same bucket and origin, so deployment tests and policy review must
+  enforce that binding. For a commercially supported backend, the separate
+  GetObject-only principal, its one-bucket/key-scope restriction, and the exact
+  origin binding are hard gates, not recommendations.
+- Keep the bucket private and archive a review of BPA or the provider's
+  equivalent, bucket/access-point policies, ACLs, IAM, and gateway/origin
+  public-access rules. The finite probe's unsigned GET/PUT/DELETE samples do
+  not prove the full policy graph or exclude an alternate public origin.
+- Require separate raw-wire HTTP/1.1 and HTTP/2 provider certification. Go's
+  `net/http` cannot expose every illegal body on HEAD/bodyless statuses, chunk
+  extension, or byte beyond declared framing, so an application-level probe
+  pass alone is not a confidentiality or commercial-support result.
+- Keep A's publication journal and B's watermark in separate protected durable
+  storage. Neither is bootstrapped from an untrusted S3 object. The current CLI
+  does not persist the client key, publisher private signing key, or root
+  capability needed to resume the same share; define secure persistence,
+  recovery, backup, and zeroization before adding such a product feature.
+- Protect the handoff, share key, bearer URLs, and cached plaintext from logs,
+  command lines, crash reports, telemetry, and other local users. `DiskCache`
+  is plaintext even though its S3 source objects are ciphertext; allocate a
+  distinct private cache directory for every `RepositoryID` and `ShareID`.
+- Enforce and test SSE-S3 or SSE-KMS as defense in depth; it does not replace
+  client-side encryption or private handoff delivery.
+- Set S3 lifecycle and retention rules so immutable objects cannot disappear
+  during the maximum supported share and recovery windows.
+- Run both compatibility probes and the partition/timeout/expiry/provider
+  matrix before claiming a commercial backend is supported.

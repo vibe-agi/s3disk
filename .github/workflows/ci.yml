@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.5"
+  GOWORK: "off"
+  GOFLAGS: "-mod=readonly"
+
+jobs:
+  native-platforms:
+    name: Native tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Run native tests
+        shell: bash
+        env:
+          GOWORK: "off"
+          GOFLAGS: "-mod=readonly"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            git rev-parse HEAD
+            go version
+            go env GOOS GOARCH GOVERSION GOWORK GOFLAGS
+            uname -a
+          } 2>&1 | tee artifacts/environment.log
+          go test ./... -count=1 -timeout=120s -json 2>&1 | tee artifacts/native-tests.json
+      - name: Require Darwin trust-state ACL tests
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          [[ "$(go env CGO_ENABLED)" == 1 ]] || {
+            echo "Darwin trust-state tests require CGO_ENABLED=1" >&2
+            exit 1
+          }
+          ./scripts/run-required-go-test.sh . TestDarwinTrustStateRevalidatesExtendedACLs 60s
+          ./scripts/run-required-go-test.sh . TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
+      - name: Archive native evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: native-evidence-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  quality:
+    name: Unit, race, vet, and compliance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Record environment
+        run: |
+          mkdir -p artifacts
+          {
+            go version
+            go env GOOS GOARCH GOVERSION
+            uname -a
+          } | tee artifacts/environment.log
+      - name: Download dependencies
+        run: go mod download
+      - name: Check module and source hygiene
+        run: |
+          set -o pipefail
+          go mod verify 2>&1 | tee artifacts/go-mod-verify.log
+          tidy_diff=$(go mod tidy -diff)
+          if [[ -n "$tidy_diff" ]]; then
+            printf '%s\n' "$tidy_diff" | tee artifacts/go-mod-tidy.diff
+            exit 1
+          fi
+          unformatted=$(rg --files -g '*.go' -0 | xargs -0 gofmt -l)
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted" | tee artifacts/gofmt.log
+            exit 1
+          fi
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          go test ./... -count=1 -timeout=90s -json 2>&1 | tee artifacts/unit-tests.json
+      - name: Race tests
+        run: |
+          set -o pipefail
+          go test -race ./... -count=1 -timeout=180s -json 2>&1 | tee artifacts/race-tests.json
+      - name: Vet
+        run: |
+          set -o pipefail
+          go vet ./... 2>&1 | tee artifacts/vet.log
+      - name: Protocol fuzz smoke tests
+        run: |
+          set -o pipefail
+          go test ./ -run='^$' -fuzz='^FuzzDecodeReferenceNeverPanics$' \
+            -fuzztime=10s 2>&1 | tee artifacts/fuzz-reference.log
+          go test ./ -run='^$' -fuzz='^FuzzVerifySignedReferenceNeverPanics$' \
+            -fuzztime=10s 2>&1 | tee artifacts/fuzz-signed-reference.log
+      - name: Third-party compliance
+        run: |
+          set -o pipefail
+          ./scripts/check-project-license.sh 2>&1 | tee artifacts/project-license.log
+          ./scripts/check-third-party.sh 2>&1 | tee artifacts/third-party.log
+      - name: Release reference gate self-test
+        run: |
+          set -o pipefail
+          ./scripts/test-release-ref.sh 2>&1 | tee artifacts/release-reference-test.log
+      - name: Lint GitHub Actions workflows
+        env:
+          GOFLAGS: ""
+        run: |
+          set -o pipefail
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            -color=false 2>&1 | tee artifacts/actionlint.log
+      - name: Archive quality evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: quality-evidence-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  minio:
+    name: MinIO integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Run pinned MinIO integration
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          {
+            docker version
+            docker compose version
+          } 2>&1 | tee artifacts/docker-environment.log
+          ./scripts/test-minio.sh 2>&1 | tee artifacts/minio.log
+      - name: Archive MinIO evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: minio-evidence-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  model:
+    name: TLA+ model checking
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Run model checker
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          java -version 2>&1 | tee artifacts/java-environment.log
+          ./scripts/check-model.sh 2>&1 | tee artifacts/model-check.log
+      - name: Archive model evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: model-evidence-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30

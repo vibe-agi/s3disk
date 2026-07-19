@@ -1,0 +1,22 @@
+# Local build and test output.
+/s3disk
+/dist/
+/artifacts/
+/coverage/
+*.test
+*.out
+*.prof
+
+# Local editor and operating-system state.
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials and developer-specific environment files.
+.env
+.env.*
+!.env.example
+
+# s3disk runtime material must never be committed.
+/.s3disk/
+/share.json
