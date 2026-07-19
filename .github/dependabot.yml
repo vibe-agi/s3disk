@@ -1,0 +1,43 @@
+version: 2
+
+# This configuration opens reviewable update pull requests. It does not grant
+# write permissions or configure automatic merging.
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 5
+    rebase-strategy: "disabled"
+    commit-message:
+      prefix: "deps(go)"
+    groups:
+      aws-sdk-minor-and-patch:
+        patterns:
+          - "github.com/aws/aws-sdk-go-v2*"
+          - "github.com/aws/smithy-go"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:30"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 5
+    rebase-strategy: "disabled"
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

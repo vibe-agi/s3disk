@@ -14,6 +14,9 @@ concurrency:
 
 env:
   GO_VERSION: "1.26.5"
+  MINIMUM_GO_VERSION: "1.25.12"
+  GOVULNCHECK_VERSION: "v1.6.0"
+  ACTIONLINT_VERSION: "v1.7.7"
   GOWORK: "off"
   GOFLAGS: "-mod=readonly"
 
@@ -70,6 +73,48 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  minimum-go:
+    name: Oldest supported patched Go (1.25.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: "local"
+      GOFLAGS: "-mod=readonly"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up minimum supported Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.MINIMUM_GO_VERSION }}
+          cache: false
+      - name: Run minimum-version tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(go env GOVERSION)" == "go$MINIMUM_GO_VERSION" ]] || {
+            echo "minimum-version job requires go$MINIMUM_GO_VERSION" >&2
+            exit 1
+          }
+          mkdir -p artifacts
+          {
+            git rev-parse HEAD
+            go version
+            go env GOOS GOARCH GOVERSION GOWORK GOFLAGS GOTOOLCHAIN
+            uname -a
+          } 2>&1 | tee artifacts/environment.log
+          go test ./... -count=1 -timeout=120s -json 2>&1 | tee artifacts/minimum-go-tests.json
+      - name: Archive minimum-version evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: minimum-go-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
   quality:
     name: Unit, race, vet, and compliance
     runs-on: ubuntu-24.04
@@ -93,7 +138,10 @@ jobs:
             uname -a
           } | tee artifacts/environment.log
       - name: Download dependencies
-        run: go mod download
+        run: |
+          set -euo pipefail
+          go mod download
+          git diff --exit-code -- go.mod go.sum
       - name: Check module and source hygiene
         run: |
           set -o pipefail
@@ -120,6 +168,17 @@ jobs:
         run: |
           set -o pipefail
           go vet ./... 2>&1 | tee artifacts/vet.log
+      - name: Scan modules for known vulnerabilities
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/s3disk-ci-tools"
+          mkdir -p "$tool_dir"
+          {
+            GOFLAGS="" GOBIN="$tool_dir" go install \
+              "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK_VERSION"
+            "$tool_dir/govulncheck" -version
+            "$tool_dir/govulncheck" -scan=module
+          } 2>&1 | tee artifacts/govulncheck.log
       - name: Protocol fuzz smoke tests
         run: |
           set -o pipefail
@@ -150,9 +209,12 @@ jobs:
         env:
           GOFLAGS: ""
         run: |
-          set -o pipefail
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
-            -color=false 2>&1 | tee artifacts/actionlint.log
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/s3disk-ci-tools"
+          mkdir -p "$tool_dir"
+          GOBIN="$tool_dir" go install \
+            "github.com/rhysd/actionlint/cmd/actionlint@$ACTIONLINT_VERSION"
+          "$tool_dir/actionlint" -color=false 2>&1 | tee artifacts/actionlint.log
       - name: Archive quality evidence
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
