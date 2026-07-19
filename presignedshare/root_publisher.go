@@ -20,6 +20,12 @@ const (
 
 var (
 	ErrRootPublishConflict = errors.New("presignedshare: concurrent root publication conflict")
+	// ErrRootBuildAuthorityRequired reports that a recovery-only publisher has
+	// successfully reconciled existing state but needs both its signer and
+	// fixed-expiry presigner before it can construct a genuinely new root.
+	// Callers must match this error specifically; Store configuration failures
+	// are unrelated and must not trigger credential or presigner acquisition.
+	ErrRootBuildAuthorityRequired = errors.New("presignedshare: root build authority is required")
 	// ErrRootPublishIndeterminate means a conditional write may have reached
 	// S3, but an exact authenticated GET could not prove whether that target is
 	// current. Retrying Create or Update with the same sealed closure is safe.

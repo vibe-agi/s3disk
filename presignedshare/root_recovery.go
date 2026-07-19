@@ -50,6 +50,25 @@ var (
 	ErrRootRecoveryIndeterminate = errors.New("presignedshare: root recovery journal outcome is indeterminate")
 )
 
+// RootRecoveryResult describes the authenticated S3 root observed after
+// RecoverPending reconciles the sealed recovery journal. RootFound is false
+// only for a prepared journal which has never published a root.
+//
+// HadPending reports whether the journal contained an operation when recovery
+// began. A successful call always sets PendingCleared when HadPending is true.
+// WroteRoot distinguishes replaying the exact WAL target during this call from
+// merely observing that an earlier ambiguous write was already applied.
+type RootRecoveryResult struct {
+	HadPending          bool
+	PendingCleared      bool
+	RootFound           bool
+	WroteRoot           bool
+	Revision            uint64
+	ReferenceGeneration uint64
+	ReferenceCommit     s3disk.Digest
+	Version             s3disk.Version
+}
+
 // rootRecoveryRecord is a write-ahead log, not an independent freshness
 // oracle. Pending always owns the exact bytes handed to the raw Store, while
 // Committed anchors the exact authenticated logical bundle last accepted from
@@ -526,6 +545,54 @@ func RestoreRootPublisher(ctx context.Context, config RootPublisherConfig) (*Roo
 	return publisher, nil
 }
 
+// RecoverPending settles one exact root operation already authenticated by the
+// sealed recovery journal. It needs no SnapshotClosure and never invokes the
+// publisher's signer or presigner: both the target bytes and their exact S3
+// create/CAS precondition come exclusively from the WAL.
+//
+// When no operation is pending, RecoverPending safely reconciles the current
+// authenticated S3 root against the committed journal anchor. It never creates
+// a missing root in that case, and it never recreates a missing base for an
+// update. A prepared journal with no root is a successful no-op.
+func (publisher *RootPublisher) RecoverPending(ctx context.Context) (RootRecoveryResult, error) {
+	if publisher == nil {
+		return RootRecoveryResult{}, fmt.Errorf("%w: nil root publisher", s3disk.ErrStoreMisconfigured)
+	}
+	if !configuredInterface(ctx) {
+		return RootRecoveryResult{}, fmt.Errorf("presignedshare: root recovery context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return RootRecoveryResult{}, err
+	}
+	if publisher.gate == nil || !publisher.rootCapability.Configured() ||
+		publisher.rootCapability.provenance != capabilityProvenanceExactGET ||
+		!configuredInterface(publisher.store) || !configuredInterface(publisher.verifier) {
+		return RootRecoveryResult{}, fmt.Errorf("%w: root publisher is not initialized", s3disk.ErrStoreMisconfigured)
+	}
+	if !configuredInterface(publisher.recoveryJournal) {
+		return RootRecoveryResult{}, fmt.Errorf("%w: recovery journal is required", ErrRootRecoveryState)
+	}
+	if !publisher.rootCapability.expiresAt.After(time.Now()) {
+		return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+	authorizationCtx, cancelAuthorization := context.WithDeadline(ctx, publisher.rootCapability.expiresAt)
+	defer cancelAuthorization()
+	ctx = authorizationCtx
+	select {
+	case <-ctx.Done():
+		return RootRecoveryResult{}, ctx.Err()
+	case <-publisher.gate:
+	}
+	defer func() { publisher.gate <- struct{}{} }()
+	if err := ctx.Err(); err != nil {
+		return RootRecoveryResult{}, err
+	}
+	if !publisher.rootCapability.expiresAt.After(time.Now()) {
+		return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+	}
+	return publisher.recoverPending(ctx)
+}
+
 func rootCapabilityRecoveryDigest(capability Capability) (s3disk.Digest, error) {
 	bearer, err := capability.ExportBearer()
 	if err != nil {
@@ -805,6 +872,210 @@ func replaceLoadedRootRecovery(current *loadedRootRecovery, next loadedRootRecov
 	*current = next
 }
 
+func rootRecoveryResultFromObservation(
+	observed rootRecoveryObserved,
+	hadPending bool,
+	wroteRoot bool,
+) RootRecoveryResult {
+	return RootRecoveryResult{
+		HadPending:          hadPending,
+		PendingCleared:      hadPending,
+		RootFound:           true,
+		WroteRoot:           wroteRoot,
+		Revision:            observed.bundle.revision,
+		ReferenceGeneration: observed.bundle.referenceGeneration,
+		ReferenceCommit:     observed.bundle.referenceCommit,
+		Version:             observed.version,
+	}
+}
+
+func (publisher *RootPublisher) recoverPending(ctx context.Context) (RootRecoveryResult, error) {
+	recovery, err := publisher.loadRootRecovery(ctx)
+	if err != nil {
+		return RootRecoveryResult{}, err
+	}
+	defer func() { recovery.clear() }()
+	if !recovery.found {
+		return RootRecoveryResult{}, fmt.Errorf("%w: prepared recovery state is absent", ErrRootRecoveryState)
+	}
+
+	hadPending := recovery.record.Pending != nil
+	var writeAttempts int
+	var hadAmbiguousWrite bool
+	for {
+		if err := ctx.Err(); err != nil {
+			return RootRecoveryResult{}, err
+		}
+		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+		}
+
+		if recovery.record.Pending == nil {
+			observed, found, err := publisher.loadRootForRecovery(ctx)
+			if err != nil {
+				return RootRecoveryResult{}, err
+			}
+			if err := ctx.Err(); err != nil {
+				observed.clear()
+				return RootRecoveryResult{}, err
+			}
+			if !publisher.rootCapability.expiresAt.After(time.Now()) {
+				observed.clear()
+				return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+			}
+			if !found {
+				if recovery.record.Committed != nil || recovery.record.HighestRevision != 0 {
+					return RootRecoveryResult{}, fmt.Errorf("%w: existing share root disappeared", s3disk.ErrRollbackDetected)
+				}
+				return RootRecoveryResult{}, nil
+			}
+			anchored, err := publisher.anchorRootObservation(ctx, recovery, observed)
+			if err != nil {
+				observed.clear()
+				return RootRecoveryResult{}, err
+			}
+			result := rootRecoveryResultFromObservation(observed, hadPending, false)
+			observed.clear()
+			replaceLoadedRootRecovery(&recovery, anchored)
+			return result, nil
+		}
+
+		pending := *recovery.record.Pending
+		observed, found, err := publisher.loadRootForRecovery(ctx)
+		if err != nil {
+			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, err)
+		}
+		if err := ctx.Err(); err != nil {
+			observed.clear()
+			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, err)
+		}
+		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			observed.clear()
+			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, s3disk.ErrAccessDenied)
+		}
+		if found && bytes.Equal(observed.raw, recovery.target) {
+			anchored, err := publisher.anchorRootObservation(ctx, recovery, observed)
+			if err != nil {
+				observed.clear()
+				return RootRecoveryResult{}, err
+			}
+			result := rootRecoveryResultFromObservation(observed, true, false)
+			observed.clear()
+			replaceLoadedRootRecovery(&recovery, anchored)
+			return result, nil
+		}
+
+		if found {
+			if err := validateObservationAgainstAnchor(recovery.record, observed); err != nil {
+				observed.clear()
+				return RootRecoveryResult{}, err
+			}
+			if observed.bundle.revision == pending.TargetRevision {
+				if observed.logicalDigest != pending.LogicalTargetDigest {
+					observed.clear()
+					return RootRecoveryResult{}, s3disk.ErrSplitBrain
+				}
+				anchored, err := publisher.anchorRootObservation(ctx, recovery, observed)
+				if err != nil {
+					observed.clear()
+					return RootRecoveryResult{}, err
+				}
+				result := rootRecoveryResultFromObservation(observed, true, false)
+				observed.clear()
+				replaceLoadedRootRecovery(&recovery, anchored)
+				return result, nil
+			}
+			if observed.bundle.revision > pending.TargetRevision {
+				anchored, err := publisher.anchorRootObservation(ctx, recovery, observed)
+				if err != nil {
+					observed.clear()
+					return RootRecoveryResult{}, err
+				}
+				result := rootRecoveryResultFromObservation(observed, true, false)
+				observed.clear()
+				replaceLoadedRootRecovery(&recovery, anchored)
+				return result, nil
+			}
+			if pending.ExpectedAbsent || recovery.record.Committed == nil ||
+				observed.bundle.revision != recovery.record.Committed.Revision ||
+				observed.logicalDigest != recovery.record.Committed.LogicalDigest {
+				observed.clear()
+				return RootRecoveryResult{}, s3disk.ErrRollbackDetected
+			}
+			baseDigest := rootRecoveryDigest("base", observed.raw)
+			if pending.BaseDigest != baseDigest || pending.ExpectedETag != observed.version.ETag ||
+				pending.ExpectedVersionID != observed.version.VersionID {
+				nextRecord := cloneRootRecoveryRecord(recovery.record)
+				nextRecord.Committed = committedRootFromObservation(observed)
+				nextRecord.Pending.setExpected(observed.version, observed.raw)
+				saved, err := publisher.saveRootRecovery(ctx, recovery, nextRecord, recovery.target)
+				if err != nil {
+					observed.clear()
+					return RootRecoveryResult{}, err
+				}
+				replaceLoadedRootRecovery(&recovery, saved)
+				pending = *recovery.record.Pending
+			}
+		} else if !pending.ExpectedAbsent {
+			return RootRecoveryResult{}, fmt.Errorf("%w: root base disappeared during recovery", s3disk.ErrRollbackDetected)
+		}
+		observed.clear()
+
+		targetBundle, logicalDigest, err := publisher.decodeRootStorageTarget(ctx, recovery.target)
+		if err != nil || targetBundle == nil || logicalDigest != pending.LogicalTargetDigest ||
+			targetBundle.revision != pending.TargetRevision ||
+			targetBundle.referenceGeneration != pending.ReferenceGeneration ||
+			targetBundle.referenceCommit != pending.ReferenceCommit {
+			return RootRecoveryResult{}, fmt.Errorf("%w: pending target cannot be authenticated", ErrRootRecoveryState)
+		}
+
+		if writeAttempts >= publisher.maxAttempts {
+			if hadAmbiguousWrite {
+				return RootRecoveryResult{}, ErrRootPublishIndeterminate
+			}
+			return RootRecoveryResult{}, ErrRootPublishConflict
+		}
+		if err := ctx.Err(); err != nil {
+			return RootRecoveryResult{}, err
+		}
+		if !publisher.rootCapability.expiresAt.After(time.Now()) {
+			return RootRecoveryResult{}, fmt.Errorf("presignedshare: share authorization expired: %w", s3disk.ErrAccessDenied)
+		}
+		writeAttempts++
+		var version s3disk.Version
+		if pending.ExpectedAbsent {
+			version, err = publisher.store.PutIfAbsent(ctx, publisher.rootKey, recovery.target)
+		} else {
+			version, err = publisher.store.CompareAndSwap(ctx, publisher.rootKey, pending.expectedVersion(), recovery.target)
+		}
+		if err == nil {
+			if err := validateRootVersion(version); err != nil {
+				return RootRecoveryResult{}, err
+			}
+			applied := rootRecoveryObserved{
+				version: version, bundle: targetBundle, logicalDigest: pending.LogicalTargetDigest,
+			}
+			anchored, err := publisher.anchorRootObservation(ctx, recovery, applied)
+			if err != nil {
+				return RootRecoveryResult{}, err
+			}
+			result := rootRecoveryResultFromObservation(applied, true, true)
+			replaceLoadedRootRecovery(&recovery, anchored)
+			return result, nil
+		}
+		if errors.Is(err, s3disk.ErrPrecondition) {
+			continue
+		}
+		hadAmbiguousWrite = true
+		if errors.Is(err, context.Canceled) {
+			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, context.Canceled)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return RootRecoveryResult{}, errors.Join(ErrRootPublishIndeterminate, context.DeadlineExceeded)
+		}
+	}
+}
+
 func (publisher *RootPublisher) validatePendingRootRequest(
 	ctx context.Context,
 	recovery loadedRootRecovery,
@@ -901,7 +1172,7 @@ func (publisher *RootPublisher) publishRecoverable(
 				observed.clear()
 				return RootPublication{}, fmt.Errorf(
 					"%w: signer and presigner are required to build a new recoverable root",
-					s3disk.ErrStoreMisconfigured,
+					ErrRootBuildAuthorityRequired,
 				)
 			}
 			targetRevision := uint64(1)

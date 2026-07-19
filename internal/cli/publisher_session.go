@@ -68,9 +68,12 @@ const (
 
 // publisherSession is the authenticated A-side restart manifest. Paths are
 // byte slices so Linux filenames which are not UTF-8 survive JSON's canonical
-// base64 representation without replacement. It deliberately contains no S3
-// SecretAccessKey, session credential, credential provider, SDK config, HTTP
-// client, or cache object. Recovery resolves A's current credentials anew.
+// base64 representation without replacement. It deliberately contains no
+// reusable AWS access-key/secret-key credential tuple, credential provider,
+// SDK config, HTTP client, or cache object. RootBearer can contain the scoped
+// URL's access-key ID and temporary session-token query value; those are sealed
+// as exact-GET authority, not retained as a reusable signer. Recovery resolves
+// A's current credentials anew.
 // Phases route idempotent recovery work; they are not proof that S3 or either
 // journal is current. Resume must reconcile the authoritative repository,
 // publication journal, and root WAL even when a later phase is present.
@@ -408,6 +411,12 @@ func validatePublisherSession(value publisherSession) error {
 	if len(value.TLSRootCAPEM) > int(presignedshare.MaximumTLSRootCAPEMBytes) {
 		return fail("TLS CA exceeds its limit")
 	}
+	canonicalCAPEM, err := canonicalTLSRootCAPEM(value.TLSRootCAPEM)
+	if err != nil || !bytes.Equal(canonicalCAPEM, value.TLSRootCAPEM) {
+		clear(canonicalCAPEM)
+		return fail("TLS CA is not a canonical certificate-only bundle")
+	}
+	clear(canonicalCAPEM)
 	if _, err := s3HTTPClient(value.TLSRootCAPEM); err != nil {
 		return fail("invalid TLS CA")
 	}
@@ -582,9 +591,6 @@ func loadPublisherSession(
 	}
 	if err := validatePublisherSessionStoreIdentity(store, state); err != nil {
 		return loadedPublisherSession{}, false, err
-	}
-	if !state.AuthorizationExpiresAt.After(time.Now()) {
-		return loadedPublisherSession{}, false, ErrPublisherSessionExpired
 	}
 	if _, err := state.RequireActive(now); err != nil {
 		return loadedPublisherSession{}, false, err

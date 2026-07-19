@@ -170,7 +170,7 @@ func (publisher *Publisher) Stage(ctx context.Context, source, channel string) (
 //
 // Like Stage, StageSelected does not update the mutable channel reference.
 func (publisher *Publisher) StageSelected(ctx context.Context, source, channel string, paths []string) (*StagedSnapshot, error) {
-	selection, err := newPathSelection(paths)
+	selection, err := newPathSelectionContext(ctx, paths)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +182,12 @@ func (publisher *Publisher) stage(
 	source, channel string,
 	selection *pathSelection,
 ) (*StagedSnapshot, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("s3disk: stage context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := publisher.repository.validateChannel(channel); err != nil {
 		return nil, err
 	}
@@ -189,12 +195,18 @@ func (publisher *Publisher) stage(
 	if err != nil {
 		return nil, fmt.Errorf("resolve source path: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(source)
 	if err != nil {
 		return nil, fmt.Errorf("stat source: %w", err)
 	}
 	if !info.IsDir() {
 		return nil, fmt.Errorf("%w: source is not a directory", ErrNotDirectory)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	sourceRoot, err := os.OpenRoot(source)
 	if err != nil {
@@ -696,6 +708,16 @@ type pathSelection struct {
 // store I/O. Besides the per-path protocol limits, aggregate limits keep an
 // adversarial caller from constructing an unbounded in-memory trie.
 func newPathSelection(values []string) (*pathSelection, error) {
+	return newPathSelectionContext(context.Background(), values)
+}
+
+func newPathSelectionContext(ctx context.Context, values []string) (*pathSelection, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("s3disk: path-selection context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(values) == 0 {
 		return nil, fmt.Errorf("%w: selected paths must not be empty", ErrInvalidPath)
 	}
@@ -707,6 +729,9 @@ func newPathSelection(values []string) (*pathSelection, error) {
 	var totalBytes int64
 	nodeCount := 0
 	for _, value := range values {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if value == "" || strings.ContainsRune(value, '\x00') || path.IsAbs(value) {
 			return nil, fmt.Errorf("%w: selected path %q is not a canonical relative path", ErrInvalidPath, value)
 		}
@@ -732,6 +757,9 @@ func newPathSelection(values []string) (*pathSelection, error) {
 
 		node := root
 		for _, component := range components {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if len(component) == 0 || len(component) > maxEntryNameBytes {
 				return nil, fmt.Errorf("%w: %w: selected path component exceeds %d bytes", ErrInvalidPath, ErrResourceLimit, maxEntryNameBytes)
 			}
@@ -800,6 +828,9 @@ func (publisher *Publisher) buildDirectorySelection(
 	}
 	entries := make([]os.DirEntry, 0, 1024)
 	for {
+		if err := ctx.Err(); err != nil {
+			return Digest{}, err
+		}
 		batch, readErr := handle.ReadDir(1024)
 		entries = append(entries, batch...)
 		if len(entries) > maxDirectoryEntries {
@@ -811,6 +842,9 @@ func (publisher *Publisher) buildDirectorySelection(
 		if readErr != nil {
 			return Digest{}, fmt.Errorf("read directory %q: %w", directory, readErr)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return Digest{}, err
 	}
 	// Directory entries are materialized above, so the opened directory is no
 	// longer needed while child manifests are built. Closing it before recursion
@@ -903,6 +937,9 @@ func (publisher *Publisher) buildDirectorySelection(
 	sort.Slice(manifest.Entries, func(i, j int) bool {
 		return bytes.Compare(manifest.Entries[i].Name, manifest.Entries[j].Name) < 0
 	})
+	if err := ctx.Err(); err != nil {
+		return Digest{}, err
+	}
 	afterHandle, openErr := sourceRoot.Open(directory)
 	if openErr != nil {
 		return Digest{}, fmt.Errorf("%w: reopen directory after scan %q: %v", ErrUnstableFile, directory, openErr)

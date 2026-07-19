@@ -20,7 +20,7 @@ func TestCommandTreeHasCommercialEntryPoints(t *testing.T) {
 		Mount:   func(context.Context, MountOptions) error { return nil },
 		Doctor:  func(context.Context, DoctorOptions, io.Writer) error { return nil },
 	})
-	for _, path := range [][]string{{"share", "publish"}, {"mount"}, {"s3", "doctor"}} {
+	for _, path := range [][]string{{"share", "publish"}, {"share", "resume"}, {"mount"}, {"s3", "doctor"}} {
 		command, _, err := root.Find(path)
 		if err != nil || command == nil || command.CommandPath() != "s3disk "+strings.Join(path, " ") {
 			t.Fatalf("missing command %q: command=%v err=%v", strings.Join(path, " "), command, err)
@@ -32,7 +32,7 @@ func TestPublishCommandValidatesSelectionAndFailClosedMode(t *testing.T) {
 	base := []string{
 		"share", "publish", "--source", t.TempDir(), "--bucket", "bucket", "--prefix", "private/share",
 		"--state-dir", t.TempDir(), "--handoff-out", t.TempDir() + "/share.json",
-		"--tls-ca", "/ca.pem",
+		"--recovery-key", "/recovery-key.json", "--tls-ca", "/ca.pem",
 	}
 	tests := []struct {
 		name string
@@ -69,7 +69,7 @@ func TestPublishCommandDefaultsToContinuousMode(t *testing.T) {
 	}})
 	root.SetArgs([]string{
 		"share", "publish", "--source", "/source", "--all", "--bucket", "bucket", "--prefix", "private/share",
-		"--state-dir", "/state", "--handoff-out", "/handoff", "--tls-ca", "/ca.pem",
+		"--state-dir", "/state", "--handoff-out", "/handoff", "--recovery-key", "/recovery-key.json", "--tls-ca", "/ca.pem",
 	})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
@@ -81,21 +81,25 @@ func TestPublishCommandDefaultsToContinuousMode(t *testing.T) {
 
 func TestPublishCommandPassesValidatedOptions(t *testing.T) {
 	var observed PublishOptions
+	var stdout, stderr bytes.Buffer
 	root := NewRootCommand(Dependencies{Publish: func(_ context.Context, options PublishOptions) error {
 		observed = clonePublishOptions(options)
 		options.Paths[0] = "mutated"
 		return nil
 	}})
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
 	root.SetArgs([]string{
 		"share", "publish", "--source", "/source", "--path", "dir/file,with-comma", "--bucket", "bucket",
 		"--prefix", "shares/random", "--state-dir", "/state", "--handoff-out", "/handoff.json",
-		"--region", "ap-southeast-1", "--expires-in", "90m", "--tls-ca", "/ca.pem", "--once",
+		"--recovery-key", "/recovery-key.json", "--region", "ap-southeast-1", "--expires-in", "90m", "--tls-ca", "/ca.pem", "--once",
 	})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if observed.Region != "ap-southeast-1" || observed.ExpiresIn != 90*time.Minute || !observed.Once ||
-		!reflect.DeepEqual(observed.Paths, []string{"dir/file,with-comma"}) {
+		!reflect.DeepEqual(observed.Paths, []string{"dir/file,with-comma"}) ||
+		observed.StatusWriter != &stdout || observed.ErrorWriter != &stderr {
 		t.Fatalf("unexpected options: %#v", observed)
 	}
 }
@@ -162,7 +166,7 @@ func TestPublishRequiresExplicitCAForStrictS3OnlyHTTPS(t *testing.T) {
 	}})
 	root.SetArgs([]string{
 		"share", "publish", "--source", "/source", "--all", "--bucket", "bucket", "--prefix", "private/share",
-		"--state-dir", "/state", "--handoff-out", "/handoff",
+		"--state-dir", "/state", "--handoff-out", "/handoff", "--recovery-key", "/recovery-key.json",
 	})
 	err := root.ExecuteContext(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "--tls-ca is required for the strict S3-only share profile") {

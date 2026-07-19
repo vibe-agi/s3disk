@@ -35,8 +35,11 @@ const (
 	MaximumResponseHeaderBytes int64 = 64 << 10
 	// MaximumTLSRootCAPEMBytes bounds caller-provisioned trust roots before
 	// parsing and copying them into Reader-owned certificate objects.
-	MaximumTLSRootCAPEMBytes   = 4 << 20
-	maximumTLSRootCertificates = 1024
+	MaximumTLSRootCAPEMBytes = 4 << 20
+	// MaximumTLSRootCertificates bounds certificate parsing work and the
+	// Reader-owned trust pool. Producers should enforce the same limit before
+	// distributing a handoff so an accepted share cannot fail only at mount.
+	MaximumTLSRootCertificates = 1024
 	// DefaultMaxConnectionsPerHost bounds direct Reader use even when callers
 	// bypass Consumer's download semaphore.
 	DefaultMaxConnectionsPerHost = 64
@@ -897,13 +900,35 @@ func parseLockedTLSRootCAPEM(encoded []byte) (*x509.CertPool, error) {
 	remaining := append([]byte(nil), encoded...)
 	pool := x509.NewCertPool()
 	count := 0
-	for len(bytes.TrimSpace(remaining)) != 0 {
-		block, rest := pem.Decode(remaining)
-		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+	for {
+		remaining = bytes.TrimLeft(remaining, " \t\r\n")
+		if len(remaining) == 0 {
+			break
+		}
+		if !bytes.HasPrefix(remaining, []byte("-----BEGIN CERTIFICATE-----")) {
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
+		}
+		const endMarker = "-----END CERTIFICATE-----"
+		endOffset := bytes.Index(remaining, []byte(endMarker))
+		if endOffset < 0 || bytes.Contains(
+			remaining[len("-----BEGIN CERTIFICATE-----"):endOffset],
+			[]byte("-----BEGIN "),
+		) {
+			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
+		}
+		candidateEnd := endOffset + len(endMarker)
+		if candidateEnd < len(remaining) && remaining[candidateEnd] == '\r' {
+			candidateEnd++
+		}
+		if candidateEnd < len(remaining) && remaining[candidateEnd] == '\n' {
+			candidateEnd++
+		}
+		block, rest := pem.Decode(remaining[:candidateEnd])
+		if block == nil || len(bytes.TrimSpace(rest)) != 0 || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
 			return nil, fmt.Errorf("presignedshare: TLS root CA PEM is malformed")
 		}
 		count++
-		if count > maximumTLSRootCertificates {
+		if count > MaximumTLSRootCertificates {
 			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains too many certificates")
 		}
 		certificate, err := x509.ParseCertificate(append([]byte(nil), block.Bytes...))
@@ -911,7 +936,7 @@ func parseLockedTLSRootCAPEM(encoded []byte) (*x509.CertPool, error) {
 			return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains an invalid certificate")
 		}
 		pool.AddCert(certificate)
-		remaining = rest
+		remaining = remaining[candidateEnd:]
 	}
 	if count == 0 {
 		return nil, fmt.Errorf("presignedshare: TLS root CA PEM contains no certificates")

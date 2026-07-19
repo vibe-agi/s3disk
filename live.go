@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -27,7 +28,10 @@ type WatchOptions struct {
 	// publication remains committed, OnError reports the failure, and a later
 	// reconciliation retries AfterPublished for the same generation.
 	//
-	// The hook must honor ctx so Watch can stop promptly when its caller cancels.
+	// AfterPublished runs in the publication worker while OnPublished and OnError
+	// run in the watch loop. A later generation's hook can therefore overlap an
+	// earlier callback. All callbacks must be concurrency-safe and return promptly;
+	// a blocking callback delays Watch shutdown. AfterPublished must also honor ctx.
 	AfterPublished func(ctx context.Context, snapshot Snapshot) error
 	OnPublished    func(Snapshot)
 	OnError        func(error)
@@ -56,7 +60,7 @@ func (publisher *Publisher) WatchSelected(
 	paths []string,
 	options WatchOptions,
 ) error {
-	selection, err := newPathSelection(paths)
+	selection, err := newPathSelectionContext(ctx, paths)
 	if err != nil {
 		return err
 	}
@@ -75,6 +79,12 @@ func (publisher *Publisher) watch(
 	options WatchOptions,
 	publish func(context.Context) (Snapshot, error),
 ) error {
+	if ctx == nil {
+		return fmt.Errorf("s3disk: watch context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := publisher.repository.validateChannel(channel); err != nil {
 		return err
 	}
@@ -90,19 +100,23 @@ func (publisher *Publisher) watch(
 	if options.ReconcileInterval == 0 {
 		options.ReconcileInterval = 5 * time.Minute
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("create filesystem watcher: %w", err)
 	}
-	defer watcher.Close()
+	defer func() { _ = watcher.Close() }()
 	watchTree := newBoundedWatchTree(watcher)
-	if err := watchTree.Add(source); err != nil {
+	if err := watchTree.Add(ctx, source); err != nil {
 		return err
 	}
 
 	type publishResult struct {
-		snapshot Snapshot
-		err      error
+		snapshot  Snapshot
+		err       error
+		reconcile bool
 	}
 	requests := make(chan struct{}, 1)
 	results := make(chan publishResult, 1)
@@ -111,6 +125,7 @@ func (publisher *Publisher) watch(
 	go func() {
 		defer close(workerDone)
 		var lastAcknowledged uint64
+		var pendingAfterPublished *Snapshot
 		for {
 			select {
 			case <-workerCtx.Done():
@@ -119,11 +134,37 @@ func (publisher *Publisher) watch(
 				if !ok {
 					return
 				}
+				// A repository generation which has not passed AfterPublished is
+				// a publication barrier. Retry that exact snapshot before scanning
+				// and committing a later generation; otherwise a root recovery WAL
+				// can retain Pending(N) while the repository advances to N+1.
+				if pendingAfterPublished != nil {
+					snapshot := *pendingAfterPublished
+					err := invokeWatchAfterPublished(workerCtx, options, snapshot)
+					reconcile := false
+					if err == nil {
+						lastAcknowledged = snapshot.Generation
+						pendingAfterPublished = nil
+						// Reconcile source changes which accumulated behind the
+						// barrier without requiring another filesystem event. The
+						// watch loop remains the only requests sender.
+						reconcile = true
+					}
+					select {
+					case results <- publishResult{snapshot: snapshot, err: err, reconcile: reconcile}:
+					case <-workerCtx.Done():
+						return
+					}
+					continue
+				}
 				snapshot, err := publish(workerCtx)
 				if err == nil && snapshot.Generation > lastAcknowledged {
 					err = invokeWatchAfterPublished(workerCtx, options, snapshot)
 					if err == nil {
 						lastAcknowledged = snapshot.Generation
+					} else {
+						pending := snapshot
+						pendingAfterPublished = &pending
 					}
 				}
 				select {
@@ -138,8 +179,9 @@ func (publisher *Publisher) watch(
 		// Watch can stop because the fsnotify channels failed while the caller's
 		// context remains live. Cancel the in-flight publication before waiting,
 		// otherwise a blocked store operation could make this return hang forever.
+		// requests is intentionally not closed. Cancellation is the sole worker
+		// shutdown signal, so no receiver can race with channel teardown.
 		cancelWorker()
-		close(requests)
 		<-workerDone
 	}()
 
@@ -178,6 +220,27 @@ func (publisher *Publisher) watch(
 	var lastPublished uint64
 	watchEvents := watcher.Events
 	watchErrors := watcher.Errors
+	rebuildWatchTree := func() error {
+		replacement, err := fsnotify.NewWatcher()
+		if err != nil {
+			return fmt.Errorf("recreate filesystem watcher: %w", err)
+		}
+		replacementTree := newBoundedWatchTree(replacement)
+		if err := replacementTree.Add(ctx, source); err != nil {
+			_ = replacement.Close()
+			return fmt.Errorf("rebuild filesystem watch tree: %w", err)
+		}
+
+		previous := watcher
+		watcher = replacement
+		watchTree = replacementTree
+		watchEvents = replacement.Events
+		watchErrors = replacement.Errors
+		if err := previous.Close(); err != nil && !errors.Is(err, fsnotify.ErrClosed) {
+			return fmt.Errorf("close replaced filesystem watcher: %w", err)
+		}
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -186,9 +249,30 @@ func (publisher *Publisher) watch(
 			if !ok {
 				return fmt.Errorf("s3disk: filesystem watcher closed")
 			}
-			if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
-				if info, statErr := os.Lstat(event.Name); statErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
-					if addErr := watchTree.Add(event.Name); addErr != nil {
+			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && watchTree.Contains(event.Name) {
+				// kqueue and similar backends can retain internal child state after
+				// the user-visible directory watch is removed. Rebuild the complete
+				// watcher before a same-path incarnation can inherit stale entries.
+				if rebuildErr := rebuildWatchTree(); rebuildErr == nil {
+					resetDebounce()
+					continue
+				} else {
+					reportWatchError(options, rebuildErr)
+				}
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				info, statErr := os.Lstat(event.Name)
+				realDirectory := statErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
+				if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && !realDirectory {
+					if removeErr := watchTree.Remove(event.Name); removeErr != nil {
+						reportWatchError(options, removeErr)
+					}
+				}
+				if realDirectory {
+					if addErr := watchTree.Add(ctx, event.Name); addErr != nil {
 						reportWatchError(options, addErr)
 					}
 				}
@@ -224,26 +308,43 @@ func (publisher *Publisher) watch(
 				lastPublished = result.snapshot.Generation
 				invokeWatchPublished(options, result.snapshot)
 			}
+			if result.reconcile {
+				requestPublish()
+			}
 		}
 	}
 }
 
 type boundedWatchTree struct {
 	watcher *fsnotify.Watcher
-	paths   map[string]struct{}
+	paths   map[string]os.FileInfo
 }
 
 func newBoundedWatchTree(watcher *fsnotify.Watcher) *boundedWatchTree {
-	return &boundedWatchTree{watcher: watcher, paths: make(map[string]struct{})}
+	return &boundedWatchTree{watcher: watcher, paths: make(map[string]os.FileInfo)}
+}
+
+func (tree *boundedWatchTree) Contains(watchPath string) bool {
+	_, exists := tree.paths[filepath.Clean(watchPath)]
+	return exists
 }
 
 // Add recursively registers a tree while materializing only bounded child
 // directory descriptors. It also refuses symlinks and applies the same path,
 // depth, and per-directory entry bounds as the publication protocol.
-func (tree *boundedWatchTree) Add(rootPath string) error {
+func (tree *boundedWatchTree) Add(ctx context.Context, rootPath string) error {
+	if ctx == nil {
+		return fmt.Errorf("s3disk: watch-tree context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	absolute, err := filepath.Abs(rootPath)
 	if err != nil {
 		return fmt.Errorf("resolve watch root: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	rootInfo, err := os.Lstat(absolute)
 	if err != nil {
@@ -259,6 +360,9 @@ func (tree *boundedWatchTree) Add(rootPath string) error {
 	defer root.Close()
 
 	revalidate := func(relative string, expected os.FileInfo) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		handle, openErr := root.Open(relative)
 		if openErr != nil {
 			return fmt.Errorf("%w: reopen watched directory %q: %v", ErrUnstableFile, relative, openErr)
@@ -277,6 +381,9 @@ func (tree *boundedWatchTree) Add(rootPath string) error {
 
 	var walk func(string, os.FileInfo, int) error
 	walk = func(relative string, expected os.FileInfo, depth int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if depth > maxLookupDepth || len(relative) > maxLookupPathBytes {
 			return fmt.Errorf("%w: watch path exceeds protocol depth or length", ErrResourceLimit)
 		}
@@ -298,7 +405,7 @@ func (tree *boundedWatchTree) Add(rootPath string) error {
 		if relative != "." {
 			absoluteDirectory = filepath.Join(absolute, filepath.FromSlash(relative))
 		}
-		if err := tree.addOne(absoluteDirectory); err != nil {
+		if err := tree.addOne(absoluteDirectory, before); err != nil {
 			return err
 		}
 
@@ -309,12 +416,18 @@ func (tree *boundedWatchTree) Add(rootPath string) error {
 		children := make([]childDirectory, 0)
 		entriesSeen := 0
 		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			batch, readErr := handle.ReadDir(256)
 			entriesSeen += len(batch)
 			if entriesSeen > maxDirectoryEntries {
 				return fmt.Errorf("%w: watched directory %q exceeds %d entries", ErrResourceLimit, relative, maxDirectoryEntries)
 			}
 			for _, entry := range batch {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				name := entry.Name()
 				if len(name) == 0 || len(name) > maxEntryNameBytes {
 					return fmt.Errorf("%w: invalid watched entry name in %q", ErrResourceLimit, relative)
@@ -367,19 +480,44 @@ func (tree *boundedWatchTree) Add(rootPath string) error {
 	return walk(".", rootInfo, 0)
 }
 
-func (tree *boundedWatchTree) addOne(watchPath string) error {
+func (tree *boundedWatchTree) addOne(watchPath string, expected os.FileInfo) error {
 	watchPath = filepath.Clean(watchPath)
-	if _, exists := tree.paths[watchPath]; exists {
-		return nil
+	if watched, exists := tree.paths[watchPath]; exists {
+		// Backends automatically discard watches when the target disappears.
+		// Keep the bounded local index only as a fast path, and confirm both the
+		// filesystem incarnation and backend registration before trusting it.
+		backendHasPath := false
+		for _, existing := range tree.watcher.WatchList() {
+			if filepath.Clean(existing) == watchPath {
+				backendHasPath = true
+				break
+			}
+		}
+		if os.SameFile(watched, expected) && backendHasPath {
+			return nil
+		}
+		if !os.SameFile(watched, expected) {
+			// The path now names a different directory. Remove every cached watch
+			// below the old incarnation before registering the replacement tree.
+			if err := tree.Remove(watchPath); err != nil {
+				return err
+			}
+		} else {
+			delete(tree.paths, watchPath)
+		}
 	}
 	if len(tree.paths) >= maxWatchDirectories {
 		// Removed/renamed watches may have disappeared in the backend. Rebuild the
 		// local index only at the limit, avoiding an O(n^2) WatchList call pattern.
 		clear(tree.paths)
 		for _, existing := range tree.watcher.WatchList() {
-			tree.paths[filepath.Clean(existing)] = struct{}{}
+			existing = filepath.Clean(existing)
+			info, err := os.Lstat(existing)
+			if err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				tree.paths[existing] = info
+			}
 		}
-		if _, exists := tree.paths[watchPath]; exists {
+		if watched, exists := tree.paths[watchPath]; exists && os.SameFile(watched, expected) {
 			return nil
 		}
 		if len(tree.paths) >= maxWatchDirectories {
@@ -389,8 +527,30 @@ func (tree *boundedWatchTree) addOne(watchPath string) error {
 	if err := tree.watcher.Add(watchPath); err != nil {
 		return fmt.Errorf("watch directory %q: %w", watchPath, err)
 	}
-	tree.paths[watchPath] = struct{}{}
+	tree.paths[watchPath] = expected
 	return nil
+}
+
+// Remove invalidates watches rooted at a removed or renamed filesystem path.
+// A directory watch is not recursive, so every registered descendant must be
+// removed as well. Backend removal is best-effort because several fsnotify
+// implementations discard the watch before delivering the terminal event.
+func (tree *boundedWatchTree) Remove(rootPath string) error {
+	rootPath = filepath.Clean(rootPath)
+	var firstErr error
+	for watchPath := range tree.paths {
+		relative, err := filepath.Rel(rootPath, watchPath)
+		if err != nil || relative == ".." || filepath.IsAbs(relative) ||
+			strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			continue
+		}
+		delete(tree.paths, watchPath)
+		if err := tree.watcher.Remove(watchPath); err != nil &&
+			!errors.Is(err, fsnotify.ErrNonExistentWatch) && firstErr == nil {
+			firstErr = fmt.Errorf("remove stale watch %q: %w", watchPath, err)
+		}
+	}
+	return firstErr
 }
 
 func reportWatchError(options WatchOptions, err error) {

@@ -29,6 +29,7 @@ const (
 // A nil function selects the production implementation.
 type Dependencies struct {
 	Publish             func(context.Context, PublishOptions) error
+	Resume              func(context.Context, ResumeOptions) error
 	GenerateRecoveryKey func(context.Context, RecoveryKeyGenerateOptions) error
 	Mount               func(context.Context, MountOptions) error
 	Doctor              func(context.Context, DoctorOptions, io.Writer) error
@@ -49,9 +50,19 @@ type PublishOptions struct {
 	ExpiresIn             time.Duration
 	HandoffOut            string
 	StateDir              string
+	RecoveryKey           string
 	TLSCAFile             string
 	Once                  bool
 	StatusWriter          io.Writer
+	ErrorWriter           io.Writer
+}
+
+type ResumeOptions struct {
+	StateDir     string
+	ShareID      string
+	RecoveryKey  string
+	StatusWriter io.Writer
+	ErrorWriter  io.Writer
 }
 
 type MountOptions struct {
@@ -88,6 +99,9 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	if dependencies.Publish == nil {
 		dependencies.Publish = runPublish
 	}
+	if dependencies.Resume == nil {
+		dependencies.Resume = runResume
+	}
 	if dependencies.GenerateRecoveryKey == nil {
 		dependencies.GenerateRecoveryKey = runGenerateRecoveryKey
 	}
@@ -115,7 +129,7 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 
 func newShareCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{Use: "share", Short: "Create a time-limited encrypted share", Args: cobra.NoArgs}
-	command.AddCommand(newPublishCommand(dependencies), newRecoveryKeyCommand(dependencies))
+	command.AddCommand(newPublishCommand(dependencies), newResumeCommand(dependencies), newRecoveryKeyCommand(dependencies))
 	return command
 }
 
@@ -158,6 +172,7 @@ func newPublishCommand(dependencies Dependencies) *cobra.Command {
 				return err
 			}
 			options.StatusWriter = command.OutOrStdout()
+			options.ErrorWriter = command.ErrOrStderr()
 			return dependencies.Publish(command.Context(), clonePublishOptions(options))
 		},
 	}
@@ -177,8 +192,32 @@ func newPublishCommand(dependencies Dependencies) *cobra.Command {
 	flags.DurationVar(&options.ExpiresIn, "expires-in", defaultShareExpiry, "fixed authorization lifetime")
 	flags.StringVar(&options.HandoffOut, "handoff-out", "", "new 0600 handoff file to give B privately")
 	flags.StringVar(&options.StateDir, "state-dir", "", "private durable state directory on A")
+	flags.StringVar(&options.RecoveryKey, "recovery-key", "", "private publisher recovery-key file")
 	flags.StringVar(&options.TLSCAFile, "tls-ca", "", "PEM trust roots embedded in the handoff")
 	flags.BoolVar(&options.Once, "once", false, "publish one snapshot and exit")
+	return command
+}
+
+func newResumeCommand(dependencies Dependencies) *cobra.Command {
+	options := ResumeOptions{}
+	command := &cobra.Command{
+		Use:   "resume",
+		Short: "Resume an existing A-side publisher session",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if err := validateResumeOptions(&options); err != nil {
+				return err
+			}
+			options.StatusWriter = command.OutOrStdout()
+			options.ErrorWriter = command.ErrOrStderr()
+			return dependencies.Resume(command.Context(), options)
+		},
+	}
+	flags := command.Flags()
+	flags.SortFlags = false
+	flags.StringVar(&options.StateDir, "state-dir", "", "private durable state directory on A")
+	flags.StringVar(&options.ShareID, "share-id", "", "share identity to resume")
+	flags.StringVar(&options.RecoveryKey, "recovery-key", "", "private publisher recovery-key file")
 	return command
 }
 
@@ -255,7 +294,7 @@ func validatePublishOptions(options *PublishOptions) error {
 	for _, field := range []struct{ name, value string }{
 		{"--source", options.Source}, {"--bucket", options.Bucket}, {"--prefix", options.Prefix},
 		{"--handoff-out", options.HandoffOut}, {"--state-dir", options.StateDir}, {"--region", options.Region},
-		{"--channel", options.Channel},
+		{"--recovery-key", options.RecoveryKey}, {"--channel", options.Channel},
 	} {
 		if strings.TrimSpace(field.value) == "" {
 			return fmt.Errorf("s3disk share publish: %s is required", field.name)
@@ -283,6 +322,31 @@ func validatePublishOptions(options *PublishOptions) error {
 	}
 	if pathWithin(options.HandoffOut, options.Source) || pathWithin(options.HandoffOut, options.StateDir) {
 		return errors.New("s3disk share publish: --handoff-out must be outside --source and --state-dir")
+	}
+	if pathWithin(options.RecoveryKey, options.Source) || pathWithin(options.RecoveryKey, options.StateDir) ||
+		pathsOverlap(options.RecoveryKey, options.HandoffOut) {
+		return errors.New("s3disk share publish: --recovery-key must be outside --source and --state-dir and differ from --handoff-out")
+	}
+	return nil
+}
+
+func validateResumeOptions(options *ResumeOptions) error {
+	if options == nil {
+		return errors.New("s3disk share resume: options are required")
+	}
+	for _, field := range []struct{ name, value string }{
+		{"--state-dir", options.StateDir}, {"--share-id", options.ShareID}, {"--recovery-key", options.RecoveryKey},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("s3disk share resume: %s is required", field.name)
+		}
+	}
+	shareID, err := presignedshare.ParseShareID(options.ShareID)
+	if err != nil || shareID.String() != options.ShareID {
+		return errors.New("s3disk share resume: --share-id is invalid")
+	}
+	if pathWithin(options.RecoveryKey, options.StateDir) {
+		return errors.New("s3disk share resume: --recovery-key must be outside --state-dir")
 	}
 	return nil
 }

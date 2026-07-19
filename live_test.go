@@ -72,6 +72,93 @@ func TestPublisherWatchAndConsumerPollConverge(t *testing.T) {
 	}
 }
 
+func TestPublisherWatchReinstallsRecreatedDirectoryWatch(t *testing.T) {
+	for _, operation := range []string{"remove", "rename"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			repository, err := s3disk.NewRepository(memstore.New(), "watch-recreated-directory-"+operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher, err := s3disk.NewPublisher(repository, s3disk.PublisherOptions{
+				DangerouslyAllowUncommissionedRepository: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := privateTestDirectory(t)
+			nested := filepath.Join(source, "nested")
+			if err := os.Mkdir(nested, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(nested, "data"), []byte("initial"))
+
+			published := make(chan s3disk.Snapshot, 16)
+			watchErrors := make(chan error, 16)
+			watchDone := make(chan error, 1)
+			go func() {
+				watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
+					Debounce:          10 * time.Millisecond,
+					ReconcileInterval: -1,
+					OnPublished:       func(snapshot s3disk.Snapshot) { published <- snapshot },
+					OnError:           func(err error) { watchErrors <- err },
+				})
+			}()
+			waitSnapshotGeneration(t, published, watchErrors, 1)
+			consumer := newConsumer(t, repository, "main")
+
+			switch operation {
+			case "remove":
+				if err := os.RemoveAll(nested); err != nil {
+					t.Fatal(err)
+				}
+			case "rename":
+				moved := filepath.Join(privateTestDirectory(t), "moved")
+				if err := os.Rename(nested, moved); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Fatalf("unknown operation %q", operation)
+			}
+			waitSnapshotGeneration(t, published, watchErrors, 2)
+
+			// Recreating the empty directory is observed by its watched parent and
+			// must reinstall the nested watch, even though the path is unchanged.
+			if err := os.Mkdir(nested, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			waitSnapshotGeneration(t, published, watchErrors, 3)
+
+			// These changes are visible only through the reinstalled nested watch;
+			// periodic reconciliation is deliberately disabled for this test.
+			filename := filepath.Join(nested, "data")
+			staged := filepath.Join(privateTestDirectory(t), "created")
+			writeFile(t, staged, []byte("created"))
+			if err := os.Rename(staged, filename); err != nil {
+				t.Fatal(err)
+			}
+			waitSnapshotFileContent(t, published, watchErrors, consumer, 4, "nested/data", "created")
+			staged = filepath.Join(privateTestDirectory(t), "modified")
+			writeFile(t, staged, []byte("modified after recreation"))
+			if err := os.Remove(filename); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(staged, filename); err != nil {
+				t.Fatal(err)
+			}
+			waitSnapshotFileContent(
+				t, published, watchErrors, consumer, 5, "nested/data", "modified after recreation",
+			)
+
+			cancel()
+			if err := <-watchDone; !errors.Is(err, context.Canceled) {
+				t.Fatalf("watch stopped with %v", err)
+			}
+		})
+	}
+}
+
 func TestPublisherWatchSelectedConvergesWithoutExposingSiblings(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -164,7 +251,7 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 		calls := 0
 		watchDone <- publisher.Watch(ctx, source, "main", s3disk.WatchOptions{
 			Debounce:          time.Millisecond,
-			ReconcileInterval: 20 * time.Millisecond,
+			ReconcileInterval: -1,
 			AfterPublished: func(hookCtx context.Context, snapshot s3disk.Snapshot) error {
 				calls++
 				hookCalls <- snapshot
@@ -192,6 +279,10 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for AfterPublished failure")
 	}
+	// A newer source state must remain behind the failed hook barrier. In the
+	// root-share composition this prevents publication N+1 from overtaking a
+	// durable root-WAL Pending(N).
+	writeFile(t, filepath.Join(source, "data"), []byte("changed behind failed hook"))
 	second := waitWatchSnapshot(t, hookCalls, "retried AfterPublished call")
 	if first.Generation != 1 || second.Generation != first.Generation || second.Commit != first.Commit {
 		t.Fatalf("hook snapshots = (%+v, %+v), want the same first publication", first, second)
@@ -205,6 +296,21 @@ func TestPublisherWatchRetriesAfterPublishedForSameGeneration(t *testing.T) {
 	accepted := waitWatchSnapshot(t, published, "OnPublished after hook retry")
 	if accepted.Generation != first.Generation || accepted.Commit != first.Commit {
 		t.Fatalf("accepted snapshot = %+v, want %+v", accepted, first)
+	}
+	advanced := waitWatchSnapshot(t, hookCalls, "AfterPublished for accumulated source change")
+	if advanced.Generation != first.Generation+1 || advanced.Commit == first.Commit {
+		t.Fatalf("advanced hook snapshot = %+v, want generation %d after %+v", advanced, first.Generation+1, first)
+	}
+	advancedAccepted := waitWatchSnapshot(t, published, "OnPublished for accumulated source change")
+	if advancedAccepted.Generation != advanced.Generation || advancedAccepted.Commit != advanced.Commit {
+		t.Fatalf("advanced accepted snapshot = %+v, want %+v", advancedAccepted, advanced)
+	}
+	consumer := newConsumer(t, repository, "main")
+	if result, err := consumer.Refresh(ctx); err != nil || result.Generation != advanced.Generation {
+		t.Fatalf("refresh accumulated source change = %+v, %v", result, err)
+	}
+	if got := string(readFile(t, consumer, "data")); got != "changed behind failed hook" {
+		t.Fatalf("accumulated source content = %q", got)
 	}
 
 	cancel()

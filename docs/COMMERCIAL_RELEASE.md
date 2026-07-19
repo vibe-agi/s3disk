@@ -91,11 +91,17 @@ ready.
   is restored. Its bounded built-in keyring can authenticate retained-key
   envelopes and rewrap them with an active key, but coordinated installation,
   backup migration, and old-key retirement remain product operations. The
-  recovery-key CLI provisions a protected standalone key file, but `share
-  publish` does not yet persist the share key, publisher private signing key, or
-  root capability through this path and cannot resume the same share after A
-  crashes. CLI wiring, external monotonic anchoring, disaster-recovery drills,
-  backup policy, and zeroization remain release work.
+  recovery-key CLI provisions a protected standalone key file. `share publish`
+  now seals the share key, publisher signing seed, original root bearer, fixed
+  deadline, source selection, handoff path, and non-credential S3 configuration;
+  it prepares the root WAL and sealed session before its first S3 object
+  operation. `share resume` authenticates those coordinates, resolves current A
+  credentials, and reconciles the descriptor, publication journal, root WAL,
+  and exact handoff without extending authorization. This closes the missing
+  same-host CLI wiring, but not the commercial blocker: complete-file replay is
+  not detected without an external monotonic anchor, and approved recovery-key
+  rotation, backup restoration, old-key retirement, disaster-recovery drills,
+  memory/core-dump controls, and zeroization remain release work.
 
 <!-- RELEASE-BLOCKER: trust-root-lifecycle -->
 
@@ -161,14 +167,16 @@ ready.
   reconciles pending-process crashes, lost S3 responses, and uncertain journal
   CAS results; an existing target can be recovered with matching identity,
   verifier, and closure but without a signer or presigner, while new targets
-  still require both and remain fixed to the original authorization expiry. The
+  return `ErrRootBuildAuthorityRequired`, require both, and remain fixed to the
+  original authorization expiry. Store errors stay separately classified. The
   current journal rejects an old root or a different authenticated root at the
-  same revision. This narrows but does not close the blocker: `share publish`
-  does not attach the WAL or retain all
-  required secrets, no distributed linearizable multi-host implementation is
-  certified, and coordinated replay of both a complete old journal and its
-  matching S3 root requires an independently protected monotonic anchor. CLI
-  recovery, anchor/backup operations, multi-process and multi-host stress, and
+  same revision. `share publish` now attaches this WAL, seals the other required
+  A-side secrets before S3 object I/O, and `share resume` restores the original
+  fixed-expiry authority. This narrows but does not close the blocker: no
+  distributed linearizable multi-host implementation is certified, and
+  coordinated replay of both complete old local state and its matching S3 root
+  requires an independently protected monotonic anchor. Anchor/backup
+  operations, recovery-key rotation, multi-process and multi-host stress, and
   archived provider evidence remain required.
 
 <!-- RELEASE-BLOCKER: supply-chain-evidence-archive -->
@@ -419,8 +427,9 @@ accept or resolve each one explicitly.
   before the write, after an applied write with its response lost, and after
   applied journal CAS operations whose responses are lost. Restart with no
   signer or presigner and prove that only the existing target is settled;
-  require both dependencies for
-  the next root. Test old-root replay, same-revision replacement, identity and
+  require both dependencies and the dedicated authority-required error for the
+  next root; prove that a Store configuration error never triggers presigning.
+  Test old-root replay, same-revision replacement, identity and
   closure mismatch, corrupt or oversized state, fixed-expiry cancellation, and
   direct plus marker-preserving encryption-wrapper rejection. Certify the
   `SealedStateStore` CAS and durability semantics for every supported topology.
@@ -478,12 +487,19 @@ accept or resolve each one explicitly.
   state; AEAD possession does not identify A. Issue separate prefixes, keys,
   roots, and handoffs wherever per-recipient attribution or revocation is a
   requirement.
-- The current CLI's A-side state directory is not same-share crash recovery: it
-  does not retain the client key, publisher private signer, or root capability.
-  The library's sealed root WAL solves the exact pending-root write window, not
-  this secret-lifecycle integration. Do not certify CLI resume until those
-  secrets have an approved persistence, wrapping, recovery, backup, rotation,
-  and zeroization design and recovery tests.
+- The CLI now provides same-host, same-share crash recovery: an independent
+  recovery key protects the session manifest and root WAL, and `share resume`
+  replays the publication and root journals before continuing. Do not treat
+  that as a complete secret lifecycle. `FileSealedStateStore` cannot detect
+  replay of a complete old state file; there is no coordinated session/root
+  rewrap transaction, KMS integration, recovery-key backup workflow, certified
+  disaster restore, or secure zeroization. Approve and test those controls
+  before certifying commercial recovery.
+- CLI source/state/recovery separation is pathname-based. A hard-link or
+  bind-mount alias can make recovery material appear inside the published
+  source even when its configured path is outside. Production policy must keep
+  those secrets on separately controlled storage and detect aliases; a
+  continuously revalidated forbidden-inode/mount set remains release work.
 - Redacted formatting is not a memory boundary. The raw handoff contains a
   usable client key and bearer, and values may remain visible to reflection,
   debuggers, core dumps, or swap. There is no `mlock`, automatic handoff

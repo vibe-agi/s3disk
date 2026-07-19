@@ -60,7 +60,9 @@ so recovery never has to regenerate presigned URLs or encryption randomness. It
 reconciles crashes and lost S3 or journal-CAS responses by reloading durable
 state and reading the exact root. A recovery-only process with the matching
 identity, verifier, and closure may settle that pending target without a signer
-or presigner, but it needs both before it can create another root.
+or presigner. A genuinely new target returns the specific
+`ErrRootBuildAuthorityRequired`; Store failures remain distinct and must not be
+used as a reason to acquire fresh presigning authority.
 
 Before an application declares the rest of its A-side session state resumable,
 it calls `RootPublisher.PrepareRecovery`. This persists a canonical Prepared
@@ -223,12 +225,20 @@ that exact sealed binding before accepting the imported bearer.
 `RootPublisher` uses the same deadline for root Store calls. An existing exact
 pending target can be recovered without signing again, but recovery cannot renew
 or extend the share and does not initiate a new write after local expiry.
+After `RestoreRootPublisher`, `RecoverPending` must run before a newer
+publication is reconciled. It uses only the authenticated WAL target and exact
+conditional-write precondition; signer and presigner are required lazily only
+when the latest signed reference needs a genuinely new root target.
 A conditional write already in flight at the boundary may still commit remotely
 after cancellation and remain ambiguous; recovery uses the exact pending WAL
-target to reconcile it. The current CLI does not persist enough of those
-secrets or attach the root recovery journal and has no same-share resume
-command; restarting `share publish` creates a new share and handoff. The root
-URL handed to B never changes during one share.
+target to reconcile it. The CLI now seals the complete A-side per-share session
+and attaches the exact root WAL before its first S3 object operation.
+`share resume` accepts only state directory, canonical share ID, and recovery-key
+path; all source, namespace, endpoint, handoff, and deadline values come from
+authenticated state and cannot be overridden. It resolves current A credentials
+again, reconciles both authoritative journals, and retains the original root
+URL and absolute deadline. A new `share publish` still creates an unrelated
+share and must not be used as recovery.
 
 After the deadline, `presignedshare.Reader` refuses reads locally without
 network I/O. A mount pins the reader's deadline when it starts and initiates a
@@ -470,10 +480,17 @@ closure, and S3-only constraints.
   and B's watermark in separate protected durable storage. Neither is
   bootstrapped from an untrusted S3 object. Back `RootPublisher` with a
   linearizable `SealedStateStore`, and add an external monotonic anchor if
-  coordinated journal-plus-S3 rollback is in scope. The current CLI does not
-  persist the client key, publisher private signing key, or root capability
-  needed to resume the same share; define secure persistence, recovery, backup,
-  rotation, and zeroization before certifying CLI resume.
+  coordinated journal-plus-S3 rollback is in scope. The CLI persists the client
+  key, publisher signing seed, and root capability only inside an independently
+  keyed sealed session and can resume the same share. Before certifying a
+  commercial deployment, still define recovery-key backup and rotation,
+  external freshness anchoring, disaster-recovery restoration, old-key
+  retirement, memory/core-dump handling, and zeroization.
+- Treat source/state/recovery path separation as necessary but not sufficient:
+  a hard-link or bind-mount alias can expose the same secret inode through the
+  source tree. Keep recovery material on separately controlled storage and add
+  deployment alias checks until the publisher supports a continuously
+  revalidated forbidden-inode/mount policy.
 - Protect the handoff, share key, bearer URLs, and cached plaintext from logs,
   command lines, crash reports, telemetry, and other local users. `DiskCache`
   is plaintext even though its S3 source objects are ciphertext; allocate a

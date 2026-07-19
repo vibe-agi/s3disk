@@ -69,7 +69,7 @@ func TestDeepDirectoryTraversalStaysBelowLowFileDescriptorLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer watcher.Close()
-	if err := newBoundedWatchTree(watcher).Add(source); err != nil {
+	if err := newBoundedWatchTree(watcher).Add(context.Background(), source); err != nil {
 		t.Fatalf("watch traversal exceeded a %d-descriptor headroom: %v", descriptorHeadroom, err)
 	}
 }

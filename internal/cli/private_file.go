@@ -19,6 +19,8 @@ var (
 	ErrPrivateFileInstalledUnconfirmed = errors.New("s3disk: private output is installed but cleanup or durability is unconfirmed")
 )
 
+const maximumPrivateStagingScanEntries = 100_000
+
 type privateFileInstaller func(temporary, destination string) error
 
 type privateFileWriteResult struct {
@@ -32,7 +34,130 @@ type privateFileWriteResult struct {
 
 func (result privateFileWriteResult) needsReconciliation() bool {
 	return result.InstallAttempted && (!result.InstallResolved ||
-		(result.Installed && (!result.CleanupConfirmed || !result.DurabilityConfirmed)))
+		!result.CleanupConfirmed || !result.DurabilityConfirmed)
+}
+
+// reconcileInstalledPrivateFileStaging removes only reserved staging names
+// which still identify the exact installed inode. This carries a hard-link
+// install's cleanup obligation across process restarts without deleting an
+// unrelated file which merely happens to match the temporary-name pattern.
+// The caller must sync the directory after this returns, whether it succeeds
+// or fails, so removals and the installed destination share one durability
+// barrier.
+func reconcileInstalledPrivateFileStaging(
+	ctx context.Context,
+	absolute resolvedPrivatePath,
+	temporaryPattern string,
+	operations privateFileOperations,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("s3disk: private staging reconciliation context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	operations = operations.withDefaults()
+	path := string(absolute)
+	wildcard := strings.LastIndexByte(temporaryPattern, '*')
+	if path == "" || !filepath.IsAbs(path) || wildcard < 0 ||
+		strings.Count(temporaryPattern, "*") != 1 ||
+		strings.ContainsRune(temporaryPattern, filepath.Separator) {
+		return fmt.Errorf("s3disk: invalid private staging reconciliation configuration")
+	}
+	prefix := temporaryPattern[:wildcard]
+	suffix := temporaryPattern[wildcard+1:]
+	matchesTemporaryName := func(name string) bool {
+		return len(name) > len(prefix)+len(suffix) &&
+			strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix)
+	}
+
+	directory := filepath.Dir(path)
+	if err := s3disk.ValidatePrivateSecretDirectory(directory); err != nil {
+		return fmt.Errorf("s3disk: unsafe private staging directory: %w", err)
+	}
+	installedPathInfo, err := os.Lstat(path)
+	if err != nil || installedPathInfo.Mode()&os.ModeSymlink != 0 || !installedPathInfo.Mode().IsRegular() {
+		return fmt.Errorf("s3disk: installed private output is not a regular non-symlink file")
+	}
+	installed, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("s3disk: open installed private output: %w", err)
+	}
+	installedInfo, statErr := installed.Stat()
+	validationErr := s3disk.ValidatePrivateSecretFile(path, installed)
+	closeErr := installed.Close()
+	if statErr != nil || validationErr != nil || closeErr != nil ||
+		!os.SameFile(installedPathInfo, installedInfo) {
+		return fmt.Errorf("s3disk: installed private output changed before staging reconciliation")
+	}
+
+	directoryFile, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("s3disk: open private staging directory: %w", err)
+	}
+	directoryOpen := true
+	defer func() {
+		if directoryOpen {
+			_ = directoryFile.Close()
+		}
+	}()
+	entriesSeen := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entries, readErr := directoryFile.ReadDir(256)
+		entriesSeen += len(entries)
+		if entriesSeen > maximumPrivateStagingScanEntries {
+			return fmt.Errorf("s3disk: %w: private staging directory exceeds %d entries", s3disk.ErrResourceLimit, maximumPrivateStagingScanEntries)
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := entry.Name()
+			if name == filepath.Base(path) || !matchesTemporaryName(name) {
+				continue
+			}
+			candidate := filepath.Join(directory, name)
+			candidateInfo, candidateErr := os.Lstat(candidate)
+			if errors.Is(candidateErr, os.ErrNotExist) {
+				continue
+			}
+			if candidateErr != nil {
+				return fmt.Errorf("s3disk: inspect staged private output: %w", candidateErr)
+			}
+			if candidateInfo.Mode()&os.ModeSymlink != 0 || !candidateInfo.Mode().IsRegular() ||
+				!os.SameFile(installedInfo, candidateInfo) {
+				continue
+			}
+
+			// Recheck both pathnames immediately before unlinking. The surrounding
+			// private-directory ownership policy excludes untrusted writers; this
+			// second identity check also fails closed on accidental concurrent use.
+			currentInstalled, installedErr := os.Lstat(path)
+			currentCandidate, stagedErr := os.Lstat(candidate)
+			if installedErr != nil || stagedErr != nil ||
+				!os.SameFile(installedInfo, currentInstalled) ||
+				!os.SameFile(installedInfo, currentCandidate) {
+				return fmt.Errorf("s3disk: private staging alias changed during reconciliation")
+			}
+			if err := operations.remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("s3disk: remove installed private staging alias: %w", err)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("s3disk: read private staging directory: %w", readErr)
+		}
+	}
+	if err := directoryFile.Close(); err != nil {
+		return fmt.Errorf("s3disk: close private staging directory: %w", err)
+	}
+	directoryOpen = false
+	return nil
 }
 
 type privateFileOperations struct {
@@ -157,32 +282,15 @@ func writePrivateFileNoReplace(
 	result := privateFileWriteResult{InstallAttempted: true}
 	installErr := operations.install(temporary, path)
 	reconciliation, reconciliationErr := reconcilePrivateFile(path, stagedInfo)
-	if !reconciliation.sameStagingFile {
-		if errors.Is(installErr, os.ErrExist) && reconciliation.validatedOtherFile {
-			result.InstallResolved = true
-			result.NotInstalledConfirmed = true
-			return result, errPrivateFileExists
-		}
-		if installErr != nil && errors.Is(reconciliationErr, os.ErrNotExist) {
-			result.InstallResolved = true
-			result.NotInstalledConfirmed = true
-			return result, fmt.Errorf("s3disk: private output installer: %w", installErr)
-		}
-		if installErr != nil {
-			installErr = fmt.Errorf("s3disk: private output installer: %w", installErr)
-		}
-		if reconciliationErr != nil {
-			reconciliationErr = fmt.Errorf("s3disk: reconcile installed private output: %w", reconciliationErr)
-		}
-		return result, errors.Join(ErrPrivateFileInstallIndeterminate, installErr, reconciliationErr)
-	}
-
-	result.InstallResolved = true
-	result.Installed = true
+	// Once installation has been attempted, every outcome must explicitly
+	// settle the staged secret and make both its removal and any destination
+	// entry durable. A deferred best-effort unlink is not sufficient evidence
+	// for an idempotent caller to turn an ambiguous install into success.
 	removeErr := operations.remove(temporary)
 	if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
 		removeTemporary = false
 		result.CleanupConfirmed = true
+		removeErr = nil
 	} else {
 		removeErr = fmt.Errorf("s3disk: remove staged private output: %w", removeErr)
 	}
@@ -192,8 +300,38 @@ func writePrivateFileNoReplace(
 	} else {
 		syncErr = fmt.Errorf("s3disk: sync private output directory: %w", syncErr)
 	}
-	if removeErr != nil || syncErr != nil {
-		return result, errors.Join(ErrPrivateFileInstalledUnconfirmed, removeErr, syncErr)
+	cleanupBarrierErr := errors.Join(removeErr, syncErr)
+	if !reconciliation.sameStagingFile {
+		if errors.Is(installErr, os.ErrExist) && reconciliation.validatedOtherFile {
+			result.InstallResolved = true
+			result.NotInstalledConfirmed = true
+			if cleanupBarrierErr != nil {
+				return result, errors.Join(ErrPrivateFileInstallIndeterminate, errPrivateFileExists, cleanupBarrierErr)
+			}
+			return result, errPrivateFileExists
+		}
+		if installErr != nil && errors.Is(reconciliationErr, os.ErrNotExist) {
+			result.InstallResolved = true
+			result.NotInstalledConfirmed = true
+			classifiedErr := fmt.Errorf("s3disk: private output installer: %w", installErr)
+			if cleanupBarrierErr != nil {
+				classifiedErr = errors.Join(ErrPrivateFileInstallIndeterminate, classifiedErr, cleanupBarrierErr)
+			}
+			return result, classifiedErr
+		}
+		if installErr != nil {
+			installErr = fmt.Errorf("s3disk: private output installer: %w", installErr)
+		}
+		if reconciliationErr != nil {
+			reconciliationErr = fmt.Errorf("s3disk: reconcile installed private output: %w", reconciliationErr)
+		}
+		return result, errors.Join(ErrPrivateFileInstallIndeterminate, installErr, reconciliationErr, cleanupBarrierErr)
+	}
+
+	result.InstallResolved = true
+	result.Installed = true
+	if cleanupBarrierErr != nil {
+		return result, errors.Join(ErrPrivateFileInstalledUnconfirmed, cleanupBarrierErr)
 	}
 	return result, nil
 }

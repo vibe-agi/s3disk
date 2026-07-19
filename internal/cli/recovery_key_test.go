@@ -91,7 +91,7 @@ func TestRecoveryKeyFileRejectsStrictJSONDamageAndWrongKeyID(t *testing.T) {
 	}
 	marshal := func(value recoveryKeyFile) []byte {
 		t.Helper()
-		encoded, err := json.Marshal(value)
+		encoded, err := json.Marshal(recoveryKeyFileWire(value))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -312,6 +312,10 @@ func TestRecoveryKeyDiagnosticsAndCommandOutputRedactSecret(t *testing.T) {
 		t.Fatalf("unsafe status output: %q", stdout.String())
 	}
 	wire := recoveryKeyFile{Format: recoveryKeyFileFormat, KeyID: loaded.keyID, RecoveryKey: secret}
+	diagnosticJSON, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, diagnostic := range map[string]string{
 		"wire String":       fmt.Sprint(wire),
 		"wire detailed":     fmt.Sprintf("%+v", wire),
@@ -319,6 +323,7 @@ func TestRecoveryKeyDiagnosticsAndCommandOutputRedactSecret(t *testing.T) {
 		"material String":   fmt.Sprint(loaded),
 		"material detailed": fmt.Sprintf("%+v", loaded),
 		"material GoString": fmt.Sprintf("%#v", loaded),
+		"wire JSON":         string(diagnosticJSON),
 	} {
 		if strings.Contains(diagnostic, secret) || !strings.Contains(diagnostic, "redacted") {
 			t.Fatalf("%s exposed secret: %q", name, diagnostic)

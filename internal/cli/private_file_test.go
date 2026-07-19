@@ -134,6 +134,36 @@ func TestPrivateFileInstallerErrorWithAbsentFinalIsNotInstalled(t *testing.T) {
 	assertNoPrivateStagingFiles(t, filepath.Dir(path))
 }
 
+func TestPrivateFileAbsentFinalWithCleanupFailureIsIndeterminate(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	path := filepath.Join(t.TempDir(), "private-output")
+	encoded := []byte("private material rejected with unconfirmed staging cleanup")
+	installFailure := errors.New("installer rejected request")
+	cleanupFailure := errors.New("staged unlink failed")
+	syncCalls := 0
+	operations := privateFileOperationsFor(func(string, string) error { return installFailure })
+	operations.remove = func(string) error { return cleanupFailure }
+	operations.syncDirectory = func(string) error {
+		syncCalls++
+		return nil
+	}
+
+	result, err := writePrivateFileForTest(context.Background(), path, encoded, operations)
+	if !errors.Is(err, ErrPrivateFileInstallIndeterminate) ||
+		!errors.Is(err, installFailure) || !errors.Is(err, cleanupFailure) {
+		t.Fatalf("error = %v, want classified install and cleanup uncertainty", err)
+	}
+	if !result.InstallAttempted || !result.InstallResolved || !result.NotInstalledConfirmed ||
+		result.Installed || result.CleanupConfirmed || !result.DurabilityConfirmed || !result.needsReconciliation() {
+		t.Fatalf("result = %+v, want not-installed with cleanup uncertainty", result)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("directory sync calls = %d, want 1", syncCalls)
+	}
+	assertPrivatePathAbsent(t, path)
+	assertPrivateBytesCleared(t, encoded)
+}
+
 func TestPrivateFileInstalledUnlinkFailureIsStableUnconfirmedResult(t *testing.T) {
 	requirePrivateSecretFiles(t)
 	directory := t.TempDir()

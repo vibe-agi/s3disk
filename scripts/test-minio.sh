@@ -135,6 +135,11 @@ S3DISK_TEST_S3_ACCESS_KEY=s3disk \
 S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
 ./scripts/run-required-go-test.sh ./internal/cli TestMinIOCLIContinuousHandoffAndCredentialFreeRead 90s integration
 
+S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
+S3DISK_TEST_S3_ACCESS_KEY=s3disk \
+S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
+./scripts/run-required-go-test.sh ./internal/cli TestMinIOCLIOneShotPublishAndResume 90s integration
+
 if [ "$(go env GOOS)" = linux ]; then
   S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
   S3DISK_TEST_S3_ACCESS_KEY=s3disk \

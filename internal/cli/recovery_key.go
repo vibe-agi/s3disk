@@ -44,11 +44,23 @@ type recoveryKeyFile struct {
 	RecoveryKey string `json:"recovery_key"`
 }
 
+type recoveryKeyFileWire recoveryKeyFile
+
 func (value recoveryKeyFile) String() string {
 	return fmt.Sprintf("s3disk.recoveryKeyFile{format:%d,key_id:%q,secrets:redacted}", value.Format, value.KeyID)
 }
 
 func (value recoveryKeyFile) GoString() string { return value.String() }
+
+// MarshalJSON is diagnostic-only and never exposes the recovery secret. The
+// narrow persistence codec explicitly marshals recoveryKeyFileWire instead.
+func (value recoveryKeyFile) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Format  int    `json:"format"`
+		KeyID   string `json:"key_id"`
+		Secrets string `json:"secrets"`
+	}{Format: value.Format, KeyID: value.KeyID, Secrets: "redacted"})
+}
 
 type recoveryKeyMaterial struct {
 	keyID string
@@ -161,7 +173,7 @@ func encodeRecoveryKeyFile(key publisherstate.RecoveryKey) ([]byte, recoveryKeyM
 	}
 	keyID := deriveRecoveryKeyID(secret)
 	value := recoveryKeyFile{Format: recoveryKeyFileFormat, KeyID: keyID, RecoveryKey: secret}
-	encoded, err := json.Marshal(value)
+	encoded, err := json.Marshal(recoveryKeyFileWire(value))
 	if err != nil || len(encoded)+1 > maximumRecoveryKeyFileBytes {
 		return nil, recoveryKeyMaterial{}, ErrInvalidRecoveryKeyFile
 	}
@@ -194,6 +206,9 @@ func writeRecoveryKeyBytesWithOperations(
 		".s3disk-recovery-key-*", operations,
 	)
 	if errors.Is(err, errPrivateFileExists) {
+		if result.needsReconciliation() {
+			return result, errors.Join(ErrRecoveryKeyFileExists, err)
+		}
 		return result, ErrRecoveryKeyFileExists
 	}
 	if err != nil {
@@ -248,7 +263,7 @@ func decodeRecoveryKeyFile(encoded []byte) (recoveryKeyMaterial, error) {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return recoveryKeyMaterial{}, ErrInvalidRecoveryKeyFile
 	}
-	canonical, err := json.Marshal(value)
+	canonical, err := json.Marshal(recoveryKeyFileWire(value))
 	defer clear(canonical)
 	if err != nil || !bytes.Equal(encoded, append(canonical, '\n')) || value.Format != recoveryKeyFileFormat {
 		return recoveryKeyMaterial{}, ErrInvalidRecoveryKeyFile

@@ -337,6 +337,15 @@ func TestReaderHTTPSRequiresExplicitTrustSource(t *testing.T) {
 	if _, err := NewReader(config); err != nil {
 		t.Fatalf("NewReader with explicit PEM trust roots: %v", err)
 	}
+
+	config.TLSRootCAPEM = append([]byte("AWS_SECRET_ACCESS_KEY=must-not-be-ignored\n"), fixture.readerConfig.TLSRootCAPEM...)
+	if _, err := NewReader(config); err == nil {
+		t.Fatal("NewReader accepted non-PEM material before an otherwise valid trust root")
+	}
+	config.TLSRootCAPEM = append([]byte("-----BEGIN CERTIFICATE-----\ninvalid and unclosed\n"), fixture.readerConfig.TLSRootCAPEM...)
+	if _, err := NewReader(config); err == nil {
+		t.Fatal("NewReader skipped an unclosed certificate block before a valid trust root")
+	}
 }
 
 func TestReaderBuildsDirectLockedTransport(t *testing.T) {

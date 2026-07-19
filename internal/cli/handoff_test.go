@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -98,6 +101,26 @@ func TestHandoffExclusive0600RoundTrip(t *testing.T) {
 	}
 }
 
+func TestHandoffDiagnosticsRedactBearerAndEncryptionKey(t *testing.T) {
+	value := newTestHandoff(t)
+	diagnosticJSON, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, diagnostic := range map[string]string{
+		"String":   fmt.Sprint(value),
+		"detailed": fmt.Sprintf("%+v", value),
+		"GoString": fmt.Sprintf("%#v", value),
+		"JSON":     string(diagnosticJSON),
+	} {
+		if strings.Contains(diagnostic, value.RootBearer) ||
+			strings.Contains(diagnostic, value.ClientEncryptionKey) ||
+			!strings.Contains(diagnostic, "redacted") {
+			t.Fatalf("%s exposed handoff authority: %q", name, diagnostic)
+		}
+	}
+}
+
 func TestHandoffNeverOverwrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "share.handoff")
 	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
@@ -110,6 +133,360 @@ func TestHandoffNeverOverwrites(t *testing.T) {
 	data, err := os.ReadFile(path)
 	if err != nil || string(data) != "keep" {
 		t.Fatalf("existing file changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestHandoffDigestIsDeterministicAndDomainSeparated(t *testing.T) {
+	encoded := []byte("canonical handoff bytes\n")
+	first := handoffDigest(encoded)
+	second := handoffDigest(bytes.Clone(encoded))
+	plain := s3disk.Digest(sha256.Sum256(encoded))
+	if first.IsZero() || first != second {
+		t.Fatalf("handoff digest is not stable: first=%s second=%s", first, second)
+	}
+	if first == plain {
+		t.Fatal("handoff digest is not domain separated from plain SHA-256")
+	}
+	encoded[0] ^= 1
+	if changed := handoffDigest(encoded); changed == first {
+		t.Fatal("handoff digest did not bind the exact bytes")
+	}
+}
+
+func TestInstallOrVerifyHandoffInstallsThenAcceptsExactExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "share.handoff")
+	value := newTestHandoff(t)
+	encoded, err := encodeHandoff(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(encoded)
+	digest := handoffDigest(encoded)
+
+	if err := installOrVerifyHandoff(context.Background(), path, value, digest); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installOrVerifyHandoff(context.Background(), path, value, digest); err != nil {
+		t.Fatalf("verify exact existing handoff: %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("exact existing handoff was replaced")
+	}
+	installed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(installed, encoded) {
+		t.Fatal("installed handoff differs from its canonical bytes")
+	}
+}
+
+func TestInstallOrVerifyHandoffRetriesExistingFileDurabilityBarrier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "share.handoff")
+	value := newTestHandoff(t)
+	encoded, err := encodeHandoff(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(encoded)
+	durabilityFailure := errors.New("injected first directory sync failure")
+	syncCalls := 0
+	operations := privateFileOperationsFor(installPrivateFileNoReplace)
+	operations.syncDirectory = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return durabilityFailure
+		}
+		return nil
+	}
+	digest := handoffDigest(encoded)
+	if err := installOrVerifyHandoffWithOperations(
+		context.Background(), path, value, digest, operations,
+	); !errors.Is(err, ErrPrivateFileInstalledUnconfirmed) || !errors.Is(err, durabilityFailure) {
+		t.Fatalf("first install error = %v, want unconfirmed durability", err)
+	}
+	if err := installOrVerifyHandoffWithOperations(
+		context.Background(), path, value, digest, operations,
+	); err != nil {
+		t.Fatalf("existing exact handoff did not retry durability barrier: %v", err)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
+	}
+}
+
+func TestInstallOrVerifyHandoffCarriesStagingCleanupAcrossCalls(t *testing.T) {
+	requirePrivateSecretFiles(t)
+	directory := t.TempDir()
+	path := filepath.Join(directory, "share.handoff")
+	value := newTestHandoff(t)
+	encoded, err := encodeHandoff(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(encoded)
+	digest := handoffDigest(encoded)
+	unlinkFailure := errors.New("injected staged unlink failure")
+	removeCalls := 0
+	operations := privateFileOperationsFor(installPrivateFileNoReplace)
+	operations.remove = func(path string) error {
+		removeCalls++
+		// The first call is the explicit cleanup and the second is the
+		// best-effort deferred cleanup in the failed invocation.
+		if removeCalls <= 2 {
+			return unlinkFailure
+		}
+		return os.Remove(path)
+	}
+
+	if err := installOrVerifyHandoffWithOperations(
+		context.Background(), path, value, digest, operations,
+	); !errors.Is(err, ErrPrivateFileInstalledUnconfirmed) || !errors.Is(err, unlinkFailure) {
+		t.Fatalf("first install error = %v, want unconfirmed staging cleanup", err)
+	}
+	staging := privateHandoffStagingFiles(t, directory)
+	if len(staging) != 1 {
+		t.Fatalf("staging files after failed cleanup = %v, want one", staging)
+	}
+	installed, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := os.Stat(staging[0])
+	if err != nil || !os.SameFile(installed, staged) {
+		t.Fatalf("staging path is not the installed hard-link alias: same=%t err=%v", err == nil && os.SameFile(installed, staged), err)
+	}
+
+	// A reserved-looking but unrelated file is not part of this install's
+	// cleanup obligation and must never be removed by reconciliation.
+	unrelated := filepath.Join(directory, ".s3disk-handoff-unrelated")
+	if err := os.WriteFile(unrelated, []byte("unrelated private file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := installOrVerifyHandoffWithOperations(
+		context.Background(), path, value, digest, operations,
+	); err != nil {
+		t.Fatalf("retry exact handoff cleanup: %v", err)
+	}
+	if _, err := os.Lstat(staging[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("installed staging alias remains after retry: %v", err)
+	}
+	if data, err := os.ReadFile(unrelated); err != nil || string(data) != "unrelated private file" {
+		t.Fatalf("unrelated reserved-looking file changed: data=%q err=%v", data, err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(installed, after) {
+		t.Fatalf("retry replaced installed handoff: same=%t err=%v", err == nil && os.SameFile(installed, after), err)
+	}
+}
+
+func TestInstallOrVerifyHandoffRejectsDigestAndExistingContentMismatch(t *testing.T) {
+	t.Run("expected digest must bind desired bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "share.handoff")
+		value := newTestHandoff(t)
+		encoded, err := encodeHandoff(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(encoded)
+		digest := handoffDigest(encoded)
+		digest[0] ^= 1
+		if err := installOrVerifyHandoff(context.Background(), path, value, digest); !errors.Is(err, ErrInvalidHandoff) {
+			t.Fatalf("error = %v, want ErrInvalidHandoff", err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("handoff exists after digest rejection: %v", err)
+		}
+	})
+
+	t.Run("different canonical handoff is a no-replace conflict", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "share.handoff")
+		existing := newTestHandoff(t)
+		existingBytes, err := encodeHandoff(existing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(existingBytes)
+		if err := installOrVerifyHandoff(context.Background(), path, existing, handoffDigest(existingBytes)); err != nil {
+			t.Fatal(err)
+		}
+
+		desired := existing
+		desired.TrustedCheckpoint.Generation++
+		desiredBytes, err := encodeHandoff(desired)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(desiredBytes)
+		if err := installOrVerifyHandoff(context.Background(), path, desired, handoffDigest(desiredBytes)); !errors.Is(err, ErrHandoffExists) {
+			t.Fatalf("error = %v, want ErrHandoffExists", err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, existingBytes) {
+			t.Fatal("conflicting existing handoff was overwritten")
+		}
+	})
+}
+
+func TestInstallOrVerifyHandoffReconcilesIndeterminateInstallOnlyForExactPrivateBytes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the injected alternate-inode installer uses POSIX private-file modes")
+	}
+	lostResponse := errors.New("injected installer response loss")
+
+	t.Run("exact canonical bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "share.handoff")
+		value := newTestHandoff(t)
+		encoded, err := encodeHandoff(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(encoded)
+		operations := privateFileOperationsFor(func(temporary, destination string) error {
+			staged, err := os.ReadFile(temporary)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(destination, staged, 0o600); err != nil {
+				return err
+			}
+			return lostResponse
+		})
+		if err := installOrVerifyHandoffWithOperations(
+			context.Background(), path, value, handoffDigest(encoded), operations,
+		); err != nil {
+			t.Fatalf("indeterminate exact install did not reconcile: %v", err)
+		}
+	})
+
+	t.Run("exact bytes do not hide staging cleanup failure", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "share.handoff")
+		value := newTestHandoff(t)
+		encoded, err := encodeHandoff(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(encoded)
+		cleanupFailure := errors.New("injected staging cleanup failure")
+		syncCalls := 0
+		operations := privateFileOperationsFor(func(temporary, destination string) error {
+			staged, readErr := os.ReadFile(temporary)
+			if readErr != nil {
+				return readErr
+			}
+			if writeErr := os.WriteFile(destination, staged, 0o600); writeErr != nil {
+				return writeErr
+			}
+			return lostResponse
+		})
+		operations.remove = func(string) error { return cleanupFailure }
+		operations.syncDirectory = func(string) error {
+			syncCalls++
+			return nil
+		}
+		err = installOrVerifyHandoffWithOperations(
+			context.Background(), path, value, handoffDigest(encoded), operations,
+		)
+		if !errors.Is(err, ErrPrivateFileInstallIndeterminate) || !errors.Is(err, cleanupFailure) {
+			t.Fatalf("error = %v, want indeterminate cleanup failure", err)
+		}
+		if syncCalls != 1 {
+			t.Fatalf("directory sync calls = %d, want 1 despite cleanup failure", syncCalls)
+		}
+	})
+
+	t.Run("exact bytes do not hide directory sync failure", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "share.handoff")
+		value := newTestHandoff(t)
+		encoded, err := encodeHandoff(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(encoded)
+		durabilityFailure := errors.New("injected directory sync failure")
+		operations := privateFileOperationsFor(func(temporary, destination string) error {
+			staged, readErr := os.ReadFile(temporary)
+			if readErr != nil {
+				return readErr
+			}
+			if writeErr := os.WriteFile(destination, staged, 0o600); writeErr != nil {
+				return writeErr
+			}
+			return lostResponse
+		})
+		operations.syncDirectory = func(string) error { return durabilityFailure }
+		err = installOrVerifyHandoffWithOperations(
+			context.Background(), path, value, handoffDigest(encoded), operations,
+		)
+		if !errors.Is(err, ErrPrivateFileInstallIndeterminate) || !errors.Is(err, durabilityFailure) {
+			t.Fatalf("error = %v, want indeterminate durability failure", err)
+		}
+	})
+
+	t.Run("different canonical bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "share.handoff")
+		desired := newTestHandoff(t)
+		desiredBytes, err := encodeHandoff(desired)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(desiredBytes)
+		other := desired
+		other.TrustedCheckpoint.Generation++
+		otherBytes, err := encodeHandoff(other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(otherBytes)
+		operations := privateFileOperationsFor(func(_ string, destination string) error {
+			if err := os.WriteFile(destination, otherBytes, 0o600); err != nil {
+				return err
+			}
+			return lostResponse
+		})
+		err = installOrVerifyHandoffWithOperations(
+			context.Background(), path, desired, handoffDigest(desiredBytes), operations,
+		)
+		if err == nil || !errors.Is(err, ErrHandoffExists) {
+			t.Fatalf("error = %v, want exact-byte conflict", err)
+		}
+		got, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(got, otherBytes) {
+			t.Fatal("indeterminate conflicting handoff was overwritten")
+		}
+	})
+}
+
+func TestInstallOrVerifyHandoffRejectsInsecureExistingFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not the Windows access-control boundary")
+	}
+	path := filepath.Join(t.TempDir(), "share.handoff")
+	value := newTestHandoff(t)
+	encoded, err := encodeHandoff(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(encoded)
+	if err := os.WriteFile(path, encoded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := installOrVerifyHandoff(context.Background(), path, value, handoffDigest(encoded)); !errors.Is(err, ErrInvalidHandoff) {
+		t.Fatalf("error = %v, want ErrInvalidHandoff", err)
 	}
 }
 
@@ -186,6 +563,15 @@ func TestHandoffAtomicInstallLeavesNoTemporarySecret(t *testing.T) {
 	if len(matches) != 0 {
 		t.Fatalf("temporary handoff secrets remain: %v", matches)
 	}
+}
+
+func privateHandoffStagingFiles(t *testing.T, directory string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(directory, ".s3disk-handoff-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return matches
 }
 
 func TestHandoffRejectsSymlinks(t *testing.T) {
@@ -281,7 +667,18 @@ func TestHandoffStrictJSONAndSizeBounds(t *testing.T) {
 	}
 }
 
-func TestHandoffAccommodatesMaximumTLSCABound(t *testing.T) {
+func TestHandoffAccommodatesMaximumTLSCertificateCount(t *testing.T) {
+	server := httptest.NewTLSServer(nil)
+	defer server.Close()
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if len(certificate) == 0 {
+		t.Fatal("test certificate PEM is empty")
+	}
+	certificateCount := presignedshare.MaximumTLSRootCertificates
+	maximumCanonicalBundle := bytes.Repeat(certificate, certificateCount)
+	if len(maximumCanonicalBundle) > int(presignedshare.MaximumTLSRootCAPEMBytes) {
+		t.Fatal("maximum certificate count unexpectedly exceeds the PEM byte bound")
+	}
 	value := newTestHandoff(t)
 	root, err := presignedshare.DangerouslyNewUncheckedCapability(
 		"shares/random/root", "https://objects.example.test/bucket/shares/random/root?X-Amz-Signature=secret",
@@ -296,7 +693,7 @@ func TestHandoffAccommodatesMaximumTLSCABound(t *testing.T) {
 	}
 	value.RootBearer = base64.RawURLEncoding.EncodeToString(bearer)
 	value.AllowInsecureLoopback = false
-	value.TLSRootCAPEM = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, int(presignedshare.MaximumTLSRootCAPEMBytes)))
+	value.TLSRootCAPEM = base64.RawURLEncoding.EncodeToString(maximumCanonicalBundle)
 	path := filepath.Join(t.TempDir(), "maximum-ca.handoff")
 	if err := writeHandoff(context.Background(), path, value); err != nil {
 		t.Fatal(err)
@@ -362,15 +759,6 @@ func TestHandoffRejectsSystemTrust(t *testing.T) {
 	value.DangerouslyUseSystemTrust = true
 	if _, err := value.decode(time.Now()); !errors.Is(err, ErrInvalidHandoff) {
 		t.Fatalf("error = %v, want ErrInvalidHandoff", err)
-	}
-}
-
-func TestHandoffDiagnosticsRedactBearerAndEncryptionKey(t *testing.T) {
-	value := newTestHandoff(t)
-	for _, diagnostic := range []string{fmt.Sprint(value), fmt.Sprintf("%#v", value)} {
-		if strings.Contains(diagnostic, value.RootBearer) || strings.Contains(diagnostic, value.ClientEncryptionKey) || !strings.Contains(diagnostic, "redacted") {
-			t.Fatalf("unsafe diagnostic: %q", diagnostic)
-		}
 	}
 }
 

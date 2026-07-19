@@ -112,11 +112,28 @@ final identity, staging cleanup, or directory durability cannot be proved, the
 command returns a stable uncertainty error and prints a `reconcile_required`
 hint containing only the output path, key ID, and outcome--never the recovery
 key. Treat that path as potentially installed and do not overwrite or delete it
-until an operator has reconciled the final file and any staging name. The
-current `share publish` command does not consume the recovery key yet, so
-same-share CLI recovery remains a release blocker. This is a CLI integration
-limit: library users can give `RootPublisher` a `SealedStateStore` recovery WAL
-as described below.
+until an operator has reconciled the final file and any staging name.
+For an idempotent handoff retry, the CLI removes a reserved staging name left
+by an earlier hard-link install only after `os.SameFile` proves that it is
+another link to the exact verified final handoff; unrelated matching files are
+preserved.
+
+`share publish` uses this independent key to seal an A-only session manifest
+and exact root recovery WAL before its first S3 object operation. The manifest
+contains the per-share encryption key, reference-signing seed, original root
+bearer, fixed deadline, source selection, handoff path, and non-credential S3
+configuration. It never stores a reusable access-key/secret-key credential
+tuple, credential provider, or SDK configuration. The sealed exact-GET root
+bearer can still contain its signing access-key ID and a temporary session-token
+query value; treat the entire state directory as secret. Keep the recovery key
+outside both the source and state directory.
+
+This separation is pathname-based. Go's portable filesystem APIs cannot prove
+that a source entry is not a hard-link or bind-mount alias of the recovery key
+or sealed state. Do not place such aliases in the source tree; for unattended
+publishing, keep recovery material on a separately controlled filesystem and
+include an alias check in deployment policy. The CLI does not yet enforce a
+continuously revalidated forbidden-inode set.
 
 ```sh
 s3disk share publish \
@@ -125,6 +142,7 @@ s3disk share publish \
   --bucket example-bucket \
   --prefix private/customer \
   --state-dir /var/lib/s3disk/publisher \
+  --recovery-key /secure/publisher-recovery-key.json \
   --handoff-out /secure/share.json \
   --expires-in 2h \
   --endpoint https://s3.example.com \
@@ -139,6 +157,31 @@ requests outside S3. `s3 doctor` alone retains the explicit
 for local tests only and requires an `http://127.0.0.1:...` endpoint plus
 `--dangerously-allow-http`. The publish command watches for changes by default;
 add `--once` for one snapshot and exit.
+
+The command emits a `prepared` line with the non-secret share ID as soon as its
+two recovery records are durable, then a `ready` line after root and handoff
+publication. The same ID is the isolated subdirectory name below `--state-dir`,
+so it remains discoverable if A crashes before either status write is observed.
+If A exits or crashes before the original fixed deadline, resume that exact
+share with only its local recovery coordinates:
+
+```sh
+s3disk share resume \
+  --state-dir /var/lib/s3disk/publisher \
+  --share-id '<share_id from publish>' \
+  --recovery-key /secure/publisher-recovery-key.json
+```
+
+`resume` intentionally has no source, bucket, prefix, endpoint, channel,
+expiry, handoff, or credential override flags. It authenticates the sealed
+session before resolving current A-side AWS credentials, then reopens the
+descriptor, reconciles the signed-publication journal and exact root WAL,
+installs or byte-verifies the original handoff, and continues the original
+one-shot or watch mode without extending the deadline. An expired session
+fails before AWS credential resolution, S3 access, source scanning, or handoff
+I/O. The same recovery-key file may technically open multiple shares, but a
+distinct key per share reduces compromise scope and avoids linkability through
+the recovery-key identifier.
 
 Copy `/secure/share.json` to B once through a private authenticated channel,
 then mount it:
@@ -162,10 +205,14 @@ repository/share subdirectories.
 The B command deliberately has no bucket, endpoint, region, or credential
 flags: the handoff fixes its S3 origin and exact GET authority. After handoff,
 the running A/B data path uses S3 only. The mount is read-only and starts a
-bounded best-effort automatic unmount at expiry. The current CLI creates new
-encryption/signing/root secrets for every `share publish`; it does not persist
-enough A-side secret state to resume the same share after a crash. Restart with
-a new handoff/share rather than treating `--state-dir` as CLI crash recovery.
+bounded best-effort automatic unmount at expiry. A fresh `share publish`
+creates new encryption/signing/root secrets; use `share resume`, never another
+publish invocation, to recover an existing share. Recovery currently relies on
+Linux or supported Darwin private-state semantics and fails closed on Windows.
+It does not solve coordinated rollback of both local sealed state and matching
+S3 state, recovery-key rotation, disaster-recovery backup policy, or early
+revocation of the cloud credential that signed the original root URL; those
+remain commercial release blockers.
 
 ## Publisher
 
@@ -268,6 +315,15 @@ closed without creating recovery state or touching the root Store. Ordinary
 `NewRootPublisher` and bundle builders continue to reject imported bearers.
 Restore requires the built-in offline reference verifier so recovery validation
 cannot invoke an application-defined network verifier.
+
+Immediately after restore, call `RootPublisher.RecoverPending` before resolving
+or publishing a newer snapshot. It authenticates and settles the exact WAL
+target (or anchors the current root when no operation is pending) without a
+closure, signer, or presigner. A recovery-only publisher can also prove an
+already matching closure idempotent; if a genuinely new root target is needed,
+it returns `ErrRootBuildAuthorityRequired`, and the caller may then restore
+again with a signer and a presigner fixed to the original deadline. Store
+configuration failures use their own errors and must not trigger presigning.
 
 The journal is a write-ahead log and local monotonic anchor, not an independent
 freshness oracle. Replaying both the complete journal and its matching old S3
