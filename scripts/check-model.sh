@@ -26,7 +26,10 @@ spec/S3Share.cfg
 spec/S3ShareRevision.cfg
 spec/S3ShareExpiry.cfg
 spec/S3ShareRestart.cfg
-spec/S3ShareLiveness.cfg'
+spec/S3ShareLiveness.cfg
+spec/RootPublisherRecovery.tla
+spec/RootPublisherRecovery.cfg
+spec/RootPublisherRecoveryLiveness.cfg'
 
 for required_model_file in $required_model_files; do
   if [ ! -f "$required_model_file" ]; then
@@ -72,6 +75,47 @@ if ! grep -Eq '^SPECIFICATION[[:space:]]+FairSpec$' \
     spec/S3ShareLiveness.cfg
 then
   echo "required S3Share liveness specification/property is missing" >&2
+  exit 1
+fi
+
+root_recovery_obligations='JournalPendingIsExactAndAnchored
+CompetitorWriteIsJournaled
+RetryUsesExactDurableTarget
+ProofIsCurrentRemoteSuccessor
+RemoteRootCASHistoryIsLinearAndJournaled
+CommittedIsOneMonotonicRemoteHistoryEntry
+CommittedRevisionAndDigestNeverRegressOrFork
+PendingCannotBeRewritten
+PendingWithoutProofCannotChangeOrClear
+PendingClearsOnlyAfterMatchingRemoteProof
+InvalidReplayCannotAdvanceJournal
+CrashClearsOnlyVolatileAndPreservesJournal
+NoRemoteWriteWhileNetworkOrStoreUnavailable
+ExpiryIsFixedAndNeverExtended
+NoRemoteWriteAtOrAfterExpiry'
+
+if ! grep -Eq '^SPECIFICATION[[:space:]]+Spec$' \
+  spec/RootPublisherRecovery.cfg
+then
+  echo "required RootPublisher recovery safety specification is missing" >&2
+  exit 1
+fi
+
+for root_recovery_obligation in $root_recovery_obligations; do
+  if ! grep -Eq "^[[:space:]]+${root_recovery_obligation}$" \
+    spec/RootPublisherRecovery.cfg
+  then
+    echo "required RootPublisher recovery obligation is missing: $root_recovery_obligation" >&2
+    exit 1
+  fi
+done
+
+if ! grep -Eq '^SPECIFICATION[[:space:]]+FairSpec$' \
+  spec/RootPublisherRecoveryLiveness.cfg \
+  || ! grep -Eq '^[[:space:]]+StableUnexpiredPendingEventuallyResolves$' \
+    spec/RootPublisherRecoveryLiveness.cfg
+then
+  echo "required RootPublisher recovery liveness specification/property is missing" >&2
   exit 1
 fi
 
@@ -169,6 +213,48 @@ require_share_enabled_actions() {
     fi
   done
 }
+
+root_recovery_log="$model_tmp/RootPublisherRecovery.log"
+if ! java -XX:+UseParallelGC -jar "$jar_path" -workers 1 -coverage 1 \
+  -metadir "$model_tmp/RootPublisherRecovery" \
+  -config spec/RootPublisherRecovery.cfg \
+  spec/RootPublisherRecovery.tla >"$root_recovery_log" 2>&1
+then
+  cat "$root_recovery_log"
+  exit 1
+fi
+cat "$root_recovery_log"
+if ! grep -Fq 'Model checking completed. No error has been found.' \
+  "$root_recovery_log"
+then
+  echo "TLC success marker missing for RootPublisherRecovery" >&2
+  exit 1
+fi
+require_share_distinct_actions "$root_recovery_log" \
+  RecordPublisherIntent RecordCompetitorIntent LoadPendingExactTarget \
+  CASAppliedResponseReceived CASAppliedResponseLost CompetitorCASWins \
+  ObserveNetworkFault ObserveStoreFault ReturnCurrentRemoteRoot \
+  ReturnLowerReplay ReturnEqualRevisionFork RejectInvalidObservation \
+  ProveRemoteRoot FinalizeCommitted CrashRestart PartitionNetwork \
+  RestoreNetwork SetStoreUnavailable SetStoreAvailable \
+  StabilizeEnvironment AdvanceTime
+
+root_recovery_liveness_log="$model_tmp/RootPublisherRecoveryLiveness.log"
+if ! java -XX:+UseParallelGC -jar "$jar_path" -workers 1 -coverage 1 \
+  -metadir "$model_tmp/RootPublisherRecoveryLiveness" \
+  -config spec/RootPublisherRecoveryLiveness.cfg \
+  spec/RootPublisherRecovery.tla >"$root_recovery_liveness_log" 2>&1
+then
+  cat "$root_recovery_liveness_log"
+  exit 1
+fi
+cat "$root_recovery_liveness_log"
+if ! grep -Fq 'Checking temporal properties for the complete state space' \
+  "$root_recovery_liveness_log"
+then
+  echo "TLC did not check the complete RootPublisher recovery liveness state space" >&2
+  exit 1
+fi
 
 run_share_case spec/S3Share.cfg
 share_network_log="$model_tmp/S3Share.log"

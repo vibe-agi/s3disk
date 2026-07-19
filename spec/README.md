@@ -258,6 +258,50 @@ restart reloads that exact target. A different target at the same generation
 can only be the separately authorized remote CAS winner, never a replacement
 for the durable local intent.
 
+## RootPublisher recovery-journal refinement
+
+`RootPublisherRecovery.tla` is a smaller executable refinement focused on the
+same-share A-side recovery journal used by `RootPublisher`. Its durable state
+is `Committed{revision,targetDigest}` plus either no pending operation or one
+immutable `Pending{base,expectedBase,target,expiresAt}`. The remote S3 root is
+an append-only abstract CAS history. Each local write, and the independently
+journaled competing publisher write used to exercise a CAS loser, carries the
+exact durable intent that existed before that history entry was appended.
+
+The model separately exercises a received CAS response, an applied response
+whose reply is lost, a correctly journaled competitor winning the CAS,
+network and store failures, lower-revision replay, equal-revision/different-
+digest replay, and a crash/restart. A crash clears the volatile attempt,
+response, and proof while preserving the complete journal. Recovery may load
+only the exact pending target. Pending cannot be rewritten or cleared until a
+validated current remote successor has been proved; finalization adopts that
+successor, including a competitor winner. Committed revision is monotonic and
+an equal revision cannot change digest. The authorization expiry is fixed,
+never extended by recovery, and no modeled publisher can add a remote write at
+or after expiry.
+
+`RootPublisherRecovery.cfg` checks those safety obligations without timing
+assumptions. `RootPublisherRecoveryLiveness.cfg` adds only weak fairness for
+the recovery steps and environment stabilization. Its conditional liveness
+claim says an unresolved local pending intent eventually resolves when the
+network and store remain stable and the fixed authorization has not expired.
+Fault/replay injection stops after stabilization and the small model bounds
+crashes to one, so it does not silently claim progress through an infinite
+fault or crash schedule.
+
+The abstraction assumes the durable journal presented after restart is the
+latest complete journal. Whole-journal rollback/replay, loss of the journal
+disk, torn persistence below the sealed-state-store contract, backup restore,
+and multi-site disaster recovery are outside the model and require separate
+operational and storage evidence.
+
+With the pinned TLC 1.8.0 jar and one worker, the checked bounds produce:
+
+| Configuration | Generated states | Distinct states | Depth |
+| --- | ---: | ---: | ---: |
+| `RootPublisherRecovery.cfg` | 407,241 | 69,525 | 22 |
+| `RootPublisherRecoveryLiveness.cfg` | 66,761 | 11,045 | 17 |
+
 This publisher state machine models commit-advancing `Publish` intents. It does
 not model authentication-envelope-only `ResignReference` operations: an
 envelope is not part of the commit DAG, so commit ancestry cannot prove that a
