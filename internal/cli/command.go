@@ -28,9 +28,10 @@ const (
 // Dependencies makes every command path testable without network or FUSE I/O.
 // A nil function selects the production implementation.
 type Dependencies struct {
-	Publish func(context.Context, PublishOptions) error
-	Mount   func(context.Context, MountOptions) error
-	Doctor  func(context.Context, DoctorOptions, io.Writer) error
+	Publish             func(context.Context, PublishOptions) error
+	GenerateRecoveryKey func(context.Context, RecoveryKeyGenerateOptions) error
+	Mount               func(context.Context, MountOptions) error
+	Doctor              func(context.Context, DoctorOptions, io.Writer) error
 }
 
 type PublishOptions struct {
@@ -82,6 +83,9 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	if dependencies.Publish == nil {
 		dependencies.Publish = runPublish
 	}
+	if dependencies.GenerateRecoveryKey == nil {
+		dependencies.GenerateRecoveryKey = runGenerateRecoveryKey
+	}
 	if dependencies.Mount == nil {
 		dependencies.Mount = runMount
 	}
@@ -106,7 +110,35 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 
 func newShareCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{Use: "share", Short: "Create a time-limited encrypted share", Args: cobra.NoArgs}
-	command.AddCommand(newPublishCommand(dependencies))
+	command.AddCommand(newPublishCommand(dependencies), newRecoveryKeyCommand(dependencies))
+	return command
+}
+
+func newRecoveryKeyCommand(dependencies Dependencies) *cobra.Command {
+	command := &cobra.Command{
+		Use:   "recovery-key",
+		Short: "Manage A-side publisher recovery keys",
+		Args:  cobra.NoArgs,
+	}
+	command.AddCommand(newRecoveryKeyGenerateCommand(dependencies))
+	return command
+}
+
+func newRecoveryKeyGenerateCommand(dependencies Dependencies) *cobra.Command {
+	options := RecoveryKeyGenerateOptions{}
+	command := &cobra.Command{
+		Use:   "generate",
+		Short: "Generate a private publisher recovery-key file",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if err := validateRecoveryKeyGenerateOptions(options); err != nil {
+				return err
+			}
+			options.StatusWriter = command.OutOrStdout()
+			return dependencies.GenerateRecoveryKey(command.Context(), options)
+		},
+	}
+	command.Flags().StringVar(&options.Out, "out", "", "new private 0600 publisher recovery-key file")
 	return command
 }
 

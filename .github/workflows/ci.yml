@@ -133,6 +133,8 @@ jobs:
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-publisher-state.log
           go test ./ -run='^$' -fuzz='^FuzzParseSealedStateFileNeverPanics$' \
             -fuzztime=10s 2>&1 | tee artifacts/fuzz-sealed-state.log
+          go test ./internal/cli -run='^$' -fuzz='^FuzzDecodeRecoveryKeyFileNeverPanics$' \
+            -fuzztime=10s 2>&1 | tee artifacts/fuzz-recovery-key.log
       - name: Third-party compliance
         run: |
           set -o pipefail

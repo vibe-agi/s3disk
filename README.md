@@ -64,6 +64,37 @@ s3disk s3 doctor \
 Then publish either the whole source with `--all`, as below, or selected
 relative paths by replacing it with repeated `--path path/to/item` flags:
 
+Provisioning for A-side publisher recovery can create a standalone recovery-key
+file without printing the key to the terminal:
+
+```sh
+s3disk share recovery-key generate \
+  --out /secure/publisher-recovery-key.json
+```
+
+The output is canonical versioned JSON installed without replacement as a
+current-owner file with exactly `0600` permissions. The final path component
+must be absent and must not be a symlink; any existing file, directory, or
+symlink is refused. Parent components may include a safely resolvable symlink:
+the command resolves the parent once before staging, then validates the
+resolved hierarchy's ownership, writable permissions, and supported ACLs.
+This directory check is a safety proof, not a promise that every parent has
+mode `0700`; safe hierarchies may use other modes. Unsupported ACL platforms
+fail closed. Protect and back up this file separately from publisher state.
+
+An installer's return value is not treated as proof of what reached the
+filesystem. After every attempted install, the command reopens and validates
+the final file and uses file identity to prove that it is the staged inode. An
+installer that applied the change but returned an error is therefore accepted
+only after the staging name is removed and the parent directory is synced. If
+final identity, staging cleanup, or directory durability cannot be proved, the
+command returns a stable uncertainty error and prints a `reconcile_required`
+hint containing only the output path, key ID, and outcome--never the recovery
+key. Treat that path as potentially installed and do not overwrite or delete it
+until an operator has reconciled the final file and any staging name. The
+current `share publish` command does not consume the recovery key yet, so
+same-share CLI recovery remains a release blocker.
+
 ```sh
 s3disk share publish \
   --source /srv/source \

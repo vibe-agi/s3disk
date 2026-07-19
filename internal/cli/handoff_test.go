@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -71,7 +72,7 @@ func TestHandoffExclusive0600RoundTrip(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "share.handoff")
 	want := newTestHandoff(t)
-	if err := writeHandoff(path, want); err != nil {
+	if err := writeHandoff(context.Background(), path, want); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
@@ -102,7 +103,7 @@ func TestHandoffNeverOverwrites(t *testing.T) {
 	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := writeHandoff(path, newTestHandoff(t))
+	err := writeHandoff(context.Background(), path, newTestHandoff(t))
 	if !errors.Is(err, ErrHandoffExists) {
 		t.Fatalf("error = %v, want ErrHandoffExists", err)
 	}
@@ -121,27 +122,33 @@ func TestHandoffFinalPathIsInvisibleUntilAtomicInstall(t *testing.T) {
 	}
 	wantStop := errors.New("stop before atomic install")
 	installCalled := false
-	err = writeHandoffBytes(path, encoded, func(temporary, destination string) error {
+	var callbackErr error
+	err = writeHandoffBytes(context.Background(), path, encoded, func(temporary, destination string) error {
 		installCalled = true
 		if destination != path {
-			t.Fatalf("install destination = %q, want %q", destination, path)
+			callbackErr = fmt.Errorf("install destination = %q, want %q", destination, path)
+			return wantStop
 		}
 		if _, statErr := os.Lstat(destination); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("final handoff became visible before install: %v", statErr)
+			callbackErr = fmt.Errorf("final handoff became visible before install: %w", statErr)
+			return wantStop
 		}
 		staged, readErr := os.ReadFile(temporary)
 		if readErr != nil {
-			t.Fatal(readErr)
+			callbackErr = readErr
+			return wantStop
 		}
 		if !bytes.Equal(staged, encoded) {
-			t.Fatal("staged handoff is not the complete canonical handoff")
+			callbackErr = errors.New("staged handoff is not the complete canonical handoff")
+			return wantStop
 		}
 		info, statErr := os.Stat(temporary)
 		if statErr != nil {
-			t.Fatal(statErr)
+			callbackErr = statErr
+			return wantStop
 		}
 		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
-			t.Fatalf("staged handoff mode = %#o, want 0600", info.Mode().Perm())
+			callbackErr = fmt.Errorf("staged handoff mode = %#o, want 0600", info.Mode().Perm())
 		}
 		return wantStop
 	})
@@ -150,6 +157,9 @@ func TestHandoffFinalPathIsInvisibleUntilAtomicInstall(t *testing.T) {
 	}
 	if !errors.Is(err, wantStop) {
 		t.Fatalf("error = %v, want injected stop", err)
+	}
+	if callbackErr != nil {
+		t.Fatal(callbackErr)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("final handoff exists after pre-install failure: %v", err)
@@ -166,7 +176,7 @@ func TestHandoffFinalPathIsInvisibleUntilAtomicInstall(t *testing.T) {
 func TestHandoffAtomicInstallLeavesNoTemporarySecret(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "share.handoff")
-	if err := writeHandoff(path, newTestHandoff(t)); err != nil {
+	if err := writeHandoff(context.Background(), path, newTestHandoff(t)); err != nil {
 		t.Fatal(err)
 	}
 	matches, err := filepath.Glob(filepath.Join(directory, ".s3disk-handoff-*"))
@@ -191,7 +201,7 @@ func TestHandoffRejectsSymlinks(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeHandoff(link, newTestHandoff(t)); err == nil {
+	if err := writeHandoff(context.Background(), link, newTestHandoff(t)); err == nil {
 		t.Fatal("writeHandoff accepted a symlink target")
 	}
 	data, err := os.ReadFile(target)
@@ -210,7 +220,7 @@ func TestHandoffRejectsSymlinks(t *testing.T) {
 	if err := os.Symlink(realParent, linkedParent); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeHandoff(filepath.Join(linkedParent, "share"), newTestHandoff(t)); err != nil {
+	if err := writeHandoff(context.Background(), filepath.Join(linkedParent, "share"), newTestHandoff(t)); err != nil {
 		t.Fatalf("write through a resolved parent failed: %v", err)
 	}
 	if info, err := os.Lstat(filepath.Join(realParent, "share")); err != nil || !info.Mode().IsRegular() {
@@ -221,7 +231,7 @@ func TestHandoffRejectsSymlinks(t *testing.T) {
 func TestHandoffStrictJSONAndSizeBounds(t *testing.T) {
 	directory := t.TempDir()
 	validPath := filepath.Join(directory, "valid")
-	if err := writeHandoff(validPath, newTestHandoff(t)); err != nil {
+	if err := writeHandoff(context.Background(), validPath, newTestHandoff(t)); err != nil {
 		t.Fatal(err)
 	}
 	valid, err := os.ReadFile(validPath)
@@ -288,7 +298,7 @@ func TestHandoffAccommodatesMaximumTLSCABound(t *testing.T) {
 	value.AllowInsecureLoopback = false
 	value.TLSRootCAPEM = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, int(presignedshare.MaximumTLSRootCAPEMBytes)))
 	path := filepath.Join(t.TempDir(), "maximum-ca.handoff")
-	if err := writeHandoff(path, value); err != nil {
+	if err := writeHandoff(context.Background(), path, value); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
@@ -316,7 +326,7 @@ func TestHandoffRejectsLoosePermissions(t *testing.T) {
 		t.Skip("POSIX permission bits are not the Windows access-control boundary")
 	}
 	path := filepath.Join(t.TempDir(), "share.handoff")
-	if err := writeHandoff(path, newTestHandoff(t)); err != nil {
+	if err := writeHandoff(context.Background(), path, newTestHandoff(t)); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -339,7 +349,7 @@ func TestHandoffRejectsWritableParentBeforeWritingSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(parent, "share.handoff")
-	if err := writeHandoff(path, newTestHandoff(t)); !errors.Is(err, s3disk.ErrCorruptObject) {
+	if err := writeHandoff(context.Background(), path, newTestHandoff(t)); !errors.Is(err, s3disk.ErrCorruptObject) {
 		t.Fatalf("error = %v, want ErrCorruptObject", err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {

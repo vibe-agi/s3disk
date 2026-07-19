@@ -156,7 +156,7 @@ func runPublish(ctx context.Context, options PublishOptions) error {
 		AllowInsecureLoopback: options.AllowInsecureEndpoint,
 		ClientEncryptionKey:   clientKey.ExportSecret(),
 	}
-	if err := writeHandoff(options.HandoffOut, value); err != nil {
+	if err := writeHandoff(ctx, options.HandoffOut, value); err != nil {
 		return fmt.Errorf("s3disk share publish: write handoff: %w", err)
 	}
 	if options.StatusWriter != nil {

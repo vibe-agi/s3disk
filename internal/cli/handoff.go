@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -192,7 +193,7 @@ func decodeCanonicalBase64(value string, maximum int) ([]byte, error) {
 	return decoded, nil
 }
 
-func writeHandoff(path string, value handoff) error {
+func writeHandoff(ctx context.Context, path string, value handoff) error {
 	if path == "" {
 		return fmt.Errorf("s3disk: handoff output path is required")
 	}
@@ -200,6 +201,7 @@ func writeHandoff(path string, value handoff) error {
 	if err != nil {
 		return err
 	}
+	defer clear(encoded)
 	absolute, err := resolveHandoffPath(path)
 	if err != nil {
 		return fmt.Errorf("s3disk: unsafe handoff output path: %w", err)
@@ -212,7 +214,7 @@ func writeHandoff(path string, value handoff) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("s3disk: inspect handoff output: %w", err)
 	}
-	return writeHandoffBytes(absolute, encoded, installHandoffNoReplace)
+	return writeHandoffBytes(ctx, absolute, encoded, installPrivateFileNoReplace)
 }
 
 func encodeHandoff(value handoff) ([]byte, error) {
@@ -226,65 +228,27 @@ func encodeHandoff(value handoff) ([]byte, error) {
 	return append(encoded, '\n'), nil
 }
 
-type handoffInstaller func(temporary, destination string) error
+type handoffInstaller = privateFileInstaller
 
 // writeHandoffBytes writes and syncs the complete secret into a private
 // temporary file before atomically installing the final pathname. A crash
 // before installation can leave, at worst, a private temporary file; it can
 // never expose a partial handoff at the path given to B.
-func writeHandoffBytes(absolute string, encoded []byte, install handoffInstaller) error {
+func writeHandoffBytes(ctx context.Context, absolute string, encoded []byte, install handoffInstaller) error {
+	defer clear(encoded)
 	if len(encoded) == 0 || int64(len(encoded)) > maximumHandoffBytes || install == nil {
 		return ErrInvalidHandoff
 	}
-	directory := filepath.Dir(absolute)
-	file, err := os.CreateTemp(directory, ".s3disk-handoff-*")
+	_, err := writePrivateFileNoReplace(
+		ctx,
+		resolvedPrivatePath(absolute), encoded, maximumHandoffBytes,
+		".s3disk-handoff-*", privateFileOperationsFor(install),
+	)
+	if errors.Is(err, errPrivateFileExists) {
+		return ErrHandoffExists
+	}
 	if err != nil {
-		return fmt.Errorf("s3disk: create staged handoff: %w", err)
-	}
-	temporary := file.Name()
-	removeTemporary := true
-	defer func() {
-		if removeTemporary {
-			_ = os.Remove(temporary)
-		}
-	}()
-	created, statErr := file.Stat()
-	if statErr != nil || !created.Mode().IsRegular() {
-		_ = file.Close()
-		return fmt.Errorf("s3disk: staged handoff is not a regular file")
-	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("s3disk: set staged handoff permissions: %w", err)
-	}
-	// Validate the already-open descriptor, its current pathname, owner, ACL,
-	// exact mode, and parent hierarchy before any bearer or encryption key bytes
-	// cross the filesystem boundary. The temporary file is in the already
-	// resolved final directory, so the atomic install cannot cross filesystems.
-	if err := s3disk.ValidatePrivateSecretFile(temporary, file); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("s3disk: protect staged handoff: %w", err)
-	}
-	if err := writeAll(file, encoded); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("s3disk: write staged handoff: %w", err)
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("s3disk: sync staged handoff: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("s3disk: close staged handoff: %w", err)
-	}
-	if err := install(temporary, absolute); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return ErrHandoffExists
-		}
-		return fmt.Errorf("s3disk: atomically install handoff: %w", err)
-	}
-	removeTemporary = false
-	if err := syncHandoffDirectory(directory); err != nil {
-		return fmt.Errorf("s3disk: sync handoff directory: %w", err)
+		return fmt.Errorf("s3disk: write handoff atomically: %w", err)
 	}
 	return nil
 }
@@ -329,6 +293,7 @@ func readHandoff(path string) (decodedHandoff, error) {
 	if err != nil || int64(len(encoded)) > maximumHandoffBytes {
 		return decodedHandoff{}, ErrInvalidHandoff
 	}
+	defer clear(encoded)
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	var value handoff
@@ -352,54 +317,6 @@ func readHandoff(path string) (decodedHandoff, error) {
 // Resolving the parent also avoids rejecting ordinary system paths such as
 // macOS /var, which itself is a compatibility symlink.
 func resolveHandoffPath(path string) (string, error) {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	base := filepath.Base(absolute)
-	if base == "." || base == string(os.PathSeparator) || strings.ContainsRune(base, '\x00') {
-		return "", fmt.Errorf("invalid final path component")
-	}
-	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Lstat(parent)
-	if err != nil || !info.IsDir() {
-		return "", fmt.Errorf("parent is not an existing directory")
-	}
-	return filepath.Join(parent, base), nil
-}
-
-func writeAll(writer io.Writer, data []byte) error {
-	for len(data) > 0 {
-		count, err := writer.Write(data)
-		if err != nil {
-			return err
-		}
-		if count < 1 || count > len(data) {
-			return io.ErrShortWrite
-		}
-		data = data[count:]
-	}
-	return nil
-}
-
-func removeSameFile(path string, expected os.FileInfo) {
-	if expected == nil {
-		return
-	}
-	observed, err := os.Lstat(path)
-	if err == nil && os.SameFile(expected, observed) {
-		_ = os.Remove(path)
-	}
-}
-
-func syncHandoffDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
+	resolved, err := resolvePrivatePath(path)
+	return string(resolved), err
 }

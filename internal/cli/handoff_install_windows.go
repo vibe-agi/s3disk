@@ -8,7 +8,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func installHandoffNoReplace(temporary, destination string) error {
+func installPrivateFileNoReplace(temporary, destination string) error {
 	from, err := windows.UTF16PtrFromString(handoffWindowsExtendedPath(temporary))
 	if err != nil {
 		return err
