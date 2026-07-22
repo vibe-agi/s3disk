@@ -46,6 +46,38 @@ func TestPublisherRejectsImpossibleChunkCountBeforeUploading(t *testing.T) {
 	}
 }
 
+func TestBuildFileClassifiesDisappearanceAfterDirectoryScanAsUnstable(t *testing.T) {
+	t.Parallel()
+
+	source := privateTestDirectory(t)
+	name := "vanished"
+	filename := filepath.Join(source, name)
+	if err := os.WriteFile(filename, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := os.Lstat(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.Remove(filename); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := &Publisher{options: PublisherOptions{StableReadTries: 1}}
+	_, _, _, err = publisher.buildFile(context.Background(), root, name, expected, nil)
+	if !errors.Is(err, ErrUnstableFile) {
+		t.Fatalf("buildFile error = %v, want ErrUnstableFile", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("buildFile error = %v, want os.ErrNotExist detail", err)
+	}
+}
+
 type resourceProbeStore struct {
 	chunkPuts atomic.Int64
 }
