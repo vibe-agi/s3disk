@@ -110,7 +110,7 @@ func TestMinIOFUSEEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	updates := make(chan s3disk.RefreshResult, 4)
-	mountpoint := integrationMountpoint(t)
+	mountpoint := t.TempDir()
 	mounted, err := mount.ReadOnly(ctx, consumer, mountpoint, minIOFUSEOptions(updates))
 	if err != nil {
 		if os.Getenv("S3DISK_REQUIRE_FUSE") == "1" {
@@ -267,11 +267,10 @@ func TestFUSEMountRefreshAndSnapshotPinning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mountpoint := integrationMountpoint(t)
+	mountpoint := t.TempDir()
 	mounted, err := mount.ReadOnly(ctx, consumer, mountpoint, mount.Options{
-		MacOSBackend: integrationMacOSBackend(t),
-		Debug:        os.Getenv("S3DISK_TEST_FUSE_DEBUG") == "1",
-		AttrTTL:      50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
+		Debug:   os.Getenv("S3DISK_TEST_FUSE_DEBUG") == "1",
+		AttrTTL: 50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
 		// The test materializes more than four generation/path identities. It can
 		// finish only if kernel FORGET events reclaim obsolete registry entries.
 		MaxInodeIdentities: 4,
@@ -476,8 +475,7 @@ func createMinIOBucket(t *testing.T, ctx context.Context, httpClient *http.Clien
 
 func minIOFUSEOptions(updates chan<- s3disk.RefreshResult) mount.Options {
 	options := mount.Options{
-		MacOSBackend: integrationMacOSBackend(nil),
-		AttrTTL:      30 * time.Millisecond, EntryTTL: 30 * time.Millisecond,
+		AttrTTL: 30 * time.Millisecond, EntryTTL: 30 * time.Millisecond,
 		NegativeTTL: 0, FilesystemName: "s3disk-minio-test",
 		Poll: s3disk.PollOptions{
 			Interval: 20 * time.Millisecond, MaxInterval: 200 * time.Millisecond,
@@ -556,48 +554,6 @@ func integrationEnv(name, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func integrationMacOSBackend(t *testing.T) mount.MacOSBackend {
-	value := os.Getenv("S3DISK_TEST_MACOS_BACKEND")
-	switch value {
-	case "", "auto":
-		return mount.MacOSBackendAuto
-	case "vfs":
-		return mount.MacOSBackendVFS
-	case "fskit":
-		return mount.MacOSBackendFSKit
-	default:
-		if t != nil {
-			t.Fatalf("invalid S3DISK_TEST_MACOS_BACKEND %q", value)
-		}
-		panic("invalid S3DISK_TEST_MACOS_BACKEND " + value)
-	}
-}
-
-func integrationMountpoint(t *testing.T) string {
-	t.Helper()
-	root := os.Getenv("S3DISK_TEST_MOUNT_ROOT")
-	if root == "" {
-		return t.TempDir()
-	}
-	if !filepath.IsAbs(root) {
-		t.Fatalf("S3DISK_TEST_MOUNT_ROOT must be absolute: %q", root)
-	}
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		t.Fatalf("S3DISK_TEST_MOUNT_ROOT is not an existing directory: %q: %v", root, err)
-	}
-	mountpoint, err := os.MkdirTemp(root, "s3disk-mount-")
-	if err != nil {
-		t.Fatalf("create integration mountpoint below %q: %v", root, err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(mountpoint); err != nil {
-			t.Errorf("remove integration mountpoint %q: %v", mountpoint, err)
-		}
-	})
-	return mountpoint
 }
 
 func requireFUSE(t *testing.T) {

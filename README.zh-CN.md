@@ -12,8 +12,9 @@
 读取端电脑 <── 私密 handoff ── 只读、按需加载的挂载点
 ```
 
-`s3disk` 当前是 pre-1.0 工程预览版。Linux 和 macOS 都有真实文件系统挂载门禁；
-集成到产品前请先查看[平台支持](#平台支持)。
+`s3disk` 当前是 pre-1.0 工程预览版。Linux 已有通过的真实文件系统挂载基线；
+macOS 已具备同一套门禁，但发布前仍需完成一次成功的 VFS 实挂。集成到产品前请先
+查看[平台支持](#平台支持)。
 
 ## 能做什么
 
@@ -86,9 +87,8 @@ s3disk mount \
   --state-dir /var/lib/s3disk/reader
 ```
 
-macOS 需要用户单独安装 macFUSE。macOS 15.4 及以上版本可使用
-`--macos-backend fskit` 避免内核扩展后端，但挂载点必须位于 `/Volumes` 下；默认
-`auto` 使用 macFUSE 的默认后端。
+macOS 需要用户单独安装并启用 macFUSE。当前 go-fuse 适配器使用 macFUSE 的
+VFS/内核后端；macFUSE 较新的 FSKit 消息传输暂未适配。
 
 共享多个 workspace 时，每个源目录独立发布。读取端可以为每个 handoff 运行一个
 `s3disk mount`，也可以使用有资源上限的 [`mount-set`](docs/MOUNT_SET.md) 管理器。
@@ -99,7 +99,7 @@ macOS 需要用户单独安装 macFUSE。macOS 15.4 及以上版本可使用
 | 平台 | 当前状态 |
 | --- | --- |
 | Linux | 主要目标。包含原生测试和真实 MinIO/FUSE 挂载测试。 |
-| macOS | 支持的挂载目标。CI 在 macOS 26 上运行真实 macFUSE/FSKit 只读、刷新、旧句柄固定、多挂载和干净卸载测试。用户需另行安装 macFUSE；实际交付的 macOS/架构仍需产品级验证。 |
+| macOS | 发布目标，已有真实 macFUSE VFS 测试门禁，覆盖只读、刷新、旧句柄固定、多挂载和干净卸载；在已启用 macFUSE 的主机上成功运行前，不能宣称正式支持。 |
 | Windows | 核心包和原生测试可运行，但尚未实现文件系统挂载。`mount` 会返回 `ErrUnsupportedPlatform`；在 Windows ACL 私密性校验完成前，发布端恢复状态也会 fail-closed。 |
 | FreeBSD | FUSE 适配器可以编译，但没有专用的原生生产测试基线。 |
 

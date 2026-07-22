@@ -2,7 +2,6 @@ package mount
 
 import (
 	"fmt"
-	"runtime"
 	"time"
 
 	"github.com/vibe-agi/s3disk"
@@ -11,14 +10,6 @@ import (
 // normalizeOptions is shared by native and unsupported platforms so invalid
 // public options have the same pre-I/O behavior everywhere.
 func normalizeOptions(options Options) (Options, error) {
-	switch options.MacOSBackend {
-	case MacOSBackendAuto, MacOSBackendVFS, MacOSBackendFSKit:
-	default:
-		return Options{}, fmt.Errorf("s3disk mount: invalid macOS backend %q", options.MacOSBackend)
-	}
-	if options.MacOSBackend != MacOSBackendAuto && runtime.GOOS != "darwin" {
-		return Options{}, fmt.Errorf("s3disk mount: macOS backend %q requires darwin", options.MacOSBackend)
-	}
 	if options.KernelCache {
 		return Options{}, ErrKernelCacheUnsupported
 	}

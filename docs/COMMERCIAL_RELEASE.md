@@ -117,7 +117,7 @@ workflow; they do not block the open-source release workflow.
 
 <!-- RELEASE-BLOCKER: platform-release-evidence -->
 
-- Linux `/dev/fuse` and macOS macFUSE/FSKit E2E tests are mandatory platform
+- Linux `/dev/fuse` and macOS macFUSE/VFS E2E tests are mandatory platform
   gates, but they have not yet produced archived evidence for a release
   candidate on every supported kernel/distribution/architecture. An ad hoc
   ARM64 Raspberry Pi 5 run on Linux
@@ -125,8 +125,9 @@ workflow; they do not block the open-source release workflow.
   old-handle `fstat`, type-change, deletion, and missing-to-present tests on
   2026-07-18; that is useful regression evidence, not per-tag certification.
   The gate also verifies refreshed reads, not guaranteed inotify/VS Code
-  watcher events. macOS depends on a separately installed macFUSE runtime and
-  still needs per-product distribution/licensing and release evidence. Windows
+  watcher events. The macOS gate is implemented but has no successful archived
+  run yet; it depends on a separately installed and enabled macFUSE VFS/kernel
+  runtime. macFUSE's newer FSKit transport requires a separate adapter. Windows
   still lacks a native adapter.
 
 <!-- RELEASE-BLOCKER: backend-fault-certification -->
@@ -418,10 +419,9 @@ accept or resolve each one explicitly.
   vulnerability result in CI. The fixture publishes MinIO on an OS-selected
   loopback port; keep that dynamic binding so parallel test jobs do not contend
   for a hard-coded port.
-- Preserve artifacts from the native Ubuntu/macOS/Windows tests, the macOS 26
-  macFUSE/FSKit mount gate, Linux unit/race/vet/compliance job, MinIO
-  integration, and TLA+ jobs configured in `.github/workflows/ci.yml`. Preserve
-  the full gate artifacts produced by
+- Preserve artifacts from the native Ubuntu/macOS/Windows tests, Linux
+  unit/race/vet/compliance job, MinIO integration, and TLA+ jobs configured in
+  `.github/workflows/ci.yml`. Preserve the full gate artifacts produced by
   `.github/workflows/release-linux.yml` on the reviewed owner-controlled
   `/dev/fuse` runner. Workflow presence or a green unrelated revision is not
   release evidence.

@@ -19,7 +19,6 @@ The command accepts one versioned JSON file:
       "mountpoint": "/mnt/project-a",
       "state_dir": "/var/lib/s3disk/reader",
       "cache_dir": "/var/cache/s3disk",
-      "macos_backend": "auto",
       "poll_interval": "1s",
       "poll_timeout": "2m"
     }
@@ -27,8 +26,7 @@ The command accepts one versioned JSON file:
 }
 ```
 
-`cache_dir`, `macos_backend`, `poll_interval`, and `poll_timeout` are optional.
-The macOS backend is `auto`, `vfs`, or `fskit`; an omitted value is `auto`.
+`cache_dir`, `poll_interval`, and `poll_timeout` are optional.
 Polling defaults to the same one-second interval and two-minute complete-attempt
 timeout as `s3disk mount`. Every path must be absolute. Names are 1 through 64
 ASCII
@@ -64,10 +62,11 @@ clean lifecycle end, including authorization expiry, is reported and does not
 remove later-expiring workspaces. The command exits successfully after all
 workspaces have ended or after graceful process-context cancellation.
 
-The required Linux and macOS integration gates create two independent real
-FUSE mounts under one supervisor, read distinct content through both mounts,
-then cancel the supervisor and require both lifecycles to unmount before they
-return. This is a functional concurrency gate, not a long-duration soak.
+The required Linux integration gate and the equivalent macOS test script create
+two independent real FUSE mounts under one supervisor, read distinct content
+through both mounts, then cancel the supervisor and require both lifecycles to
+unmount before they return. This is a functional concurrency gate, not a
+long-duration soak.
 
 Run the command below the platform service manager for restart policy, resource
 limits, log shipping, and boot ordering. Do not configure a service manager to

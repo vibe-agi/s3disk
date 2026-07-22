@@ -1083,18 +1083,20 @@ MinIO is pulled only as an external AGPL-3.0 test fixture. It is not linked into
 the Go module and must not be included in a redistributed product image without
 a separate licensing review.
 
-The regular CI workflow runs native tests on Ubuntu, macOS, and Windows, a real
-macOS 26 macFUSE/FSKit mount gate, Linux quality/race/vet/compliance checks, the
-pinned MinIO integration, and TLA+ model checking. The MinIO fixture binds an
-OS-selected loopback port so parallel jobs do not depend on a fixed host port.
+The regular CI workflow runs native tests on Ubuntu, macOS, and Windows, plus
+Linux quality/race/vet/compliance checks, the pinned MinIO integration, and TLA+
+model checking. The MinIO fixture binds an OS-selected loopback port so parallel
+jobs do not depend on a fixed host port. `scripts/test-mount-macos.sh` is a
+separate real-mount gate for an owner-controlled Mac with macFUSE VFS enabled.
 
 Pushing a canonical `v0.x.y` or `v1.x.y` tag runs the open-source release
 workflow. It revalidates source hygiene, tests, static analysis, known
 vulnerabilities, MinIO behavior, and the formal models; then it publishes
-versioned Linux and native-cgo macOS archives with SHA-256 checksums. Linux and
-macOS are read-only FUSE mount targets; macOS requires a separately installed
-macFUSE runtime. Windows remains a
-source-build target and does not support `mount`.
+versioned Linux and native-cgo macOS archives with SHA-256 checksums. Linux is
+the currently evidenced read-only FUSE target. macOS is a release target but
+requires a separately installed and enabled macFUSE VFS runtime plus a passing
+mount gate for the release; Windows remains a source-build target and does not
+support `mount`.
 
 The separate supported-production workflow is manual and optional. It retains
 the stricter signer, evidence-retention, isolated-runner, and support-policy

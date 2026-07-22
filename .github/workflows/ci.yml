@@ -400,79 +400,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  macos-fuse:
-    name: macOS 26 macFUSE/FSKit mount
-    runs-on: macos-26
-    timeout-minutes: 20
-    env:
-      MACFUSE_VERSION: "5.1.3"
-      MACFUSE_DMG_SHA256: "e5f80ff8c3df826e997fb786b35125a0c6a672f4bba2770b0def6ba63ca4ef81"
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-      - name: Install pinned macFUSE test runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          dmg="$RUNNER_TEMP/macfuse-$MACFUSE_VERSION.dmg"
-          image="$RUNNER_TEMP/macfuse-image"
-          mkdir "$image"
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            --output "$dmg" \
-            "https://github.com/macfuse/macfuse/releases/download/macfuse-$MACFUSE_VERSION/macfuse-$MACFUSE_VERSION.dmg"
-          printf '%s  %s\n' "$MACFUSE_DMG_SHA256" "$dmg" | shasum -a 256 --check
-          hdiutil attach -readonly -nobrowse -mountpoint "$image" "$dmg"
-          trap 'hdiutil detach "$image" >/dev/null 2>&1 || true' EXIT
-          package="$image/Install macFUSE.pkg"
-          [[ -f "$package" ]]
-          sudo installer -pkg "$package" -target /
-          hdiutil detach "$image"
-          trap - EXIT
-          macfuse_cli=/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/MacOS/macfuse
-          [[ -x "$macfuse_cli" ]]
-          if "$macfuse_cli" install --help 2>&1 | grep -q -- '--components'; then
-            sudo "$macfuse_cli" install --components file-system-extensions --force
-          else
-            sudo "$macfuse_cli" install --force
-          fi
-      - name: Run real FSKit mount tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          mount_root="/Volumes/s3disk-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          sudo mkdir "$mount_root"
-          sudo chown "$(id -u):$(id -g)" "$mount_root"
-          cleanup() {
-            sudo rmdir -- "$mount_root" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          {
-            sw_vers
-            uname -a
-            go version
-            go env GOOS GOARCH GOVERSION
-            pkgutil --pkg-info io.macfuse.pkg.Core || true
-          } 2>&1 | tee artifacts/macos-fuse-environment.log
-          S3DISK_TEST_MACOS_BACKEND=fskit \
-          S3DISK_TEST_MOUNT_ROOT="$mount_root" \
-            ./scripts/test-mount-macos.sh 2>&1 | tee artifacts/macos-fuse.log
-      - name: Archive macOS mount evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: macos-fuse-evidence-${{ github.sha }}-${{ github.run_attempt }}
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 30
-
   model:
     name: TLA+ model checking
     runs-on: ubuntu-24.04
@@ -541,7 +468,6 @@ jobs:
       - cross-build
       - quality
       - minio
-      - macos-fuse
       - model
       - scale
     runs-on: ubuntu-24.04
@@ -556,7 +482,6 @@ jobs:
           CROSS_BUILD_RESULT: ${{ needs.cross-build.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           MINIO_RESULT: ${{ needs.minio.result }}
-          MACOS_FUSE_RESULT: ${{ needs.macos-fuse.result }}
           MODEL_RESULT: ${{ needs.model.result }}
           SCALE_RESULT: ${{ needs.scale.result }}
         run: |
@@ -575,6 +500,5 @@ jobs:
           require_success cross-build "$CROSS_BUILD_RESULT"
           require_success quality "$QUALITY_RESULT"
           require_success minio "$MINIO_RESULT"
-          require_success macos-fuse "$MACOS_FUSE_RESULT"
           require_success model "$MODEL_RESULT"
           require_success scale "$SCALE_RESULT"

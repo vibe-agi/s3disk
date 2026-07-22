@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -48,10 +47,6 @@ type Options struct {
 	// while s3disk permits old and new snapshot handles to coexist at one path.
 	KernelCache    bool
 	FilesystemName string
-	// MacOSBackend selects macFUSE's default/VFS or FSKit backend on macOS.
-	// FSKit requires macOS 15.4 or later, macFUSE 5 or later, and a mountpoint
-	// below /Volumes. Non-default values are rejected on other platforms.
-	MacOSBackend MacOSBackend
 	// MaxInodeIdentities bounds the number of distinct (snapshot, path, type)
 	// identities currently remembered for this mount. Remembering them makes
 	// concurrent LOOKUP calls converge on one stable inode without probabilistic
@@ -196,9 +191,6 @@ func readOnlyWithMounter(
 	if err != nil {
 		return nil, err
 	}
-	if err := validatePlatformMountpoint(resolvedMountpoint, options); err != nil {
-		return nil, err
-	}
 	initialRefreshContext, cancelInitialRefresh := context.WithTimeout(ctx, options.Poll.AttemptTimeout)
 	result, err := consumer.Refresh(initialRefreshContext)
 	cancelInitialRefresh()
@@ -307,17 +299,6 @@ func readOnlyWithMounter(
 	return mounted, nil
 }
 
-func validatePlatformMountpoint(mountpoint string, options Options) error {
-	if runtime.GOOS != "darwin" || options.MacOSBackend != MacOSBackendFSKit {
-		return nil
-	}
-	relative, err := filepath.Rel("/Volumes", mountpoint)
-	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("s3disk mount: macOS FSKit mountpoint must be below /Volumes")
-	}
-	return nil
-}
-
 // newMountLifetimeContext fixes the authorization boundary for one mount. A
 // later reader refresh may shorten access at the object service, but it can
 // never extend this local deadline. The parent context's earlier deadline or
@@ -357,17 +338,13 @@ func newFUSEOptions(options Options) *fs.Options {
 			Debug:   options.Debug,
 			FsName:  options.FilesystemName,
 			Name:    "s3disk",
-			Options: kernelMountOptions(options),
+			Options: kernelMountOptions(),
 		},
 	}
 }
 
-func kernelMountOptions(options Options) []string {
-	mountOptions := []string{"ro", "default_permissions"}
-	if runtime.GOOS == "darwin" && options.MacOSBackend == MacOSBackendFSKit {
-		mountOptions = append(mountOptions, "backend=fskit")
-	}
-	return mountOptions
+func kernelMountOptions() []string {
+	return []string{"ro", "default_permissions"}
 }
 
 type snapshotIdentity struct {
