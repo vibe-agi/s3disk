@@ -44,6 +44,7 @@ for required_file in \
   third_party/licenses/go-singleflight-BSD-3-Clause.txt \
   third_party/licenses/pflag-BSD-3-Clause.txt \
   third_party/licenses/restic-chunker-BSD-2-Clause.txt \
+  third_party/licenses/x-net-BSD-3-Clause.txt \
   third_party/licenses/x-sys-BSD-3-Clause.txt
 do
   if [ ! -s "$required_file" ]; then
@@ -70,6 +71,12 @@ fi
 x_sys_dir=$(go list -m -f '{{.Dir}}' golang.org/x/sys)
 if ! diff -u "$x_sys_dir/PATENTS" third_party/licenses/Go-PATENTS.txt >/dev/null; then
   echo "third-party audit: bundled x/sys patent grant differs from upstream" >&2
+  echo "Review the module terms before updating the attribution bundle." >&2
+  exit 1
+fi
+x_net_dir=$(go list -m -f '{{.Dir}}' golang.org/x/net)
+if ! diff -u "$x_net_dir/PATENTS" third_party/licenses/Go-PATENTS.txt >/dev/null; then
+  echo "third-party audit: bundled x/net patent grant differs from upstream" >&2
   echo "Review the module terms before updating the attribution bundle." >&2
   exit 1
 fi
@@ -157,6 +164,7 @@ do
         github.com/fsnotify/fsnotify) bundled_license=third_party/licenses/fsnotify-BSD-3-Clause.txt ;;
         github.com/hanwen/go-fuse/v2) bundled_license=third_party/licenses/go-fuse-BSD-3-Clause.txt ;;
         github.com/spf13/pflag) bundled_license=third_party/licenses/pflag-BSD-3-Clause.txt ;;
+        golang.org/x/net) bundled_license=third_party/licenses/x-net-BSD-3-Clause.txt ;;
         golang.org/x/sys) bundled_license=third_party/licenses/x-sys-BSD-3-Clause.txt ;;
         *)
           echo "third-party audit: no bundled BSD-3-Clause text mapped for $module" >&2

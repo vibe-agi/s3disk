@@ -151,6 +151,10 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
+      - name: Require native macOS WebDAV mount
+        if: matrix.goos == 'darwin' && matrix.goarch == 'arm64'
+        shell: bash
+        run: ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 60s integration
       - name: Build versioned archive
         shell: bash
         env:

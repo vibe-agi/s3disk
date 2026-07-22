@@ -111,6 +111,13 @@ jobs:
           }
           ./scripts/run-required-go-test.sh ./internal/localstate TestDarwinTrustStateRevalidatesExtendedACLs 60s
           ./scripts/run-required-go-test.sh ./internal/localstate TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
+      - name: Require native macOS WebDAV mount
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 60s integration \
+            2>&1 | tee artifacts/macos-webdav-mount.json
       - name: Archive native evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

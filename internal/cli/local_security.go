@@ -276,6 +276,31 @@ type mountLocalPaths struct {
 	cacheBase  string
 }
 
+type consumerLocalPaths struct {
+	stateDir  string
+	cacheBase string
+}
+
+func preflightConsumerLocalPaths(statePath, cachePath string) (consumerLocalPaths, error) {
+	stateDir, err := resolveProspectiveLocalPath(statePath)
+	if err != nil {
+		return consumerLocalPaths{}, fmt.Errorf("resolve state directory: %w", err)
+	}
+	resolved := consumerLocalPaths{stateDir: stateDir}
+	if cachePath == "" {
+		return resolved, nil
+	}
+	cacheBase, err := resolveProspectiveLocalPath(cachePath)
+	if err != nil {
+		return consumerLocalPaths{}, fmt.Errorf("resolve cache base: %w", err)
+	}
+	if pathsOverlap(cacheBase, stateDir) {
+		return consumerLocalPaths{}, fmt.Errorf("cache base and state directory must not contain one another")
+	}
+	resolved.cacheBase = cacheBase
+	return resolved, nil
+}
+
 func preflightMountLocalPaths(options MountOptions) (mountLocalPaths, error) {
 	mountpoint, err := filepath.Abs(options.Mountpoint)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ const (
 	defaultShareExpiry  = 2 * time.Hour
 	defaultPollInterval = time.Second
 	defaultPollTimeout  = 2 * time.Minute
+	defaultWebDAVListen = "127.0.0.1:0"
 )
 
 // Dependencies makes every command path testable without network or FUSE I/O.
@@ -35,6 +37,7 @@ type Dependencies struct {
 	GenerateRecoveryKey func(context.Context, RecoveryKeyGenerateOptions) error
 	Mount               func(context.Context, MountOptions) error
 	MountSet            func(context.Context, MountSetOptions) error
+	ServeWebDAV         func(context.Context, WebDAVOptions) error
 	Doctor              func(context.Context, DoctorOptions, io.Writer) error
 }
 
@@ -85,6 +88,17 @@ type MountSetOptions struct {
 	ErrorWriter  io.Writer
 }
 
+type WebDAVOptions struct {
+	HandoffPath  string
+	Listen       string
+	StateDir     string
+	CacheDir     string
+	PollInterval time.Duration
+	PollTimeout  time.Duration
+	StatusWriter io.Writer
+	ErrorWriter  io.Writer
+}
+
 type DoctorOptions struct {
 	Bucket                      string
 	Prefix                      string
@@ -121,6 +135,9 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	if dependencies.MountSet == nil {
 		dependencies.MountSet = runMountSet
 	}
+	if dependencies.ServeWebDAV == nil {
+		dependencies.ServeWebDAV = runWebDAV
+	}
 	if dependencies.Doctor == nil {
 		dependencies.Doctor = runDoctor
 	}
@@ -141,8 +158,41 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 		newShareCommand(dependencies),
 		newMountCommand(dependencies),
 		newMountSetCommand(dependencies),
+		newServeCommand(dependencies),
 		newS3Command(dependencies),
 	)
+	return command
+}
+
+func newServeCommand(dependencies Dependencies) *cobra.Command {
+	command := &cobra.Command{Use: "serve", Short: "Expose a handoff through a portable local protocol", Args: cobra.NoArgs}
+	command.AddCommand(newWebDAVCommand(dependencies))
+	return command
+}
+
+func newWebDAVCommand(dependencies Dependencies) *cobra.Command {
+	options := WebDAVOptions{}
+	command := &cobra.Command{
+		Use:   "webdav",
+		Short: "Serve B's handoff as loopback-only read-only WebDAV",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if err := validateWebDAVOptions(&options); err != nil {
+				return err
+			}
+			options.StatusWriter = command.OutOrStdout()
+			options.ErrorWriter = command.ErrOrStderr()
+			return dependencies.ServeWebDAV(command.Context(), options)
+		},
+	}
+	flags := command.Flags()
+	flags.SortFlags = false
+	flags.StringVar(&options.HandoffPath, "handoff", "", "secret handoff file received privately from A")
+	flags.StringVar(&options.Listen, "listen", defaultWebDAVListen, "loopback TCP listen address")
+	flags.StringVar(&options.StateDir, "state-dir", "", "private durable anti-rollback state directory on B")
+	flags.StringVar(&options.CacheDir, "cache-dir", "", "private lazy block cache base (defaults below state-dir)")
+	flags.DurationVar(&options.PollInterval, "poll-interval", defaultPollInterval, "S3 root refresh interval")
+	flags.DurationVar(&options.PollTimeout, "poll-timeout", defaultPollTimeout, "maximum time for one complete S3 refresh")
 	return command
 }
 
@@ -444,6 +494,51 @@ func validateMountOptions(options *MountOptions) error {
 	}
 	if options.CacheDir != "" && pathsOverlap(options.CacheDir, options.StateDir) {
 		return errors.New("s3disk mount: --cache-dir and --state-dir must not contain one another")
+	}
+	return nil
+}
+
+func validateWebDAVOptions(options *WebDAVOptions) error {
+	if options == nil {
+		return errors.New("s3disk serve webdav: options are required")
+	}
+	for _, field := range []struct{ name, value string }{
+		{"--handoff", options.HandoffPath}, {"--listen", options.Listen}, {"--state-dir", options.StateDir},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("s3disk serve webdav: %s is required", field.name)
+		}
+	}
+	if err := validateLoopbackListenAddress(options.Listen); err != nil {
+		return fmt.Errorf("s3disk serve webdav: --listen: %w", err)
+	}
+	if options.PollInterval < 100*time.Millisecond || options.PollInterval > 5*time.Minute {
+		return errors.New("s3disk serve webdav: --poll-interval must be between 100ms and 5m")
+	}
+	if options.PollTimeout == 0 {
+		options.PollTimeout = defaultPollTimeout
+	}
+	if options.PollTimeout < time.Second || options.PollTimeout > presignedshare.MaximumOperationTimeout {
+		return fmt.Errorf("s3disk serve webdav: --poll-timeout must be between 1s and %s", presignedshare.MaximumOperationTimeout)
+	}
+	if options.CacheDir != "" && pathsOverlap(options.CacheDir, options.StateDir) {
+		return errors.New("s3disk serve webdav: --cache-dir and --state-dir must not contain one another")
+	}
+	return nil
+}
+
+func validateLoopbackListenAddress(address string) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return errors.New("must be an IP address and numeric port, for example 127.0.0.1:9867")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("must use a loopback IP address (127.0.0.0/8 or ::1)")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 0 || portNumber > 65535 {
+		return errors.New("port must be a number between 0 and 65535")
 	}
 	return nil
 }

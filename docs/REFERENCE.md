@@ -48,6 +48,8 @@ is separate from ordinary open-source tags and is not required for internal use.
 - `github.com/vibe-agi/s3disk/mount`: read-only FUSE adapter on Linux, macOS,
   and FreeBSD build targets. See [Compatibility](COMPATIBILITY.md) before
   shipping it.
+- `github.com/vibe-agi/s3disk/webdav`: portable read-only WebDAV handler for a
+  local reader endpoint. See [WebDAV access](WEBDAV.md).
 
 ## CLI: one expiring share
 
@@ -205,8 +207,23 @@ I/O. The same recovery-key file may technically open multiple shares, but a
 distinct key per share reduces compromise scope and avoids linkability through
 the recovery-key identifier.
 
-Copy `/secure/share.json` to B once through a private authenticated channel,
-then mount it:
+Copy `/secure/share.json` to B once through a private authenticated channel.
+The portable default starts a loopback-only WebDAV endpoint:
+
+```sh
+s3disk serve webdav \
+  --handoff /secure/share.json \
+  --state-dir /var/lib/s3disk/reader \
+  --poll-interval 1s \
+  --poll-timeout 2m
+```
+
+On macOS, connect Finder to the printed `http://127.0.0.1:.../` URL. Linux and
+other platforms can use the same URL with a WebDAV client. The server exposes
+only read methods and stops at the handoff deadline; detailed limits are in
+[`WEBDAV.md`](WEBDAV.md).
+
+The optional FUSE path uses an existing empty mountpoint:
 
 ```sh
 s3disk mount \
@@ -246,7 +263,8 @@ The processes may share a private `--state-dir`; share-ID subdirectories isolate
 their durable state. Publisher sessions remain independent processes and should
 be managed by the host service manager.
 
-On a reader, either run one `s3disk mount` process per handoff or use the
+On a reader, run one `s3disk serve webdav` process and loopback port per
+handoff. For FUSE, either run one `s3disk mount` process per handoff or use the
 declarative same-process supervisor:
 
 ```json
@@ -1054,7 +1072,8 @@ checks and limitations.
 ## Development checks
 
 The MinIO suite requires Docker Compose v2 and `jq`; Linux FUSE coverage also
-requires `/dev/fuse` and `fusermount3`, while macOS coverage requires a
+requires `/dev/fuse` and `fusermount3`. The zero-driver macOS WebDAV gate uses
+the built-in `/sbin/mount_webdav`; optional macOS FUSE coverage requires a
 separately installed macFUSE runtime.
 
 ```sh
@@ -1073,6 +1092,8 @@ go vet ./...
 ./scripts/test-mount-linux.sh
 # On a macOS runner with macFUSE:
 ./scripts/test-mount-macos.sh
+# Zero-driver native macOS WebDAV mount:
+./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 60s integration
 ```
 
 The scale smoke emits structured per-run evidence and accepts bounded workload
@@ -1086,17 +1107,17 @@ a separate licensing review.
 The regular CI workflow runs native tests on Ubuntu, macOS, and Windows, plus
 Linux quality/race/vet/compliance checks, the pinned MinIO integration, and TLA+
 model checking. The MinIO fixture binds an OS-selected loopback port so parallel
-jobs do not depend on a fixed host port. `scripts/test-mount-macos.sh` is a
-separate real-mount gate for an owner-controlled Mac with macFUSE VFS enabled.
+jobs do not depend on a fixed host port. macOS CI requires a real mount through
+Apple's built-in WebDAV client. `scripts/test-mount-macos.sh` is a separate,
+optional real-mount gate for an owner-controlled Mac with macFUSE VFS enabled.
 
 Pushing a canonical `v0.x.y` or `v1.x.y` tag runs the open-source release
 workflow. It revalidates source hygiene, tests, static analysis, known
 vulnerabilities, MinIO behavior, and the formal models; then it publishes
 versioned Linux and native-cgo macOS archives with SHA-256 checksums. Linux is
-the currently evidenced read-only FUSE target. macOS is a release target but
-requires a separately installed and enabled macFUSE VFS runtime plus a passing
-mount gate for the release; Windows remains a source-build target and does not
-support `mount`.
+the currently evidenced read-only FUSE target. macOS uses built-in WebDAV as
+its zero-driver release path; macFUSE remains optional. Windows remains a
+source-build target and does not support `mount`.
 
 The separate supported-production workflow is manual and optional. It retains
 the stricter signer, evidence-retention, isolated-runner, and support-policy

@@ -29,11 +29,13 @@ explicit packages.
 cmd/s3disk
     │
     ▼
-internal/cli ───────────────┐
-                            │
-mount  presignedshare       │
-  │          │              │
-  └──────────┴──────► s3disk (public root package)
+internal/cli
+    │
+    ├────────► mount ───────────┐
+    ├────────► webdav ──────────┤
+    └────────► presignedshare ──┤
+                                ▼
+                      s3disk (public root package)
                             │
              ┌──────────────┼──────────────┐
              ▼              ▼              ▼
@@ -59,6 +61,7 @@ contract.
 | `internal/fsutil` | Small platform-specific filesystem operations used by disposable cache state. |
 | `internal/syncutil` | Context-aware byte reservations and coalesced immutable downloads. |
 | `mount` | Read-only filesystem adapter and inode lifecycle. |
+| `webdav` | Portable read-only HTTP/WebDAV presentation adapter. |
 | `presignedshare` | Expiring, credential-free read capabilities. |
 | `publisherstate` | Protected publisher recovery envelopes. |
 | `s3store` | AWS SDK v2 S3 implementation. |

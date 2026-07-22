@@ -25,7 +25,21 @@ done
   exit 1
 }
 
+mount_device=
+for candidate in /dev/macfuse* /dev/osxfuse*
+do
+  if [ -c "$candidate" ] && [ -r "$candidate" ] && [ -w "$candidate" ]; then
+    mount_device=$candidate
+    break
+  fi
+done
+[ -n "$mount_device" ] || {
+  echo "macFUSE is installed, but its VFS device is not loaded and enabled" >&2
+  exit 1
+}
+
 printf 'macFUSE helper: %s\n' "$mount_helper"
+printf 'macFUSE device: %s\n' "$mount_device"
 S3DISK_REQUIRE_FUSE=1 ./scripts/run-required-go-test.sh \
   ./mount TestFUSEMountRefreshAndSnapshotPinning 60s integration
 

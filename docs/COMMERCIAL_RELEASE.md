@@ -117,7 +117,7 @@ workflow; they do not block the open-source release workflow.
 
 <!-- RELEASE-BLOCKER: platform-release-evidence -->
 
-- Linux `/dev/fuse` and macOS macFUSE/VFS E2E tests are mandatory platform
+- Linux `/dev/fuse` and built-in macOS WebDAV E2E tests are mandatory platform
   gates, but they have not yet produced archived evidence for a release
   candidate on every supported kernel/distribution/architecture. An ad hoc
   ARM64 Raspberry Pi 5 run on Linux
@@ -125,10 +125,11 @@ workflow; they do not block the open-source release workflow.
   old-handle `fstat`, type-change, deletion, and missing-to-present tests on
   2026-07-18; that is useful regression evidence, not per-tag certification.
   The gate also verifies refreshed reads, not guaranteed inotify/VS Code
-  watcher events. The macOS gate is implemented but has no successful archived
-  run yet; it depends on a separately installed and enabled macFUSE VFS/kernel
-  runtime. macFUSE's newer FSKit transport requires a separate adapter. Windows
-  still lacks a native adapter.
+  watcher events. The zero-driver WebDAV gate passed locally on macOS 26.5.2
+  ARM64 and is required by CI/release workflows; per-candidate archived evidence
+  remains pending. macFUSE VFS is an optional higher-fidelity path and still
+  needs an enabled host if the product advertises it. Windows still lacks a
+  certified Explorer/WebDAV integration and a native FUSE-style adapter.
 
 <!-- RELEASE-BLOCKER: backend-fault-certification -->
 
@@ -426,9 +427,10 @@ accept or resolve each one explicitly.
   `/dev/fuse` runner. Workflow presence or a green unrelated revision is not
   release evidence.
 - Preserve the mandatory `scripts/test-mount-linux.sh` result from a Linux
-  runner with `/dev/fuse` and `scripts/test-mount-macos.sh` from each shipped
-  macOS/architecture with the selected macFUSE backend. Extend them with forced
-  termination/restart and clean unmount. Test IDE watcher behavior separately:
+  runner with `/dev/fuse`, plus `TestMacOSNativeWebDAVMount` from each shipped
+  macOS/architecture. If macFUSE is advertised, also preserve
+  `scripts/test-mount-macos.sh` for the selected backend. Extend them with
+  forced termination/restart and clean unmount. Test IDE watcher behavior separately:
   FUSE invalidation freshness is not evidence of an inotify or VS Code event.
 - Test both default symlink rejection and any explicitly supported
   `SymlinkPreserve` workflow. Treat preserve mode as outside the mount sandbox.
