@@ -1088,17 +1088,20 @@ go vet ./...
 ./scripts/check-fuzz-wiring.sh
 ./scripts/test-release-ref.sh
 ./scripts/test-scale.sh
+./scripts/test-webdav-churn.sh
 # On a Linux release runner with /dev/fuse:
 ./scripts/test-mount-linux.sh
 # On a macOS runner with macFUSE:
 ./scripts/test-mount-macos.sh
 # Zero-driver native macOS WebDAV mount:
-./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 60s integration
+./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 120s integration
 ```
 
-The scale smoke emits structured per-run evidence and accepts bounded workload
-overrides documented in [`docs/SCALE.md`](SCALE.md). It is a regression
-profile, not a universal capacity claim.
+The scale smoke emits structured per-run evidence, including full WebDAV
+directory enumeration and byte-checked concurrent reads, and accepts bounded
+workload overrides documented in [`docs/SCALE.md`](SCALE.md). A scheduled
+5,000-file, 20-generation WebDAV churn profile adds sustained regression
+evidence. Neither profile is a universal capacity claim or a real-S3 soak.
 
 MinIO is pulled only as an external AGPL-3.0 test fixture. It is not linked into
 the Go module and must not be included in a redistributed product image without

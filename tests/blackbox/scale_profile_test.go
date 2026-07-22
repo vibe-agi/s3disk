@@ -3,13 +3,19 @@
 package s3disk_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -17,6 +23,7 @@ import (
 
 	"github.com/vibe-agi/s3disk"
 	"github.com/vibe-agi/s3disk/memstore"
+	s3webdav "github.com/vibe-agi/s3disk/webdav"
 )
 
 const (
@@ -38,6 +45,7 @@ type scaleProfileEvidence struct {
 	UpdatePublishMillis  int64  `json:"update_publish_millis"`
 	RefreshMillis        int64  `json:"refresh_millis"`
 	ReadMillis           int64  `json:"read_millis"`
+	WebDAVReadMillis     int64  `json:"webdav_read_millis"`
 	HeapAllocBytes       uint64 `json:"heap_alloc_bytes"`
 	HeapInuseBytes       uint64 `json:"heap_inuse_bytes"`
 	Goroutines           int    `json:"goroutines"`
@@ -100,12 +108,23 @@ func TestWorkspaceScaleProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer, err := s3disk.NewConsumer(repository, "main", s3disk.ConsumerOptions{})
+	watermarks, err := s3disk.NewFileWatermarkStore(filepath.Join(t.TempDir(), "watermark.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := s3disk.NewConsumer(repository, "main", s3disk.ConsumerOptions{
+		Watermarks: watermarks, RequirePersistentWatermark: true,
+		Symlinks: s3disk.SymlinkRejectExternal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	webDAVHandler, err := s3webdav.NewHandler(consumer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	started = time.Now()
-	refreshed, err := consumer.Refresh(ctx)
+	refreshed, err := webDAVHandler.Refresh(ctx)
 	refreshDuration := time.Since(started)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +137,18 @@ func TestWorkspaceScaleProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	readDuration := time.Since(started)
+	server := httptest.NewServer(webDAVHandler)
+	defer server.Close()
+	expectedGenerations := make([]int, len(paths))
+	for index := range expectedGenerations {
+		expectedGenerations[index] = 1
+	}
+	started = time.Now()
+	if err := readWebDAVScaleWorkspace(ctx, server.Client(), server.URL, paths,
+		expectedGenerations, fileBytes, readers); err != nil {
+		t.Fatal(err)
+	}
+	webDAVReadDuration := time.Since(started)
 
 	var updatePublishDuration time.Duration
 	for generation := 2; generation <= generations; generation++ {
@@ -135,8 +166,9 @@ func TestWorkspaceScaleProfile(t *testing.T) {
 		if snapshot.Generation != uint64(generation) {
 			t.Fatalf("published generation = %d, want %d", snapshot.Generation, generation)
 		}
+		expectedGenerations[index] = generation
 		started = time.Now()
-		refreshed, err := consumer.Refresh(ctx)
+		refreshed, err := webDAVHandler.Refresh(ctx)
 		refreshDuration += time.Since(started)
 		if err != nil {
 			t.Fatal(err)
@@ -149,6 +181,12 @@ func TestWorkspaceScaleProfile(t *testing.T) {
 			t.Fatal(err)
 		}
 		readDuration += time.Since(started)
+		started = time.Now()
+		if err := readWebDAVScaleWorkspace(ctx, server.Client(), server.URL, paths,
+			expectedGenerations, fileBytes, readers); err != nil {
+			t.Fatal(err)
+		}
+		webDAVReadDuration += time.Since(started)
 	}
 
 	runtime.GC()
@@ -165,7 +203,8 @@ func TestWorkspaceScaleProfile(t *testing.T) {
 		InitialPublishMillis: initialPublish.Milliseconds(),
 		UpdatePublishMillis:  updatePublishDuration.Milliseconds(),
 		RefreshMillis:        refreshDuration.Milliseconds(), ReadMillis: readDuration.Milliseconds(),
-		HeapAllocBytes: memory.HeapAlloc, HeapInuseBytes: memory.HeapInuse,
+		WebDAVReadMillis: webDAVReadDuration.Milliseconds(),
+		HeapAllocBytes:   memory.HeapAlloc, HeapInuseBytes: memory.HeapInuse,
 		Goroutines: runtime.NumGoroutine(),
 	}
 	encoded, err := json.Marshal(evidence)
@@ -173,6 +212,121 @@ func TestWorkspaceScaleProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("S3DISK_SCALE_EVIDENCE=%s", encoded)
+}
+
+type webDAVScaleRead struct {
+	index      int
+	path       string
+	generation int
+}
+
+func readWebDAVScaleWorkspace(
+	ctx context.Context,
+	client *http.Client,
+	baseURL string,
+	paths []string,
+	expectedGenerations []int,
+	fileBytes int,
+	readers int,
+) error {
+	if len(paths) != len(expectedGenerations) {
+		return errors.New("WebDAV scale expectations do not match paths")
+	}
+	if err := readWebDAVScaleDirectories(ctx, client, baseURL, paths); err != nil {
+		return err
+	}
+	readContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	work := make(chan webDAVScaleRead)
+	errorsFound := make(chan error, 1)
+	var wait sync.WaitGroup
+	for range readers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for item := range work {
+				request, err := http.NewRequestWithContext(readContext, http.MethodGet,
+					baseURL+"/"+item.path, nil)
+				if err == nil {
+					var response *http.Response
+					response, err = client.Do(request)
+					if err == nil {
+						contents, readErr := io.ReadAll(io.LimitReader(response.Body, int64(fileBytes)+1))
+						closeErr := response.Body.Close()
+						if readErr != nil {
+							err = readErr
+						} else if closeErr != nil {
+							err = closeErr
+						} else if response.StatusCode != http.StatusOK {
+							err = fmt.Errorf("GET status %d", response.StatusCode)
+						} else if !bytes.Equal(contents, scalePayload(item.index, item.generation, fileBytes)) {
+							err = errors.New("GET returned unexpected contents")
+						}
+					}
+				}
+				if err != nil {
+					select {
+					case errorsFound <- fmt.Errorf("read WebDAV scale file %q: %w", item.path, err):
+						cancel()
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	for index, value := range paths {
+		select {
+		case work <- webDAVScaleRead{index: index, path: value, generation: expectedGenerations[index]}:
+		case <-readContext.Done():
+		}
+		if readContext.Err() != nil {
+			break
+		}
+	}
+	close(work)
+	wait.Wait()
+	select {
+	case err := <-errorsFound:
+		return err
+	default:
+		return ctx.Err()
+	}
+}
+
+func readWebDAVScaleDirectories(ctx context.Context, client *http.Client, baseURL string, paths []string) error {
+	directorySet := map[string]struct{}{`/`: {}}
+	for _, value := range paths {
+		directorySet[path.Dir("/"+value)] = struct{}{}
+	}
+	directories := make([]string, 0, len(directorySet))
+	for directory := range directorySet {
+		directories = append(directories, directory)
+	}
+	sort.Strings(directories)
+	for _, directory := range directories {
+		request, err := http.NewRequestWithContext(ctx, "PROPFIND", baseURL+directory, nil)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Depth", "1")
+		response, err := client.Do(request)
+		if err != nil {
+			return fmt.Errorf("PROPFIND scale directory %q: %w", directory, err)
+		}
+		_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, 16<<20))
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("read PROPFIND scale directory %q: %w", directory, readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close PROPFIND scale directory %q: %w", directory, closeErr)
+		}
+		if response.StatusCode != http.StatusMultiStatus {
+			return fmt.Errorf("PROPFIND scale directory %q: status %d", directory, response.StatusCode)
+		}
+	}
+	return nil
 }
 
 func scaleEnvInt(t *testing.T, name string, fallback, minimum, maximum int) int {

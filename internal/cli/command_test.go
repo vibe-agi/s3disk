@@ -45,6 +45,7 @@ func TestWebDAVCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
 	root.SetArgs([]string{
 		"serve", "webdav", "--handoff", "/private/share.json", "--listen", "[::1]:9876",
 		"--state-dir", "/state", "--cache-dir", "/cache", "--poll-interval", "750ms", "--poll-timeout", "45s",
+		"--max-stale", "5m",
 	})
 	err := root.ExecuteContext(context.Background())
 	if !errors.Is(err, wantErr) {
@@ -52,9 +53,39 @@ func TestWebDAVCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
 	}
 	if observed.HandoffPath != "/private/share.json" || observed.Listen != "[::1]:9876" ||
 		observed.StateDir != "/state" || observed.CacheDir != "/cache" ||
-		observed.PollInterval != 750*time.Millisecond || observed.PollTimeout != 45*time.Second ||
+		observed.PollInterval != 750*time.Millisecond || observed.PollTimeout != 45*time.Second || observed.MaxStale != 5*time.Minute ||
 		observed.StatusWriter != &stdout || observed.ErrorWriter != &stderr {
 		t.Fatalf("unexpected WebDAV options: %#v", observed)
+	}
+}
+
+func TestWebDAVCommandRejectsStalenessBelowAttemptTimeout(t *testing.T) {
+	root := NewRootCommand(Dependencies{ServeWebDAV: func(context.Context, WebDAVOptions) error {
+		t.Fatal("runner called after invalid staleness options")
+		return nil
+	}})
+	root.SetArgs([]string{
+		"serve", "webdav", "--handoff", "/private/share.json", "--state-dir", "/state",
+		"--poll-timeout", "2m", "--max-stale", "1m",
+	})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "at least both --poll-interval and --poll-timeout") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWebDAVCommandRejectsStalenessBelowPollInterval(t *testing.T) {
+	root := NewRootCommand(Dependencies{ServeWebDAV: func(context.Context, WebDAVOptions) error {
+		t.Fatal("runner called after invalid staleness options")
+		return nil
+	}})
+	root.SetArgs([]string{
+		"serve", "webdav", "--handoff", "/private/share.json", "--state-dir", "/state",
+		"--poll-interval", "2m", "--poll-timeout", "30s", "--max-stale", "1m",
+	})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "at least both --poll-interval and --poll-timeout") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

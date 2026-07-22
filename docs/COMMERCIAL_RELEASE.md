@@ -126,8 +126,9 @@ workflow; they do not block the open-source release workflow.
   2026-07-18; that is useful regression evidence, not per-tag certification.
   The gate also verifies refreshed reads, not guaranteed inotify/VS Code
   watcher events. The zero-driver WebDAV gate passed locally on macOS 26.5.2
-  ARM64 and is required by CI/release workflows; per-candidate archived evidence
-  remains pending. macFUSE VFS is an optional higher-fidelity path and still
+  ARM64, including changed contents and a new Unicode path after Apple's native
+  60-second validation window without a remount. It is required by CI/release
+  workflows; per-candidate archived evidence remains pending. macFUSE VFS is an optional higher-fidelity path and still
   needs an enabled host if the product advertises it. Windows still lacks a
   certified Explorer/WebDAV integration and a native FUSE-style adapter.
 
@@ -219,9 +220,11 @@ workflow; they do not block the open-source release workflow.
   deliberately tiny registry limit. This removes permanent historical-map
   accumulation but does not establish how quickly each supported kernel emits
   `FORGET` under large concurrent working sets. The deterministic checked-in
-  scale profile and bounded `mount-set` supervisor provide repeatable core
-  evidence and same-process orchestration, but neither is a multi-workspace
-  S3/FUSE soak result. Certification still requires the actual backend, kernel,
+  scale profile now enumerates every directory and byte-checks every file
+  through WebDAV on every generation. A scheduled 5,000-file, 20-generation
+  churn profile and bounded `mount-set` supervisor provide repeatable core
+  evidence and same-process orchestration, but none is a multi-workspace
+  S3/FUSE or multi-day soak result. Certification still requires the actual backend, kernel,
   directory shape, churn, expiry, partial-failure, and service-manager restart
   matrix.
 

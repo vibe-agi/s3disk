@@ -12,4 +12,7 @@ var (
 	// ErrAuthorizationExpired reports that the immutable handoff authorization
 	// deadline has passed.
 	ErrAuthorizationExpired = errors.New("s3disk webdav: read authorization expired")
+	// ErrRefreshStale reports that a caller-configured freshness deadline was
+	// exceeded without one successful snapshot refresh.
+	ErrRefreshStale = errors.New("s3disk webdav: maximum refresh staleness exceeded")
 )

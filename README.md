@@ -139,6 +139,9 @@ See the full [compatibility matrix](docs/COMPATIBILITY.md).
   large, high-churn, long-running mounts.
 - WebDAV intentionally omits symbolic links because the protocol has no
   portable POSIX symlink representation, and the CLI is loopback-only.
+- macOS's built-in WebDAVFS may retain an already-read file for about 60
+  seconds before revalidating it; server refresh is immediate, Finder refresh
+  is not. The native release gate verifies eventual refresh without remounting.
 - The mount inode-identity table is bounded; reaching the configured limit
   requires a remount or a different sharding strategy.
 - `mount-set` supervises independent mounts; it is not a union filesystem or a

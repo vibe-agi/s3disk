@@ -18,7 +18,11 @@ import (
 
 type readOnlyFileSystem struct {
 	consumer *s3disk.Consumer
+	gate     *sync.RWMutex
 }
+
+type snapshotGateHeldKey struct{}
+type snapshotHTTPValidatorKey struct{}
 
 func (filesystem *readOnlyFileSystem) Mkdir(context.Context, string, os.FileMode) error {
 	return os.ErrPermission
@@ -33,6 +37,8 @@ func (filesystem *readOnlyFileSystem) Rename(context.Context, string, string) er
 }
 
 func (filesystem *readOnlyFileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	unlock := filesystem.lockSnapshot(ctx)
+	defer unlock()
 	entry, err := filesystem.consumer.Stat(ctx, name)
 	if err != nil {
 		return nil, translateFileError("stat", name, err)
@@ -44,7 +50,7 @@ func (filesystem *readOnlyFileSystem) Stat(ctx context.Context, name string) (os
 	if !ok {
 		return nil, translateFileError("stat", name, s3disk.ErrNoSnapshot)
 	}
-	return newFileInfo(name, entry, snapshot.Generation), nil
+	return newFileInfo(name, entry, snapshot.Generation, false), nil
 }
 
 func (filesystem *readOnlyFileSystem) OpenFile(
@@ -53,6 +59,8 @@ func (filesystem *readOnlyFileSystem) OpenFile(
 	flag int,
 	_ os.FileMode,
 ) (xwebdav.File, error) {
+	unlock := filesystem.lockSnapshot(ctx)
+	defer unlock()
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_TRUNC) != 0 {
 		return nil, translateFileError("open", name, os.ErrPermission)
 	}
@@ -67,9 +75,10 @@ func (filesystem *readOnlyFileSystem) OpenFile(
 	if !ok {
 		return nil, translateFileError("open", name, s3disk.ErrNoSnapshot)
 	}
+	useHTTPValidator := ctx != nil && ctx.Value(snapshotHTTPValidatorKey{}) == true
 	opened := &readOnlyFile{
 		ctx: ctx, consumer: filesystem.consumer,
-		info: newFileInfo(name, entry, snapshot.Generation),
+		info: newFileInfo(name, entry, snapshot.Generation, useHTTPValidator),
 	}
 	if entry.Type == s3disk.EntryDir {
 		entries, listErr := filesystem.consumer.ListDir(ctx, name)
@@ -85,7 +94,7 @@ func (filesystem *readOnlyFileSystem) OpenFile(
 				continue
 			}
 			opened.entries = append(opened.entries,
-				newFileInfo(path.Join(name, child.Name), child, snapshot.Generation))
+				newFileInfo(path.Join(name, child.Name), child, snapshot.Generation, useHTTPValidator))
 		}
 		return opened, nil
 	}
@@ -95,6 +104,15 @@ func (filesystem *readOnlyFileSystem) OpenFile(
 	}
 	opened.file = file
 	return opened, nil
+}
+
+func (filesystem *readOnlyFileSystem) lockSnapshot(ctx context.Context) func() {
+	if filesystem == nil || filesystem.gate == nil ||
+		(ctx != nil && ctx.Value(snapshotGateHeldKey{}) == true) {
+		return func() {}
+	}
+	filesystem.gate.RLock()
+	return filesystem.gate.RUnlock
 }
 
 func translateFileError(operation, name string, err error) error {
@@ -118,9 +136,10 @@ type fileInfo struct {
 	path       string
 	entry      s3disk.Entry
 	generation uint64
+	httpTime   bool
 }
 
-func newFileInfo(name string, entry s3disk.Entry, generation uint64) fileInfo {
+func newFileInfo(name string, entry s3disk.Entry, generation uint64, httpTime bool) fileInfo {
 	cleaned := path.Clean("/" + name)
 	base := path.Base(cleaned)
 	if cleaned == "/" {
@@ -129,14 +148,38 @@ func newFileInfo(name string, entry s3disk.Entry, generation uint64) fileInfo {
 	if entry.Name != "" {
 		base = entry.Name
 	}
-	return fileInfo{name: base, path: cleaned, entry: entry, generation: generation}
+	return fileInfo{
+		name: base, path: cleaned, entry: entry, generation: generation,
+		httpTime: httpTime,
+	}
 }
 
-func (info fileInfo) Name() string       { return info.name }
-func (info fileInfo) Size() int64        { return max(info.entry.Size, 0) }
-func (info fileInfo) ModTime() time.Time { return info.entry.ModTime }
-func (info fileInfo) IsDir() bool        { return info.entry.Type == s3disk.EntryDir }
-func (info fileInfo) Sys() any           { return nil }
+func (info fileInfo) Name() string { return info.name }
+func (info fileInfo) Size() int64  { return max(info.entry.Size, 0) }
+func (info fileInfo) ModTime() time.Time {
+	if info.httpTime {
+		return snapshotHTTPValidatorTime(info.generation)
+	}
+	return info.entry.ModTime
+}
+func (info fileInfo) IsDir() bool { return info.entry.Type == s3disk.EntryDir }
+func (info fileInfo) Sys() any    { return nil }
+
+// snapshotHTTPValidatorTime maps every practically representable generation
+// to a stable whole-second HTTP date. It is deliberately separate from the
+// source mtime exposed by PROPFIND. Generation zero or a value beyond the
+// four-digit HTTP year range returns zero, which makes net/http ignore weak
+// date validators and safely send the representation in full.
+func snapshotHTTPValidatorTime(generation uint64) time.Time {
+	const (
+		validatorEpochUnix = int64(946684800)    // 2000-01-01T00:00:00Z
+		maximumHTTPUnix    = int64(253402300799) // 9999-12-31T23:59:59Z
+	)
+	if generation == 0 || generation > uint64(maximumHTTPUnix-validatorEpochUnix) {
+		return time.Time{}
+	}
+	return time.Unix(validatorEpochUnix+int64(generation), 0).UTC()
+}
 
 func (info fileInfo) Mode() os.FileMode {
 	mode := os.FileMode(info.entry.Mode & 0o777)
