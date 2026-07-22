@@ -168,7 +168,9 @@ jobs:
             go build -trimpath -buildvcs=true \
               -ldflags="-s -w -X main.version=$GITHUB_REF_NAME" \
               -o "$binary" ./cmd/s3disk
-          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md SUPPORT.md "$package_dir/"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md README.zh-CN.md \
+            SUPPORT.md SECURITY.md CONTRIBUTING.md "$package_dir/"
+          cp -R docs "$package_dir/"
           go version -m "$binary" >"$package_dir/build-info.txt"
           archive="$package.tar.gz"
           if [[ "$RUNNER_OS" == Linux ]]; then

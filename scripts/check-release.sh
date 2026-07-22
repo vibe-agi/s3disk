@@ -62,7 +62,7 @@ require_clean_tree() {
 }
 
 for required_file in \
-  LICENSE NOTICE README.md SUPPORT.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md \
+  LICENSE NOTICE README.md README.zh-CN.md SUPPORT.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md \
   docs/COMPATIBILITY.md docs/COMMERCIAL_RELEASE.md .github/CODEOWNERS \
   .github/workflows/ci.yml .github/workflows/dco.yml \
   scripts/check-dco.sh scripts/check-staticcheck.sh scripts/test-dco.sh \
