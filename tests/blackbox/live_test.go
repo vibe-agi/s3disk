@@ -112,12 +112,12 @@ func TestPublisherWatchReinstallsRecreatedDirectoryWatch(t *testing.T) {
 
 			switch operation {
 			case "remove":
-				if err := os.RemoveAll(nested); err != nil {
+				if err := retryPermissionDenied(func() error { return os.RemoveAll(nested) }); err != nil {
 					t.Fatal(err)
 				}
 			case "rename":
 				moved := filepath.Join(privateTestDirectory(t), "moved")
-				if err := os.Rename(nested, moved); err != nil {
+				if err := retryPermissionDenied(func() error { return os.Rename(nested, moved) }); err != nil {
 					t.Fatal(err)
 				}
 			default:
@@ -1098,6 +1098,21 @@ func waitSnapshotGeneration(t *testing.T, snapshots <-chan s3disk.Snapshot, errs
 		case <-deadline.C:
 			t.Fatalf("timed out waiting for published generation %d", generation)
 		}
+	}
+}
+
+// retryPermissionDenied tolerates the bounded handoff window in which Windows
+// is completing an asynchronous ReadDirectoryChangesW request and temporarily
+// rejects removal or rename of the watched directory. A persistent sharing or
+// handle leak still fails the test after the deadline.
+func retryPermissionDenied(operation func() error) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := operation()
+		if err == nil || !errors.Is(err, os.ErrPermission) || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

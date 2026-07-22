@@ -1134,6 +1134,14 @@ func (publisher *Publisher) buildFile(
 	for attempt := 0; attempt < publisher.options.StableReadTries; attempt++ {
 		file, err := sourceRoot.Open(path)
 		if err != nil {
+			// The directory entry was already inspected by buildDirectory. If it
+			// disappears before this descriptor is opened, the source changed
+			// during the scan. Preserve os.ErrNotExist for callers which need the
+			// platform detail, while classifying the publication failure as
+			// retryable source instability.
+			if errors.Is(err, os.ErrNotExist) {
+				return Digest{}, 0, nil, fmt.Errorf("%w: open %q: %w", ErrUnstableFile, path, err)
+			}
 			return Digest{}, 0, nil, fmt.Errorf("open %q: %w", path, err)
 		}
 		before, err := file.Stat()
