@@ -1,6 +1,6 @@
 //go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !windows
 
-package s3disk
+package localstate
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 
 var fallbackWatermarkLocks sync.Map
 
-func lockWatermarkFile(_ context.Context, path string) (func() error, error) {
+func LockFile(_ context.Context, path string) (func() error, error) {
 	value, _ := fallbackWatermarkLocks.LoadOrStore(path, new(sync.Mutex))
 	lock := value.(*sync.Mutex)
 	lock.Lock()

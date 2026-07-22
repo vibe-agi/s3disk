@@ -1,6 +1,6 @@
 //go:build windows
 
-package s3disk
+package localstate
 
 import (
 	"errors"
@@ -26,16 +26,16 @@ const windowsWatermarkWriteMask windows.ACCESS_MASK = windows.FILE_WRITE_DATA |
 	windows.ACCESS_MASK(windows.GENERIC_WRITE) |
 	windows.ACCESS_MASK(windows.GENERIC_ALL)
 
-func prepareWatermarkDirectory(directory string) (string, error) {
+func PrepareDirectory(directory string) (string, error) {
 	missing := make([]string, 0, 4)
 	current := filepath.Clean(directory)
 	for {
 		info, err := os.Lstat(current)
 		if err == nil {
 			if !info.IsDir() {
-				return "", fmt.Errorf("%w: watermark directory ancestor is not a directory", ErrCorruptObject)
+				return "", fmt.Errorf("%w: watermark directory ancestor is not a directory", ErrUnsafe)
 			}
-			if err := validateWatermarkDirectory(current); err != nil {
+			if err := ValidateDirectory(current); err != nil {
 				return "", err
 			}
 			break
@@ -64,7 +64,7 @@ func prepareWatermarkDirectory(directory string) (string, error) {
 				_ = os.Remove(temporary)
 			}
 		}()
-		if err := validateWatermarkDirectory(temporary); err != nil {
+		if err := ValidateDirectory(temporary); err != nil {
 			return "", err
 		}
 		err = moveWatermarkPathWindows(temporary, created, false)
@@ -78,17 +78,17 @@ func prepareWatermarkDirectory(directory string) (string, error) {
 		} else {
 			removeTemporary = false
 		}
-		if err := validateWatermarkDirectory(created); err != nil {
+		if err := ValidateDirectory(created); err != nil {
 			return "", err
 		}
 	}
-	if err := validateWatermarkDirectory(directory); err != nil {
+	if err := ValidateDirectory(directory); err != nil {
 		return "", err
 	}
 	return filepath.Clean(directory), nil
 }
 
-func validateWatermarkDirectory(path string) error {
+func ValidateDirectory(path string) error {
 	linked, err := os.Lstat(path)
 	if err != nil {
 		return err
@@ -98,7 +98,7 @@ func validateWatermarkDirectory(path string) error {
 		return err
 	}
 	defer directory.Close()
-	_, err = validateWatermarkOpenedPath(path, linked, directory, true)
+	_, err = ValidateOpenedPath(path, linked, directory, true)
 	return err
 }
 
@@ -146,7 +146,7 @@ func rejectWindowsWatermarkReparsePoint(path string) error {
 		return fmt.Errorf("s3disk: read Windows watermark attributes: %w", err)
 	}
 	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return fmt.Errorf("%w: Windows watermark path component %q is a reparse point", ErrCorruptObject, path)
+		return fmt.Errorf("%w: Windows watermark path component %q is a reparse point", ErrUnsafe, path)
 	}
 	return nil
 }
@@ -161,11 +161,11 @@ func validateWindowsWatermarkACL(handle windows.Handle) error {
 		return fmt.Errorf("s3disk: read Windows watermark ACL: %w", err)
 	}
 	if descriptor == nil || !descriptor.IsValid() {
-		return fmt.Errorf("%w: Windows watermark has no valid security descriptor", ErrCorruptObject)
+		return fmt.Errorf("%w: Windows watermark has no valid security descriptor", ErrUnsafe)
 	}
 	dacl, _, err := descriptor.DACL()
 	if err != nil || dacl == nil {
-		return fmt.Errorf("%w: Windows watermark has no restrictive DACL", ErrCorruptObject)
+		return fmt.Errorf("%w: Windows watermark has no restrictive DACL", ErrUnsafe)
 	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
@@ -173,10 +173,10 @@ func validateWindowsWatermarkACL(handle windows.Handle) error {
 	}
 	owner, _, err := descriptor.Owner()
 	if err != nil || owner == nil || !owner.IsValid() {
-		return fmt.Errorf("%w: Windows watermark has no valid owner", ErrCorruptObject)
+		return fmt.Errorf("%w: Windows watermark has no valid owner", ErrUnsafe)
 	}
 	if !allowedWindowsWatermarkWriter(owner, user.User.Sid) {
-		return fmt.Errorf("%w: Windows watermark owner %s is not trusted", ErrCorruptObject, owner.String())
+		return fmt.Errorf("%w: Windows watermark owner %s is not trusted", ErrUnsafe, owner.String())
 	}
 	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
@@ -191,14 +191,14 @@ func validateWindowsWatermarkACL(handle windows.Handle) error {
 			continue
 		case windows.ACCESS_ALLOWED_ACE_TYPE:
 		default:
-			return fmt.Errorf("%w: unsupported modifying Windows watermark ACE type %d", ErrCorruptObject, ace.Header.AceType)
+			return fmt.Errorf("%w: unsupported modifying Windows watermark ACE type %d", ErrUnsafe, ace.Header.AceType)
 		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		if !sid.IsValid() {
-			return fmt.Errorf("%w: Windows watermark ACL contains an invalid SID", ErrCorruptObject)
+			return fmt.Errorf("%w: Windows watermark ACL contains an invalid SID", ErrUnsafe)
 		}
 		if !allowedWindowsWatermarkWriter(sid, user.User.Sid) {
-			return fmt.Errorf("%w: Windows watermark ACL grants modification to %s", ErrCorruptObject, sid.String())
+			return fmt.Errorf("%w: Windows watermark ACL grants modification to %s", ErrUnsafe, sid.String())
 		}
 	}
 	return nil
@@ -212,16 +212,16 @@ func allowedWindowsWatermarkWriter(sid, current *windows.SID) bool {
 		sid.IsWellKnown(windows.WinCreatorOwnerRightsSid)
 }
 
-func protectWatermarkFile(path string, file *os.File) error {
+func ProtectFile(path string, file *os.File) error {
 	linked, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
-	_, err = validateWatermarkOpenedPath(path, linked, file, false)
+	_, err = ValidateOpenedPath(path, linked, file, false)
 	return err
 }
 
-func installWatermarkFile(temporary, destination string) error {
+func InstallFile(temporary, destination string) error {
 	return moveWatermarkPathWindows(temporary, destination, true)
 }
 
@@ -255,4 +255,4 @@ func windowsExtendedPath(path string) string {
 // MOVEFILE_WRITE_THROUGH on Windows. Unlike os.File.Sync on a directory, that
 // operation has an explicit documented write-through contract, so no separate
 // directory flush is needed for the installed state.
-func syncWatermarkDirectory(string) error { return nil }
+func SyncDirectory(string) error { return nil }

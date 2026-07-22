@@ -1,6 +1,6 @@
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
-package s3disk
+package localstate
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func lockWatermarkFile(ctx context.Context, path string) (func() error, error) {
+func LockFile(ctx context.Context, path string) (func() error, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("s3disk: open watermark lock: %w", err)
@@ -50,6 +50,6 @@ func validateWatermarkLockFile(path string, file *os.File) error {
 	if err != nil {
 		return fmt.Errorf("s3disk: inspect watermark lock: %w", err)
 	}
-	_, err = validateWatermarkOpenedPath(path, linked, file, false)
+	_, err = ValidateOpenedPath(path, linked, file, false)
 	return err
 }

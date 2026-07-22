@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/vibe-agi/s3disk/internal/syncutil"
 )
 
 func TestProtocolV1GoldenFixtures(t *testing.T) {
@@ -146,7 +148,7 @@ func TestManifestValidationRejectsHostileMetadata(t *testing.T) {
 	digest := digestObject("file", []byte("node"))
 	consumer := &Consumer{
 		downloadSlots: make(chan struct{}, 1),
-		downloadBytes: newWeightedSemaphore(DefaultMaxConcurrentDownloadBytes),
+		downloadBytes: syncutil.NewWeightedSemaphore(DefaultMaxConcurrentDownloadBytes, ErrResourceLimit),
 	}
 	for _, name := range [][]byte{[]byte("."), []byte(".."), []byte(strings.Repeat("x", maxEntryNameBytes+1))} {
 		manifest := dirManifest{Format: objectFormatVersion, Entries: []dirEntry{{

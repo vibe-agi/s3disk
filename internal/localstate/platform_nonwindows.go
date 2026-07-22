@@ -1,6 +1,6 @@
 //go:build !windows
 
-package s3disk
+package localstate
 
 import (
 	"errors"
@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-func prepareWatermarkDirectory(directory string) (string, error) {
+func PrepareDirectory(directory string) (string, error) {
 	missing := make([]string, 0, 4)
 	current := filepath.Clean(directory)
 	for {
@@ -45,21 +45,21 @@ func prepareWatermarkDirectory(directory string) (string, error) {
 			if !errors.Is(err, os.ErrExist) {
 				return "", err
 			}
-		} else if err := syncWatermarkDirectory(filepath.Dir(created)); err != nil {
+		} else if err := SyncDirectory(filepath.Dir(created)); err != nil {
 			return "", fmt.Errorf("persist watermark directory %q: %w", created, err)
 		}
-		if err := validateWatermarkDirectory(created); err != nil {
+		if err := ValidateDirectory(created); err != nil {
 			return "", err
 		}
 		current = created
 	}
-	if err := validateWatermarkDirectory(current); err != nil {
+	if err := ValidateDirectory(current); err != nil {
 		return "", err
 	}
 	return current, nil
 }
 
-func validateWatermarkDirectory(path string) error {
+func ValidateDirectory(path string) error {
 	return validateWatermarkDirectoryHierarchy(path, false)
 }
 
@@ -79,7 +79,7 @@ func validateWatermarkDirectoryHierarchy(path string, allowStickyFinal bool) err
 			return err
 		}
 		if !linked.IsDir() || linked.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: watermark directory component %q is not a real directory", ErrCorruptObject, component)
+			return fmt.Errorf("%w: watermark directory component %q is not a real directory", ErrUnsafe, component)
 		}
 		directory, err := os.Open(component)
 		if err != nil {
@@ -97,10 +97,10 @@ func validateWatermarkDirectoryHierarchy(path string, allowStickyFinal bool) err
 			return errors.Join(statErr, aclErr, closeErr)
 		}
 		if !opened.IsDir() || !os.SameFile(linked, opened) {
-			return fmt.Errorf("%w: watermark directory component %q changed identity", ErrCorruptObject, component)
+			return fmt.Errorf("%w: watermark directory component %q changed identity", ErrUnsafe, component)
 		}
 		if !trustedWatermarkPathOwner(opened) {
-			return fmt.Errorf("%w: watermark directory component %q has an untrusted owner", ErrCorruptObject, component)
+			return fmt.Errorf("%w: watermark directory component %q has an untrusted owner", ErrUnsafe, component)
 		}
 		permissions := opened.Mode().Perm()
 		if permissions&0o022 != 0 {
@@ -110,7 +110,7 @@ func validateWatermarkDirectoryHierarchy(path string, allowStickyFinal bool) err
 			// before the ancestor was tightened and can use *at operations through
 			// that descriptor without traversing the current path.
 			if (isFinal && !allowStickyFinal) || opened.Mode()&os.ModeSticky == 0 {
-				return fmt.Errorf("%w: watermark directory component %q is group/world writable", ErrCorruptObject, component)
+				return fmt.Errorf("%w: watermark directory component %q is group/world writable", ErrUnsafe, component)
 			}
 		}
 	}
@@ -126,20 +126,20 @@ func validateWatermarkPathSecurity(path string, linked, opened os.FileInfo, file
 		return err
 	}
 	if !trustedWatermarkPathOwner(linked) || !trustedWatermarkPathOwner(opened) {
-		return fmt.Errorf("%w: watermark path has an untrusted owner", ErrCorruptObject)
+		return fmt.Errorf("%w: watermark path has an untrusted owner", ErrUnsafe)
 	}
 	if linked.Mode().Perm()&0o022 != 0 || opened.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%w: watermark path is group/world writable", ErrCorruptObject)
+		return fmt.Errorf("%w: watermark path is group/world writable", ErrUnsafe)
 	}
 	if !directory {
-		if err := validateWatermarkDirectory(filepath.Dir(path)); err != nil {
+		if err := ValidateDirectory(filepath.Dir(path)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func protectWatermarkFile(_ string, file *os.File) error {
+func ProtectFile(_ string, file *os.File) error {
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}
@@ -148,11 +148,11 @@ func protectWatermarkFile(_ string, file *os.File) error {
 	return validateUnixWatermarkACL(file)
 }
 
-func installWatermarkFile(temporary, destination string) error {
+func InstallFile(temporary, destination string) error {
 	return os.Rename(temporary, destination)
 }
 
-func syncWatermarkDirectory(path string) error {
+func SyncDirectory(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("s3disk: open watermark directory for sync: %w", err)

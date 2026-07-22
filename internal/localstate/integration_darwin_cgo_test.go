@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package s3disk
+package localstate_test
 
 import (
 	"context"
@@ -9,7 +9,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/vibe-agi/s3disk"
+	"github.com/vibe-agi/s3disk/internal/localstate"
 )
+
+func privateTestDirectory(t testing.TB) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatalf("protect test directory: %v", err)
+	}
+	return directory
+}
 
 func addDarwinACLEntry(t *testing.T, path, entry string) {
 	t.Helper()
@@ -26,21 +38,21 @@ func TestDarwinTrustStateRejectsDirectoryExtendedACL(t *testing.T) {
 	}
 	addDarwinACLEntry(t, directory, "everyone allow add_file,delete_child")
 
-	_, err := NewFileWatermarkStore(filepath.Join(directory, "main.watermark"))
-	if !errors.Is(err, ErrCorruptObject) {
+	_, err := s3disk.NewFileWatermarkStore(filepath.Join(directory, "main.watermark"))
+	if !errors.Is(err, s3disk.ErrCorruptObject) {
 		t.Fatalf("NewFileWatermarkStore ACL error = %v, want ErrCorruptObject", err)
 	}
 }
 
 func TestDarwinTrustStateRevalidatesExtendedACLs(t *testing.T) {
-	newStore := func(t *testing.T) (string, *FileWatermarkStore) {
+	newStore := func(t *testing.T) (string, *s3disk.FileWatermarkStore) {
 		t.Helper()
 		path := filepath.Join(privateTestDirectory(t), "main.watermark")
-		store, err := NewFileWatermarkStore(path)
+		store, err := s3disk.NewFileWatermarkStore(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		watermark := Watermark{RepositoryID: RepositoryID{1}, Generation: 1, Commit: Digest{2}}
+		watermark := s3disk.Watermark{RepositoryID: s3disk.RepositoryID{1}, Generation: 1, Commit: s3disk.Digest{2}}
 		if err := store.CompareAndSwap(context.Background(), "main", nil, watermark); err != nil {
 			t.Fatal(err)
 		}
@@ -50,7 +62,7 @@ func TestDarwinTrustStateRevalidatesExtendedACLs(t *testing.T) {
 	t.Run("ancestor", func(t *testing.T) {
 		path, store := newStore(t)
 		addDarwinACLEntry(t, filepath.Dir(path), "everyone allow add_file,delete_child")
-		if _, _, err := store.Load(context.Background(), "main"); !errors.Is(err, ErrCorruptObject) {
+		if _, _, err := store.Load(context.Background(), "main"); !errors.Is(err, s3disk.ErrCorruptObject) {
 			t.Fatalf("Load with ancestor ACL error = %v, want ErrCorruptObject", err)
 		}
 	})
@@ -58,7 +70,7 @@ func TestDarwinTrustStateRevalidatesExtendedACLs(t *testing.T) {
 	t.Run("lock", func(t *testing.T) {
 		path, store := newStore(t)
 		addDarwinACLEntry(t, path+".lock", "everyone allow write,append")
-		if _, _, err := store.Load(context.Background(), "main"); !errors.Is(err, ErrCorruptObject) {
+		if _, _, err := store.Load(context.Background(), "main"); !errors.Is(err, s3disk.ErrCorruptObject) {
 			t.Fatalf("Load with lock ACL error = %v, want ErrCorruptObject", err)
 		}
 	})
@@ -71,7 +83,7 @@ func TestDarwinTrustStateRevalidatesExtendedACLs(t *testing.T) {
 		} else if info.Mode().Perm() != 0o600 {
 			t.Fatalf("state mode after chmod +a = %o, want hidden ACL with mode 0600", info.Mode().Perm())
 		}
-		if _, _, err := store.Load(context.Background(), "main"); !errors.Is(err, ErrCorruptObject) {
+		if _, _, err := store.Load(context.Background(), "main"); !errors.Is(err, s3disk.ErrCorruptObject) {
 			t.Fatalf("Load with state ACL error = %v, want ErrCorruptObject", err)
 		}
 	})
@@ -86,7 +98,7 @@ func TestProtectWatermarkFileRejectsInheritedDarwinACL(t *testing.T) {
 	}
 	defer file.Close()
 
-	if err := protectWatermarkFile(file.Name(), file); !errors.Is(err, ErrCorruptObject) {
+	if err := localstate.ProtectFile(file.Name(), file); !errors.Is(err, localstate.ErrUnsafe) {
 		t.Fatalf("protectWatermarkFile inherited ACL error = %v, want ErrCorruptObject", err)
 	}
 	if info, err := file.Stat(); err != nil {
@@ -98,7 +110,7 @@ func TestProtectWatermarkFileRejectsInheritedDarwinACL(t *testing.T) {
 
 func TestFilePublicationJournalRevalidatesDarwinLockACL(t *testing.T) {
 	path := filepath.Join(privateTestDirectory(t), "publisher.journal")
-	journal, err := NewFilePublicationJournal(path)
+	journal, err := s3disk.NewFilePublicationJournal(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +118,7 @@ func TestFilePublicationJournalRevalidatesDarwinLockACL(t *testing.T) {
 		t.Fatalf("initial journal Load found=%v error=%v", found, err)
 	}
 	addDarwinACLEntry(t, path+".lock", "everyone allow write,append")
-	if _, _, _, err := journal.Load(context.Background(), "main"); !errors.Is(err, ErrCorruptObject) {
+	if _, _, _, err := journal.Load(context.Background(), "main"); !errors.Is(err, s3disk.ErrCorruptObject) {
 		t.Fatalf("journal Load with lock ACL error = %v, want ErrCorruptObject", err)
 	}
 }

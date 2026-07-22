@@ -1,6 +1,6 @@
 //go:build !windows && !plan9
 
-package s3disk
+package localstate
 
 import (
 	"fmt"
@@ -8,30 +8,30 @@ import (
 	"syscall"
 )
 
-func validatePrivateSecretDirectory(path string) error {
-	if err := validateWatermarkDirectory(path); err != nil {
+func ValidatePrivateSecretDirectory(path string) error {
+	if err := ValidateDirectory(path); err != nil {
 		return fmt.Errorf("s3disk: unsafe private secret directory: %w", err)
 	}
 	return nil
 }
 
-func validatePrivateSecretFile(path string, file *os.File) error {
+func ValidatePrivateSecretFile(path string, file *os.File) error {
 	linked, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("s3disk: inspect private secret file: %w", err)
 	}
-	opened, err := validateWatermarkOpenedPath(path, linked, file, false)
+	opened, err := ValidateOpenedPath(path, linked, file, false)
 	if err != nil {
 		return fmt.Errorf("s3disk: validate private secret file: %w", err)
 	}
 	if linked.Mode().Perm() != 0o600 || opened.Mode().Perm() != 0o600 {
-		return fmt.Errorf("%w: private secret file permissions must be exactly 0600", ErrCorruptObject)
+		return fmt.Errorf("%w: private secret file permissions must be exactly 0600", ErrUnsafe)
 	}
 	if !privateSecretOwnedByCurrentProcess(linked) || !privateSecretOwnedByCurrentProcess(opened) {
-		return fmt.Errorf("%w: private secret file is not owned by the current process identity", ErrCorruptObject)
+		return fmt.Errorf("%w: private secret file is not owned by the current process identity", ErrUnsafe)
 	}
 	if !privateSecretHasSingleLink(linked) || !privateSecretHasSingleLink(opened) {
-		return fmt.Errorf("%w: private secret file must have exactly one filesystem link", ErrCorruptObject)
+		return fmt.Errorf("%w: private secret file must have exactly one filesystem link", ErrUnsafe)
 	}
 	return nil
 }

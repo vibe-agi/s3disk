@@ -1,4 +1,4 @@
-package s3disk
+package syncutil
 
 import (
 	"container/list"
@@ -7,13 +7,14 @@ import (
 	"sync"
 )
 
-// weightedSemaphore is a FIFO byte reservation primitive. Waiters block on
+// WeightedSemaphore is a FIFO byte reservation primitive. Waiters block on
 // per-request channels, so cancellation never needs a helper goroutine.
-type weightedSemaphore struct {
+type WeightedSemaphore struct {
 	mu       sync.Mutex
 	capacity int64
 	used     int64
 	waiters  list.List
+	limitErr error
 }
 
 type weightedSemaphoreWaiter struct {
@@ -23,13 +24,13 @@ type weightedSemaphoreWaiter struct {
 	granted bool
 }
 
-func newWeightedSemaphore(capacity int64) *weightedSemaphore {
-	return &weightedSemaphore{capacity: capacity}
+func NewWeightedSemaphore(capacity int64, limitErr error) *WeightedSemaphore {
+	return &WeightedSemaphore{capacity: capacity, limitErr: limitErr}
 }
 
-func (semaphore *weightedSemaphore) Acquire(ctx context.Context, weight int64) error {
+func (semaphore *WeightedSemaphore) Acquire(ctx context.Context, weight int64) error {
 	if semaphore == nil || weight <= 0 {
-		return fmt.Errorf("%w: invalid download byte reservation", ErrResourceLimit)
+		return fmt.Errorf("%w: invalid download byte reservation", semaphore.limitError())
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -42,7 +43,7 @@ func (semaphore *weightedSemaphore) Acquire(ctx context.Context, weight int64) e
 	}
 	if weight > semaphore.capacity {
 		semaphore.mu.Unlock()
-		return fmt.Errorf("%w: download byte reservation %d exceeds budget %d", ErrResourceLimit, weight, semaphore.capacity)
+		return fmt.Errorf("%w: download byte reservation %d exceeds budget %d", semaphore.limitError(), weight, semaphore.capacity)
 	}
 	if semaphore.waiters.Len() == 0 && weight <= semaphore.capacity-semaphore.used {
 		semaphore.used += weight
@@ -72,7 +73,7 @@ func (semaphore *weightedSemaphore) Acquire(ctx context.Context, weight int64) e
 	}
 }
 
-func (semaphore *weightedSemaphore) Release(weight int64) {
+func (semaphore *WeightedSemaphore) Release(weight int64) {
 	semaphore.mu.Lock()
 	if weight <= 0 || weight > semaphore.used {
 		semaphore.mu.Unlock()
@@ -83,7 +84,7 @@ func (semaphore *weightedSemaphore) Release(weight int64) {
 	semaphore.mu.Unlock()
 }
 
-func (semaphore *weightedSemaphore) grantLocked() {
+func (semaphore *WeightedSemaphore) grantLocked() {
 	for {
 		element := semaphore.waiters.Front()
 		if element == nil {
@@ -99,4 +100,29 @@ func (semaphore *weightedSemaphore) grantLocked() {
 		semaphore.used += waiter.weight
 		close(waiter.ready)
 	}
+}
+
+func (semaphore *WeightedSemaphore) limitError() error {
+	if semaphore != nil && semaphore.limitErr != nil {
+		return semaphore.limitErr
+	}
+	return fmt.Errorf("syncutil: reservation exceeds capacity")
+}
+
+// Stats returns the current byte usage and queued waiter count atomically.
+func (semaphore *WeightedSemaphore) Stats() (used int64, waiters int) {
+	if semaphore == nil {
+		return 0, 0
+	}
+	semaphore.mu.Lock()
+	defer semaphore.mu.Unlock()
+	return semaphore.used, semaphore.waiters.Len()
+}
+
+// Capacity returns the immutable reservation capacity.
+func (semaphore *WeightedSemaphore) Capacity() int64 {
+	if semaphore == nil {
+		return 0
+	}
+	return semaphore.capacity
 }

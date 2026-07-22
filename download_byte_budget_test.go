@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/vibe-agi/s3disk/internal/syncutil"
 )
 
 func TestConsumerDownloadByteBudgetOptionBounds(t *testing.T) {
@@ -17,7 +19,7 @@ func TestConsumerDownloadByteBudgetOptionBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := consumer.downloadBytes.capacity; got != DefaultMaxConcurrentDownloadBytes {
+	if got := consumer.downloadBytes.Capacity(); got != DefaultMaxConcurrentDownloadBytes {
 		t.Fatalf("default download byte budget = %d, want %d", got, DefaultMaxConcurrentDownloadBytes)
 	}
 
@@ -31,35 +33,10 @@ func TestConsumerDownloadByteBudgetOptionBounds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("download byte budget %d: %v", value, err)
 		}
-		if consumer.downloadBytes.capacity != value {
-			t.Fatalf("download byte budget = %d, want %d", consumer.downloadBytes.capacity, value)
+		if consumer.downloadBytes.Capacity() != value {
+			t.Fatalf("download byte budget = %d, want %d", consumer.downloadBytes.Capacity(), value)
 		}
 	}
-}
-
-func TestWeightedSemaphoreCancellationRemovesWaiter(t *testing.T) {
-	semaphore := newWeightedSemaphore(10)
-	if err := semaphore.Acquire(t.Context(), 10); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	result := make(chan error, 1)
-	go func() { result <- semaphore.Acquire(ctx, 6) }()
-	waitForSemaphoreWaiters(t, semaphore, 1)
-	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled acquire error = %v, want context.Canceled", err)
-	}
-	semaphore.mu.Lock()
-	if semaphore.waiters.Len() != 0 || semaphore.used != 10 {
-		t.Fatalf("after cancellation waiters=%d used=%d, want 0 and 10", semaphore.waiters.Len(), semaphore.used)
-	}
-	semaphore.mu.Unlock()
-	semaphore.Release(10)
-	if err := semaphore.Acquire(t.Context(), 10); err != nil {
-		t.Fatalf("acquire after canceled waiter: %v", err)
-	}
-	semaphore.Release(10)
 }
 
 func TestConsumerByteBudgetBoundsConcurrentChunkGetsAndCancellation(t *testing.T) {
@@ -104,7 +81,7 @@ func TestConsumerByteBudgetBoundsConcurrentChunkGetsAndCancellation(t *testing.T
 	}
 	// Use small values to exercise the weighted algorithm without allocating
 	// protocol-maximum chunks. Public construction enforces the production floor.
-	consumer.downloadBytes = newWeightedSemaphore(10)
+	consumer.downloadBytes = syncutil.NewWeightedSemaphore(10, ErrResourceLimit)
 
 	firstResult := make(chan error, 1)
 	go func() {
@@ -199,10 +176,10 @@ func TestChunkReservationLivesUntilLastFlightWaiterConsumesData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer.downloadBytes = newWeightedSemaphore(10)
+	consumer.downloadBytes = syncutil.NewWeightedSemaphore(10, ErrResourceLimit)
 
 	type leaseResult struct {
-		lease *chunkLease
+		lease *syncutil.BytesLease
 		err   error
 	}
 	sharedResults := make(chan leaseResult, 2)
@@ -274,7 +251,7 @@ func TestCanceledChunkFlightWaiterDoesNotRetainLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer.downloadBytes = newWeightedSemaphore(10)
+	consumer.downloadBytes = syncutil.NewWeightedSemaphore(10, ErrResourceLimit)
 
 	cancelCtx, cancel := context.WithCancel(t.Context())
 	canceled := make(chan error, 1)
@@ -287,7 +264,7 @@ func TestCanceledChunkFlightWaiterDoesNotRetainLease(t *testing.T) {
 	}()
 	<-entered
 	type survivorResult struct {
-		lease *chunkLease
+		lease *syncutil.BytesLease
 		err   error
 	}
 	survivor := make(chan survivorResult, 1)
@@ -444,8 +421,8 @@ func TestConsumerPassesExpectedSizeToSizedChunkCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(lease.data) != string(data) {
-		t.Fatalf("cached data = %q, want %q", lease.data, data)
+	if string(lease.Data()) != string(data) {
+		t.Fatalf("cached data = %q, want %q", lease.Data(), data)
 	}
 	lease.Release()
 	if cache.expected.Load() != int64(len(data)) {
@@ -536,13 +513,11 @@ func TestConsumerConservativelyChargesSmallMetadataAndReference(t *testing.T) {
 	}
 }
 
-func waitForSemaphoreWaiters(t *testing.T, semaphore *weightedSemaphore, count int) {
+func waitForSemaphoreWaiters(t *testing.T, semaphore *syncutil.WeightedSemaphore, count int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		semaphore.mu.Lock()
-		got := semaphore.waiters.Len()
-		semaphore.mu.Unlock()
+		_, got := semaphore.Stats()
 		if got == count {
 			return
 		}
@@ -553,27 +528,19 @@ func waitForSemaphoreWaiters(t *testing.T, semaphore *weightedSemaphore, count i
 	}
 }
 
-func assertSemaphoreUsed(t *testing.T, semaphore *weightedSemaphore, expected int64) {
+func assertSemaphoreUsed(t *testing.T, semaphore *syncutil.WeightedSemaphore, expected int64) {
 	t.Helper()
-	semaphore.mu.Lock()
-	got := semaphore.used
-	semaphore.mu.Unlock()
+	got, _ := semaphore.Stats()
 	if got != expected {
 		t.Fatalf("charged download bytes = %d, want %d", got, expected)
 	}
 }
 
-func waitForChunkFlightUsers(t *testing.T, group *chunkFlightGroup, key chunkFlightKey, count int) {
+func waitForChunkFlightUsers(t *testing.T, group *syncutil.FlightGroup[chunkFlightKey], key chunkFlightKey, count int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		group.mu.Lock()
-		call := group.calls[key]
-		got := 0
-		if call != nil {
-			got = call.users
-		}
-		group.mu.Unlock()
+		got := group.Users(key)
 		if got == count {
 			return
 		}

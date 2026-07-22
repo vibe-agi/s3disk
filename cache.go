@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vibe-agi/s3disk/internal/fsutil"
 )
 
 // ChunkCache stores verified raw chunks outside the mounted tree. Get transfers
@@ -392,7 +394,7 @@ func (cache *DiskCache) readEntry(ctx context.Context, entry *diskCacheEntry, ex
 	// Persist approximate recency through the already-open file handle. A
 	// pathname-based timestamp update could follow a concurrently substituted
 	// symlink outside the cache root on Unix.
-	_ = touchCacheFile(file, time.Now())
+	_ = fsutil.TouchFile(file, time.Now())
 	if err := cache.validateShard(shardName, shardInfo); err != nil {
 		return nil, false, err
 	}
@@ -975,7 +977,7 @@ func syncCacheDirectoryAt(root *os.Root, name string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%w: cache sync target is not a directory", ErrCorruptObject)
 	}
-	return syncCacheDirectory(directory)
+	return fsutil.SyncDirectory(directory)
 }
 
 func syncCacheRootDirectory(root *os.Root) error {
