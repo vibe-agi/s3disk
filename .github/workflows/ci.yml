@@ -109,7 +109,7 @@ jobs:
             echo "Darwin trust-state tests require CGO_ENABLED=1" >&2
             exit 1
           }
-          ./scripts/run-required-go-test.sh . TestDarwinTrustStateRevalidatesExtendedACLs 60s
+          ./scripts/run-required-go-test.sh ./internal/localstate TestDarwinTrustStateRevalidatesExtendedACLs 60s
           ./scripts/run-required-go-test.sh . TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
       - name: Archive native evidence
         if: always()
