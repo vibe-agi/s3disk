@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.0
 	github.com/aws/smithy-go v1.27.4
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/hanwen/go-fuse/v2 v2.10.1
+	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/restic/chunker v0.5.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
