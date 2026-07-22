@@ -106,8 +106,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          ./scripts/run-required-go-test.sh . TestFileWatermarkStoreRejectsWindowsWritableDirectoryACL 60s
-          ./scripts/run-required-go-test.sh . TestFileWatermarkStoreRejectsWindowsDirectoryReparsePoint 60s
+          ./scripts/run-required-go-test.sh ./tests/blackbox TestFileWatermarkStoreRejectsWindowsWritableDirectoryACL 60s
+          ./scripts/run-required-go-test.sh ./tests/blackbox TestFileWatermarkStoreRejectsWindowsDirectoryReparsePoint 60s
       - name: Archive successful native release evidence
         if: success()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

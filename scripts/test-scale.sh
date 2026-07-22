@@ -13,4 +13,4 @@ S3DISK_SCALE_READERS=${S3DISK_SCALE_READERS:-8}
 export S3DISK_RUN_SCALE S3DISK_SCALE_FILES S3DISK_SCALE_FILE_BYTES
 export S3DISK_SCALE_GENERATIONS S3DISK_SCALE_READERS
 
-./scripts/run-required-go-test.sh . TestWorkspaceScaleProfile 10m scale
+./scripts/run-required-go-test.sh ./tests/blackbox TestWorkspaceScaleProfile 10m scale

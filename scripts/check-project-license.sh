@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 cd "$project_dir"
 
-for required_file in LICENSE NOTICE README.md CONTRIBUTING.md \
+for required_file in LICENSE NOTICE README.md README.zh-CN.md CONTRIBUTING.md \
   THIRD_PARTY_NOTICES.md third_party/licenses/Apache-2.0.txt
 do
   if [ ! -s "$required_file" ]; then
