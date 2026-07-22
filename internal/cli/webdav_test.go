@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,9 +92,66 @@ func TestServeWebDAVStopsAtAuthorizationExpiry(t *testing.T) {
 	}
 }
 
+func TestServeWebDAVStopsAfterConfiguredRefreshStaleness(t *testing.T) {
+	t.Parallel()
+	handler, store := newCLIWebDAVHandlerWithStore(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.failReads.Store(true)
+	var warnings synchronizedBuffer
+	result := make(chan error, 1)
+	go func() {
+		result <- serveWebDAV(context.Background(), listener, handler, WebDAVOptions{
+			PollInterval: 100 * time.Millisecond, PollTimeout: time.Second, MaxStale: time.Second,
+			ErrorWriter: &warnings,
+		}, time.Now().Add(time.Minute))
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, s3webdav.ErrRefreshStale) {
+			t.Fatalf("error = %v", err)
+		}
+		if !strings.Contains(warnings.String(), "consecutive_failures=") ||
+			!strings.Contains(warnings.String(), "last_success=") {
+			t.Fatalf("warnings = %q", warnings.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WebDAV server did not stop after its freshness deadline")
+	}
+}
+
+func TestServeWebDAVBoundsBlockedRefreshByStalenessDeadline(t *testing.T) {
+	t.Parallel()
+	handler, store := newCLIWebDAVHandlerWithStore(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.blockReads.Store(true)
+	started := time.Now()
+	err = serveWebDAV(context.Background(), listener, handler, WebDAVOptions{
+		PollInterval: 10 * time.Millisecond, PollTimeout: 5 * time.Second, MaxStale: 200 * time.Millisecond,
+	}, time.Now().Add(time.Minute))
+	if !errors.Is(err, s3webdav.ErrRefreshStale) {
+		t.Fatalf("error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("staleness shutdown took %s, want at most 1s", elapsed)
+	}
+}
+
 func newCLIWebDAVHandler(t *testing.T) *s3webdav.Handler {
 	t.Helper()
-	repository, err := s3disk.NewRepository(memstore.New(), "cli-webdav-test")
+	handler, _ := newCLIWebDAVHandlerWithStore(t)
+	return handler
+}
+
+func newCLIWebDAVHandlerWithStore(t *testing.T) (*s3webdav.Handler, *toggleReadFailureStore) {
+	t.Helper()
+	store := &toggleReadFailureStore{Store: memstore.New()}
+	repository, err := s3disk.NewRepository(store, "cli-webdav-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,5 +190,26 @@ func newCLIWebDAVHandler(t *testing.T) *s3webdav.Handler {
 	if _, err := handler.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	return handler
+	return handler, store
+}
+
+type toggleReadFailureStore struct {
+	*memstore.Store
+	failReads  atomic.Bool
+	blockReads atomic.Bool
+}
+
+func (store *toggleReadFailureStore) Get(
+	ctx context.Context,
+	key string,
+	options s3disk.GetOptions,
+) (s3disk.Object, error) {
+	if store.blockReads.Load() {
+		<-ctx.Done()
+		return s3disk.Object{}, ctx.Err()
+	}
+	if store.failReads.Load() {
+		return s3disk.Object{}, s3disk.ErrStoreUnavailable
+	}
+	return store.Store.Get(ctx, key, options)
 }

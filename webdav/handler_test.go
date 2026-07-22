@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/vibe-agi/s3disk"
 	"github.com/vibe-agi/s3disk/memstore"
@@ -194,6 +196,222 @@ func TestOpenFilePinsBytesAcrossRefresh(t *testing.T) {
 	}
 }
 
+func TestDateValidatorsCannotHideSameSecondRefresh(t *testing.T) {
+	t.Parallel()
+	fixture := newHandlerFixture(t)
+	initial := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(initial,
+		httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil))
+	lastModified := initial.Header().Get("Last-Modified")
+	oldETag := initial.Header().Get("ETag")
+	if lastModified == "" || oldETag == "" {
+		t.Fatalf("initial validators: Last-Modified=%q ETag=%q", lastModified, oldETag)
+	}
+	original, err := os.Stat(filepath.Join(fixture.source, "hello.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixture.source, "hello.txt"), []byte("new generation"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(fixture.source, "hello.txt"), original.ModTime(), original.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.publisher.Publish(context.Background(), fixture.source, "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.handler.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	modifiedSince := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil)
+	modifiedSince.Header.Set("If-Modified-Since", lastModified)
+	response := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(response, modifiedSince)
+	if response.Code != http.StatusOK || response.Body.String() != "new generation" {
+		t.Fatalf("same-second If-Modified-Since = status %d body %q", response.Code, response.Body.String())
+	}
+	newETag := response.Header().Get("ETag")
+	if newETag == "" || newETag == oldETag {
+		t.Fatalf("refreshed ETag = %q, old = %q", newETag, oldETag)
+	}
+	newLastModified := response.Header().Get("Last-Modified")
+	if newLastModified == "" || newLastModified == lastModified {
+		t.Fatalf("refreshed Last-Modified = %q, old = %q", newLastModified, lastModified)
+	}
+
+	noneMatch := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil)
+	noneMatch.Header.Set("If-None-Match", newETag)
+	notModified := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(notModified, noneMatch)
+	if notModified.Code != http.StatusNotModified {
+		t.Fatalf("current If-None-Match status = %d, want 304", notModified.Code)
+	}
+	modifiedSinceCurrent := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil)
+	modifiedSinceCurrent.Header.Set("If-Modified-Since", newLastModified)
+	dateNotModified := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(dateNotModified, modifiedSinceCurrent)
+	if dateNotModified.Code != http.StatusNotModified {
+		t.Fatalf("current If-Modified-Since status = %d, want 304", dateNotModified.Code)
+	}
+
+	dateRange := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil)
+	dateRange.Header.Set("Range", "bytes=6-")
+	dateRange.Header.Set("If-Range", lastModified)
+	complete := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(complete, dateRange)
+	if complete.Code != http.StatusOK || complete.Body.String() != "new generation" {
+		t.Fatalf("same-second date If-Range = status %d body %q", complete.Code, complete.Body.String())
+	}
+}
+
+func TestSnapshotHTTPValidatorTimeIsStableAndBounded(t *testing.T) {
+	t.Parallel()
+	first := snapshotHTTPValidatorTime(1)
+	second := snapshotHTTPValidatorTime(2)
+	if first.IsZero() || !second.After(first) || second.Sub(first) != time.Second {
+		t.Fatalf("validator times: generation 1=%s generation 2=%s", first, second)
+	}
+	if repeat := snapshotHTTPValidatorTime(2); !repeat.Equal(second) {
+		t.Fatalf("repeated validator time = %s, want %s", repeat, second)
+	}
+	if value := snapshotHTTPValidatorTime(^uint64(0)); !value.IsZero() {
+		t.Fatalf("unrepresentable generation validator = %s, want zero", value)
+	}
+}
+
+func TestLongGETPinsBytesWithoutBlockingRefresh(t *testing.T) {
+	t.Parallel()
+	fixture := newHandlerFixture(t)
+	response := newBlockingResponseWriter()
+	t.Cleanup(response.unblock)
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		fixture.handler.ServeHTTP(response,
+			httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil))
+	}()
+	waitForSignal(t, response.writeStarted, "GET did not begin streaming")
+
+	if err := os.WriteFile(filepath.Join(fixture.source, "hello.txt"), []byte("new generation"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.publisher.Publish(context.Background(), fixture.source, "main"); err != nil {
+		t.Fatal(err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() {
+		result, err := fixture.handler.Refresh(context.Background())
+		if err == nil && result.Status != s3disk.RefreshUpdated {
+			err = errors.New("refresh did not adopt the published generation")
+		}
+		refreshDone <- err
+	}()
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh was blocked by an in-progress GET body")
+	}
+	response.unblock()
+	waitForSignal(t, requestDone, "GET did not finish after releasing its client")
+	if response.statusCode != http.StatusOK || response.body.String() != "hello world" {
+		t.Fatalf("pinned GET = status %d body %q", response.statusCode, response.body.String())
+	}
+
+	current := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(current,
+		httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil))
+	if current.Code != http.StatusOK || current.Body.String() != "new generation" {
+		t.Fatalf("current GET = status %d body %q", current.Code, current.Body.String())
+	}
+}
+
+func TestPROPFINDRemainsSingleSnapshotDuringRefresh(t *testing.T) {
+	t.Parallel()
+	fixture := newHandlerFixture(t)
+	response := newBlockingResponseWriter()
+	t.Cleanup(response.unblock)
+	request := httptest.NewRequest("PROPFIND", "http://127.0.0.1/", nil)
+	request.Header.Set("Depth", "1")
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		fixture.handler.ServeHTTP(response, request)
+	}()
+	waitForSignal(t, response.writeStarted, "PROPFIND did not begin its response")
+
+	if err := os.WriteFile(filepath.Join(fixture.source, "new.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.publisher.Publish(context.Background(), fixture.source, "main"); err != nil {
+		t.Fatal(err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.handler.Refresh(context.Background())
+		refreshDone <- err
+	}()
+	select {
+	case err := <-refreshDone:
+		t.Fatalf("refresh completed before PROPFIND snapshot finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	response.unblock()
+	waitForSignal(t, requestDone, "PROPFIND did not finish after releasing its client")
+	if strings.Contains(response.body.String(), "new.txt") {
+		t.Fatalf("PROPFIND mixed a later generation into its response: %s", response.body.String())
+	}
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not resume after PROPFIND completed")
+	}
+
+	currentRequest := httptest.NewRequest("PROPFIND", "http://127.0.0.1/", nil)
+	currentRequest.Header.Set("Depth", "1")
+	current := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(current, currentRequest)
+	if current.Code != 207 || !strings.Contains(current.Body.String(), "new.txt") {
+		t.Fatalf("current PROPFIND = status %d body %q", current.Code, current.Body.String())
+	}
+}
+
+func TestHandlerStatusTracksRefreshHealth(t *testing.T) {
+	t.Parallel()
+	fixture := newHandlerFixture(t)
+	initial := fixture.handler.Status()
+	if initial.Generation != 1 || initial.LastRefreshSuccess.IsZero() ||
+		initial.ConsecutiveRefreshFailures != 0 || initial.LastRefreshError != "" {
+		t.Fatalf("initial status = %#v", initial)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := fixture.handler.Refresh(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled refresh error = %v", err)
+	}
+	failed := fixture.handler.Status()
+	if failed.Generation != initial.Generation || failed.ConsecutiveRefreshFailures != 1 ||
+		failed.LastRefreshError == "" || failed.LastRefreshAttempt.Before(initial.LastRefreshSuccess) {
+		t.Fatalf("failed status = %#v", failed)
+	}
+
+	if _, err := fixture.handler.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recovered := fixture.handler.Status()
+	if recovered.Generation != initial.Generation || recovered.ConsecutiveRefreshFailures != 0 ||
+		recovered.LastRefreshError != "" || recovered.LastRefreshSuccess.Before(initial.LastRefreshSuccess) {
+		t.Fatalf("recovered status = %#v", recovered)
+	}
+}
+
 func TestHandlerRequiresDurableWatermark(t *testing.T) {
 	t.Parallel()
 	repository, err := s3disk.NewRepository(memstore.New(), "webdav-no-watermark")
@@ -206,5 +424,51 @@ func TestHandlerRequiresDurableWatermark(t *testing.T) {
 	}
 	if _, err := NewHandler(consumer); !errors.Is(err, ErrDurableWatermarkRequired) {
 		t.Fatalf("NewHandler error = %v", err)
+	}
+}
+
+type blockingResponseWriter struct {
+	header       http.Header
+	statusCode   int
+	body         bytes.Buffer
+	writeStarted chan struct{}
+	release      chan struct{}
+	startOnce    sync.Once
+	releaseOnce  sync.Once
+}
+
+func newBlockingResponseWriter() *blockingResponseWriter {
+	return &blockingResponseWriter{
+		header: make(http.Header), writeStarted: make(chan struct{}), release: make(chan struct{}),
+	}
+}
+
+func (writer *blockingResponseWriter) Header() http.Header { return writer.header }
+
+func (writer *blockingResponseWriter) WriteHeader(statusCode int) {
+	if writer.statusCode == 0 {
+		writer.statusCode = statusCode
+	}
+}
+
+func (writer *blockingResponseWriter) Write(contents []byte) (int, error) {
+	if writer.statusCode == 0 {
+		writer.statusCode = http.StatusOK
+	}
+	writer.startOnce.Do(func() { close(writer.writeStarted) })
+	<-writer.release
+	return writer.body.Write(contents)
+}
+
+func (writer *blockingResponseWriter) unblock() {
+	writer.releaseOnce.Do(func() { close(writer.release) })
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, timeoutMessage string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatal(timeoutMessage)
 	}
 }

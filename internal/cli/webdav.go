@@ -102,17 +102,18 @@ func serveWebDAV(
 	}
 	lifetimeContext, cancelLifetime := context.WithCancel(ctx)
 	defer cancelLifetime()
-	pollDone := make(chan struct{})
+	pollResult := make(chan error, 1)
 	go func() {
-		defer close(pollDone)
-		pollWebDAV(lifetimeContext, handler, options)
+		pollResult <- pollWebDAV(lifetimeContext, handler, options)
 	}()
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- server.Serve(listener) }()
 	if options.StatusWriter != nil {
+		health := handler.Status()
 		_, _ = fmt.Fprintf(options.StatusWriter,
-			"webdav: url=%q expires_at=%s read_only=true loopback_only=true authentication=none\n",
-			"http://"+listener.Addr().String()+"/", expiresAt.Format(time.RFC3339))
+			"webdav: url=%q expires_at=%s generation=%d last_refresh_success=%s max_stale=%s read_only=true loopback_only=true authentication=none\n",
+			"http://"+listener.Addr().String()+"/", expiresAt.Format(time.RFC3339), health.Generation,
+			health.LastRefreshSuccess.Format(time.RFC3339), options.MaxStale)
 	}
 
 	var expiryTimer *time.Timer
@@ -124,6 +125,7 @@ func serveWebDAV(
 	}
 	var resultErr error
 	serverExited := false
+	pollExited := false
 	select {
 	case err := <-serveResult:
 		serverExited = true
@@ -133,6 +135,11 @@ func serveWebDAV(
 	case <-ctx.Done():
 	case <-expiry:
 		resultErr = s3webdav.ErrAuthorizationExpired
+	case err := <-pollResult:
+		pollExited = true
+		if err != nil {
+			resultErr = err
+		}
 	}
 	cancelLifetime()
 	if !serverExited {
@@ -150,24 +157,90 @@ func serveWebDAV(
 			resultErr = fmt.Errorf("s3disk serve webdav: HTTP server: %w", serveErr)
 		}
 	}
-	<-pollDone
+	if serverExited {
+		_ = server.Close()
+	}
+	if !pollExited {
+		pollErr := <-pollResult
+		if pollErr != nil && resultErr == nil {
+			resultErr = pollErr
+		}
+	}
 	return resultErr
 }
 
-func pollWebDAV(ctx context.Context, handler *s3webdav.Handler, options WebDAVOptions) {
+func pollWebDAV(ctx context.Context, handler *s3webdav.Handler, options WebDAVOptions) error {
 	ticker := time.NewTicker(options.PollInterval)
 	defer ticker.Stop()
 	for {
+		var (
+			staleDeadline time.Time
+			staleTimer    *time.Timer
+			stale         <-chan time.Time
+		)
+		if options.MaxStale > 0 {
+			health := handler.Status()
+			if health.LastRefreshSuccess.IsZero() {
+				return webDAVStaleError(health)
+			}
+			staleDeadline = health.LastRefreshSuccess.Add(options.MaxStale)
+			untilStale := time.Until(staleDeadline)
+			if untilStale <= 0 {
+				return webDAVStaleError(health)
+			}
+			staleTimer = time.NewTimer(untilStale)
+			stale = staleTimer.C
+		}
 		select {
 		case <-ctx.Done():
-			return
+			stopWebDAVTimer(staleTimer)
+			return nil
 		case <-ticker.C:
+			stopWebDAVTimer(staleTimer)
+		case <-stale:
+			return webDAVStaleError(handler.Status())
 		}
-		attemptContext, cancelAttempt := context.WithTimeout(ctx, options.PollTimeout)
-		_, err := handler.Refresh(attemptContext)
+		attemptDeadline := time.Now().Add(options.PollTimeout)
+		if !staleDeadline.IsZero() && staleDeadline.Before(attemptDeadline) {
+			attemptDeadline = staleDeadline
+		}
+		attemptContext, cancelAttempt := context.WithDeadline(ctx, attemptDeadline)
+		result, err := handler.Refresh(attemptContext)
 		cancelAttempt()
-		if err != nil && ctx.Err() == nil && options.ErrorWriter != nil {
-			_, _ = fmt.Fprintf(options.ErrorWriter, "s3disk webdav: refresh warning: %v\n", err)
+		if err != nil && ctx.Err() == nil {
+			health := handler.Status()
+			if options.ErrorWriter != nil {
+				_, _ = fmt.Fprintf(options.ErrorWriter,
+					"s3disk webdav: refresh warning: consecutive_failures=%d last_success=%s error=%v\n",
+					health.ConsecutiveRefreshFailures, health.LastRefreshSuccess.Format(time.RFC3339), err)
+			}
+			if options.MaxStale > 0 && !time.Now().Before(health.LastRefreshSuccess.Add(options.MaxStale)) {
+				return webDAVStaleError(health)
+			}
+			continue
 		}
+		if err == nil && result.Status == s3disk.RefreshUpdated && options.StatusWriter != nil {
+			health := handler.Status()
+			_, _ = fmt.Fprintf(options.StatusWriter, "webdav: refreshed generation=%d at=%s\n",
+				health.Generation, health.LastRefreshSuccess.Format(time.RFC3339))
+		}
+	}
+}
+
+func webDAVStaleError(health s3webdav.Status) error {
+	if health.LastRefreshSuccess.IsZero() {
+		return fmt.Errorf("%w: no successful refresh was recorded", s3webdav.ErrRefreshStale)
+	}
+	return fmt.Errorf("%w: last successful refresh was %s",
+		s3webdav.ErrRefreshStale, health.LastRefreshSuccess.Format(time.RFC3339))
+}
+
+func stopWebDAVTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
 	}
 }

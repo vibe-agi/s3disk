@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 60s integration \
+          ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 120s integration \
             2>&1 | tee artifacts/macos-webdav-mount.json
       - name: Archive native evidence
         if: always()

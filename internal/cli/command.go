@@ -95,6 +95,7 @@ type WebDAVOptions struct {
 	CacheDir     string
 	PollInterval time.Duration
 	PollTimeout  time.Duration
+	MaxStale     time.Duration
 	StatusWriter io.Writer
 	ErrorWriter  io.Writer
 }
@@ -193,6 +194,7 @@ func newWebDAVCommand(dependencies Dependencies) *cobra.Command {
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "private lazy block cache base (defaults below state-dir)")
 	flags.DurationVar(&options.PollInterval, "poll-interval", defaultPollInterval, "S3 root refresh interval")
 	flags.DurationVar(&options.PollTimeout, "poll-timeout", defaultPollTimeout, "maximum time for one complete S3 refresh")
+	flags.DurationVar(&options.MaxStale, "max-stale", 0, "stop after this long without a successful refresh (zero keeps the last snapshot)")
 	return command
 }
 
@@ -520,6 +522,13 @@ func validateWebDAVOptions(options *WebDAVOptions) error {
 	}
 	if options.PollTimeout < time.Second || options.PollTimeout > presignedshare.MaximumOperationTimeout {
 		return fmt.Errorf("s3disk serve webdav: --poll-timeout must be between 1s and %s", presignedshare.MaximumOperationTimeout)
+	}
+	if options.MaxStale < 0 || options.MaxStale > presignedshare.MaximumCapabilityLifetime {
+		return fmt.Errorf("s3disk serve webdav: --max-stale must be zero or at most %s", presignedshare.MaximumCapabilityLifetime)
+	}
+	if options.MaxStale > 0 &&
+		(options.MaxStale < options.PollTimeout || options.MaxStale < options.PollInterval) {
+		return errors.New("s3disk serve webdav: --max-stale must be zero or at least both --poll-interval and --poll-timeout")
 	}
 	if options.CacheDir != "" && pathsOverlap(options.CacheDir, options.StateDir) {
 		return errors.New("s3disk serve webdav: --cache-dir and --state-dir must not contain one another")

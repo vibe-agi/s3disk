@@ -20,6 +20,8 @@ const maximumPROPFINDBodyBytes int64 = 1 << 20
 // called through Handler so a PROPFIND response observes one complete snapshot.
 type Handler struct {
 	gate     sync.RWMutex
+	statusMu sync.RWMutex
+	status   Status
 	consumer *s3disk.Consumer
 	dav      *xwebdav.Handler
 }
@@ -38,25 +40,54 @@ func NewHandler(consumer *s3disk.Consumer) (*Handler, error) {
 	if security.SymlinkPolicy != s3disk.SymlinkRejectExternal {
 		return nil, fmt.Errorf("%w: Consumer must use SymlinkRejectExternal", ErrSymlinkUnsupported)
 	}
-	filesystem := &readOnlyFileSystem{consumer: consumer}
-	return &Handler{
-		consumer: consumer,
-		dav: &xwebdav.Handler{
-			FileSystem: filesystem,
-			LockSystem: xwebdav.NewMemLS(),
-		},
-	}, nil
+	handler := &Handler{consumer: consumer}
+	filesystem := &readOnlyFileSystem{consumer: consumer, gate: &handler.gate}
+	handler.dav = &xwebdav.Handler{
+		FileSystem: filesystem,
+		LockSystem: xwebdav.NewMemLS(),
+	}
+	return handler, nil
 }
 
-// Refresh atomically advances the view between HTTP requests. It serializes
-// against complete requests so directory metadata cannot mix generations.
+// Refresh atomically advances the view between metadata operations. A
+// PROPFIND response observes one complete snapshot, while a GET pins its file
+// before streaming so a long transfer does not delay later refreshes.
 func (handler *Handler) Refresh(ctx context.Context) (s3disk.RefreshResult, error) {
 	if handler == nil || handler.consumer == nil {
 		return s3disk.RefreshResult{}, fmt.Errorf("s3disk webdav: handler is not initialized")
 	}
+	attemptedAt := time.Now().UTC()
 	handler.gate.Lock()
-	defer handler.gate.Unlock()
-	return handler.consumer.Refresh(ctx)
+	result, err := handler.consumer.Refresh(ctx)
+	handler.recordRefresh(attemptedAt, result, err)
+	handler.gate.Unlock()
+	return result, err
+}
+
+// Status returns a concurrency-safe snapshot of refresh health. Callers should
+// treat LastRefreshError as diagnostic text rather than a telemetry label.
+func (handler *Handler) Status() Status {
+	if handler == nil {
+		return Status{}
+	}
+	handler.statusMu.RLock()
+	defer handler.statusMu.RUnlock()
+	return handler.status
+}
+
+func (handler *Handler) recordRefresh(attemptedAt time.Time, result s3disk.RefreshResult, err error) {
+	handler.statusMu.Lock()
+	defer handler.statusMu.Unlock()
+	handler.status.LastRefreshAttempt = attemptedAt
+	if err != nil {
+		handler.status.ConsecutiveRefreshFailures++
+		handler.status.LastRefreshError = err.Error()
+		return
+	}
+	handler.status.Generation = result.Generation
+	handler.status.LastRefreshSuccess = time.Now().UTC()
+	handler.status.ConsecutiveRefreshFailures = 0
+	handler.status.LastRefreshError = ""
 }
 
 // AuthorizationExpiry forwards the Consumer's immutable authorization bound.
@@ -85,6 +116,8 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		response.WriteHeader(http.StatusOK)
 		return
 	case "PROPFIND":
+		response.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		response.Header().Set("Pragma", "no-cache")
 		depth := request.Header.Get("Depth")
 		if depth != "0" && depth != "1" {
 			http.Error(response, "WebDAV Depth must be 0 or 1", http.StatusForbidden)
@@ -92,6 +125,11 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		}
 		request.Body = http.MaxBytesReader(response, request.Body, maximumPROPFINDBodyBytes)
 	case http.MethodGet, http.MethodHead:
+		response.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		response.Header().Set("Pragma", "no-cache")
+		// GET/HEAD use a generation-specific whole-second Last-Modified value.
+		// PROPFIND continues to expose the source file's real modification time.
+		request = request.WithContext(context.WithValue(request.Context(), snapshotHTTPValidatorKey{}, true))
 		contentType := mime.TypeByExtension(path.Ext(request.URL.Path))
 		if contentType == "" {
 			contentType = "application/octet-stream"
@@ -107,8 +145,14 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		http.Error(response, ErrAuthorizationExpired.Error(), http.StatusGone)
 		return
 	}
-	handler.gate.RLock()
-	defer handler.gate.RUnlock()
+	if request.Method == "PROPFIND" {
+		// x/net/webdav walks every Depth-1 child with separate FileSystem calls.
+		// Keep those calls on one generation, and mark the context so the
+		// FileSystem does not recursively acquire the same RWMutex.
+		handler.gate.RLock()
+		defer handler.gate.RUnlock()
+		request = request.WithContext(context.WithValue(request.Context(), snapshotGateHeldKey{}, true))
+	}
 	handler.dav.ServeHTTP(response, request)
 }
 
