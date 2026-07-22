@@ -26,6 +26,16 @@ git -C "$test_repository" commit -q -s -m "Signed commit"
   "$checker" 'HEAD^!' >/dev/null
 )
 
+printf '%s\n' alias >>"$test_repository/tracked.txt"
+git -C "$test_repository" add tracked.txt
+GIT_AUTHOR_NAME='GitHub Profile Alias' \
+  git -C "$test_repository" commit -q -m "Signed with legal name" \
+    -m "Signed-off-by: DCO Test Contributor <dco-test@example.invalid>"
+(
+  cd "$test_repository"
+  "$checker" 'HEAD^!' >/dev/null
+)
+
 printf '%s\n' second >>"$test_repository/tracked.txt"
 git -C "$test_repository" add tracked.txt
 git -C "$test_repository" commit -q -m "Unsigned commit"
@@ -57,6 +67,17 @@ if (
   "$checker" 'HEAD^!' >/dev/null 2>&1
 ); then
   fail "mismatched sign-off passed"
+fi
+
+printf '%s\n' empty-name >>"$test_repository/tracked.txt"
+git -C "$test_repository" add tracked.txt
+git -C "$test_repository" commit -q -m "Empty sign-off name" \
+  -m "Signed-off-by: <dco-test@example.invalid>"
+if (
+  cd "$test_repository"
+  "$checker" 'HEAD^!' >/dev/null 2>&1
+); then
+  fail "empty sign-off name passed"
 fi
 
 printf '%s\n' fourth >>"$test_repository/tracked.txt"
