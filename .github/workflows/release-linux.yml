@@ -101,7 +101,7 @@ jobs:
             exit 1
           }
           ./scripts/run-required-go-test.sh ./internal/localstate TestDarwinTrustStateRevalidatesExtendedACLs 60s
-          ./scripts/run-required-go-test.sh . TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
+          ./scripts/run-required-go-test.sh ./internal/localstate TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
       - name: Require Windows trust-state security tests
         if: runner.os == 'Windows'
         shell: bash
