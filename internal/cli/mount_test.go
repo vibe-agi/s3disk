@@ -127,7 +127,7 @@ func TestPrepareMountCachePathNamespacesCustomBase(t *testing.T) {
 	if err := os.Chmod(base, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path, err := prepareMountCachePath(base, t.TempDir(), "repository-id", "share-id")
+	path, err := prepareConsumerCachePath(base, t.TempDir(), "repository-id", "share-id")
 	if err != nil {
 		t.Fatal(err)
 	}

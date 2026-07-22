@@ -118,16 +118,30 @@ func cliFUSERuntimeAvailable() error {
 		}
 		return device.Close()
 	case "darwin":
+		helperAvailable := false
 		for _, helper := range []string{
 			"/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
 			"/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
 		} {
 			info, err := os.Stat(helper)
 			if err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
-				return nil
+				helperAvailable = true
+				break
 			}
 		}
-		return fmt.Errorf("no executable macFUSE mount helper found below /Library/Filesystems")
+		if !helperAvailable {
+			return fmt.Errorf("no executable macFUSE mount helper found below /Library/Filesystems")
+		}
+		for _, pattern := range []string{"/dev/macfuse*", "/dev/osxfuse*"} {
+			devices, _ := filepath.Glob(pattern)
+			for _, device := range devices {
+				info, err := os.Stat(device)
+				if err == nil && info.Mode()&os.ModeCharDevice != 0 {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("macFUSE helper is installed but its VFS device is not loaded and enabled")
 	default:
 		return fmt.Errorf("unsupported test platform %s", runtime.GOOS)
 	}

@@ -56,13 +56,14 @@ The mousetrap upstream license records: Copyright 2022 Alan Shreve
 | `github.com/fsnotify/fsnotify` | `v1.10.1` | [`fsnotify-BSD-3-Clause.txt`](third_party/licenses/fsnotify-BSD-3-Clause.txt) |
 | `github.com/hanwen/go-fuse/v2` | `v2.11.0` | [`go-fuse-BSD-3-Clause.txt`](third_party/licenses/go-fuse-BSD-3-Clause.txt) |
 | `github.com/spf13/pflag` | `v1.0.10` | [`pflag-BSD-3-Clause.txt`](third_party/licenses/pflag-BSD-3-Clause.txt) |
+| `golang.org/x/net` | `v0.57.0` | [`x-net-BSD-3-Clause.txt`](third_party/licenses/x-net-BSD-3-Clause.txt) |
 | `golang.org/x/sys` | `v0.47.0` | [`x-sys-BSD-3-Clause.txt`](third_party/licenses/x-sys-BSD-3-Clause.txt) |
 
 The Go project's additional patent grant reproduced in
 [`Go-PATENTS.txt`](third_party/licenses/Go-PATENTS.txt) also accompanies
-`golang.org/x/sys`. It is intentionally a direct module dependency because the
-Windows `FileWatermarkStore` and `FilePublicationJournal` use `LockFileEx` for
-cross-process CAS locking.
+`golang.org/x/net` and `golang.org/x/sys`. The former provides the portable
+WebDAV protocol handler. The latter is intentionally a direct dependency
+because Windows durable state uses `LockFileEx` for cross-process CAS locking.
 
 AWS SDK for Go and smithy-go contain compiled copies of the Go project's
 `singleflight` implementation under their Apache-2.0 module trees. Its retained

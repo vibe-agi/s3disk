@@ -2,16 +2,12 @@ package cli
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/vibe-agi/s3disk"
 	"github.com/vibe-agi/s3disk/mount"
-	"github.com/vibe-agi/s3disk/presignedshare"
 )
 
 const (
@@ -43,66 +39,29 @@ func runMount(ctx context.Context, options MountOptions) error {
 }
 
 func runPreparedMount(ctx context.Context, options MountOptions, localPaths mountLocalPaths, share decodedHandoff) error {
-	if share.wire.DangerouslyUseSystemTrust {
-		return fmt.Errorf("s3disk mount: system TLS trust is incompatible with the S3-only CLI profile")
-	}
-	verifier, err := s3disk.NewEd25519ReferenceVerifier(share.repository, map[string]ed25519.PublicKey{
-		share.wire.ReferenceKeyID: share.publicKey,
-	})
+	runtime, err := prepareConsumerRuntime(ctx, share, localPaths.stateDir, localPaths.cacheBase)
 	if err != nil {
-		return fmt.Errorf("s3disk mount: create offline verifier: %w", err)
+		return fmt.Errorf("s3disk mount: %w", err)
 	}
-	reader, err := presignedshare.NewReader(presignedshare.ReaderConfig{
-		RootCapability: share.root, RepositoryPrefix: share.wire.RepositoryPrefix,
-		ReferenceKey: share.wire.ReferenceKey, ShareID: share.shareID, Verifier: verifier,
-		ClientEncryption: share.profile, TLSRootCAPEM: share.tlsCAPEM,
-		AllowInsecureLoopback: share.wire.AllowInsecureLoopback,
-	})
-	if err != nil {
-		return fmt.Errorf("s3disk mount: create credential-free reader: %w", err)
-	}
-	repository, err := s3disk.NewReadOnlyRepositoryWithOptions(reader, share.wire.RepositoryPrefix,
-		s3disk.RepositoryOptions{ClientEncryption: share.profile})
-	if err != nil {
-		return fmt.Errorf("s3disk mount: create read-only repository: %w", err)
-	}
+	defer runtime.Close()
 	baseStateDir, err := preparePrivateDirectory(localPaths.stateDir)
 	if err != nil {
-		return fmt.Errorf("s3disk mount: state directory: %w", err)
+		return fmt.Errorf("s3disk mount: resolve state directory: %w", err)
 	}
 	if pathsOverlap(baseStateDir, localPaths.mountpoint) {
 		return fmt.Errorf("s3disk mount: resolved state directory and mountpoint must not contain one another")
 	}
-	shareStateDir, err := preparePrivateSubdirectories(baseStateDir, share.wire.RepositoryID, share.wire.ShareID)
-	if err != nil {
-		return fmt.Errorf("s3disk mount: isolated state directory: %w", err)
-	}
-	watermarks, err := s3disk.NewFileWatermarkStore(filepath.Join(shareStateDir, "watermark.json"))
-	if err != nil {
-		return err
-	}
-	cachePath, err := prepareMountCachePath(localPaths.cacheBase, shareStateDir, share.wire.RepositoryID, share.wire.ShareID)
-	if err != nil {
-		return fmt.Errorf("s3disk mount: isolated cache directory: %w", err)
-	}
-	if localPaths.cacheBase != "" && (pathsOverlap(cachePath, baseStateDir) || pathsOverlap(cachePath, localPaths.mountpoint)) {
-		return fmt.Errorf("s3disk mount: resolved cache directory overlaps state or mountpoint")
-	}
-	cache, err := s3disk.NewDiskCache(cachePath)
-	if err != nil {
-		return fmt.Errorf("s3disk mount: create cache: %w", err)
-	}
-	defer cache.Close()
-	consumer, err := s3disk.NewConsumer(repository, share.wire.Channel, s3disk.ConsumerOptions{
-		Cache: cache, Watermarks: watermarks, RequirePersistentWatermark: true,
-		ReferenceVerifier: verifier, TrustedCheckpoint: &share.checkpoint,
-		Symlinks: s3disk.SymlinkRejectExternal,
-	})
-	if err != nil {
-		return fmt.Errorf("s3disk mount: create consumer: %w", err)
+	if localPaths.cacheBase != "" {
+		cacheBase, resolveErr := preparePrivateDirectory(localPaths.cacheBase)
+		if resolveErr != nil {
+			return fmt.Errorf("s3disk mount: resolve cache directory: %w", resolveErr)
+		}
+		if pathsOverlap(cacheBase, baseStateDir) || pathsOverlap(cacheBase, localPaths.mountpoint) {
+			return fmt.Errorf("s3disk mount: resolved cache directory overlaps state or mountpoint")
+		}
 	}
 	healthEvents, reportHealthError := newMountHealthEvents()
-	mounted, err := mount.ReadOnly(ctx, consumer, localPaths.mountpoint, mount.Options{
+	mounted, err := mount.ReadOnly(ctx, runtime.consumer, localPaths.mountpoint, mount.Options{
 		Poll: s3disk.PollOptions{
 			Interval: options.PollInterval, AttemptTimeout: options.PollTimeout, OnError: reportHealthError,
 		},
@@ -115,17 +74,6 @@ func runPreparedMount(ctx context.Context, options MountOptions, localPaths moun
 			localPaths.mountpoint, share.wire.AuthorizationExpiresAt.Format(time.RFC3339))
 	}
 	return waitForMountLifecycle(mounted, healthEvents, options.ErrorWriter, mountStatusPollInterval)
-}
-
-func prepareMountCachePath(cacheBase, shareStateDir, repositoryID, shareID string) (string, error) {
-	if cacheBase == "" {
-		return filepath.Join(shareStateDir, "cache"), nil
-	}
-	base, err := preparePrivateDirectory(cacheBase)
-	if err != nil {
-		return "", err
-	}
-	return preparePrivateSubdirectories(base, repositoryID, shareID, "cache")
 }
 
 func newMountHealthEvents() (<-chan error, func(error)) {
@@ -187,22 +135,4 @@ func mountLifecycleFailure(status mount.MountStatus) error {
 		return fmt.Errorf("s3disk mount: automatic unmount failed")
 	}
 	return fmt.Errorf("s3disk mount: automatic unmount failed: %s", status.Unmount.LastError)
-}
-
-func preparePrivateSubdirectories(base string, names ...string) (string, error) {
-	current := base
-	for _, name := range names {
-		if name == "" || filepath.Base(name) != name {
-			return "", fmt.Errorf("invalid state namespace")
-		}
-		current = filepath.Join(current, name)
-		if err := os.Mkdir(current, 0o700); err != nil && !os.IsExist(err) {
-			return "", err
-		}
-		info, err := os.Lstat(current)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-			return "", fmt.Errorf("state namespace is not a private directory")
-		}
-	}
-	return current, nil
 }

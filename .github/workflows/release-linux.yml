@@ -102,6 +102,13 @@ jobs:
           }
           ./scripts/run-required-go-test.sh ./internal/localstate TestDarwinTrustStateRevalidatesExtendedACLs 60s
           ./scripts/run-required-go-test.sh ./internal/localstate TestProtectWatermarkFileRejectsInheritedDarwinACL 60s
+      - name: Require native macOS WebDAV mount
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 60s integration \
+            2>&1 | tee artifacts/macos-webdav-mount.json
       - name: Require Windows trust-state security tests
         if: runner.os == 'Windows'
         shell: bash

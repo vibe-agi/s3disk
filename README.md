@@ -2,29 +2,29 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-Share one or more local workspaces through S3 and mount them read-only on other
+Share one or more local workspaces through S3 and access them read-only on other
 computers. Readers receive a short-lived handoff file, need no reusable S3
 credentials, and download file contents lazily when they are opened.
 
 ```text
 publisher computer ── encrypted snapshots ──> S3-compatible storage
                                                   │
-reader computer <── private handoff ── read-only lazy mount
+reader computer <── private handoff ── local WebDAV or FUSE view
 ```
 
-`s3disk` is a pre-1.0 engineering preview. Linux has a passing real filesystem
-mount baseline; macOS now has the same gate but still needs a successful VFS
-run before release. Review [Platform support](#platform-support) before
-embedding it in a product.
+`s3disk` is a pre-1.0 engineering preview. Linux has a passing real FUSE mount
+baseline. macOS has a passing mount through its built-in WebDAV client, without
+macFUSE or a kernel extension. Review [Platform support](#platform-support)
+before embedding it in a product.
 
 ## What it provides
 
 - Expiring, encrypted shares backed by an S3-compatible object store.
 - Immutable chunks and manifests with an atomically updated signed reference.
 - Lazy reads and snapshot-pinned open files.
-- One independent share per workspace, plus `mount-set` for supervising several
-  reader mountpoints in one process.
-- A read-only filesystem: readers cannot modify the publisher's workspace.
+- Portable loopback-only WebDAV for macOS, Linux, and other WebDAV clients.
+- Optional FUSE mounts, plus `mount-set` for supervising several mountpoints.
+- Read-only adapters: readers cannot modify the publisher's workspace.
 
 ## Install
 
@@ -82,8 +82,21 @@ one snapshot and exit. If the publisher stops before expiry, use `share resume`
 with its printed share ID instead of creating a new share.
 
 Transfer `/secure/workspace-a.handoff` to the reader once through a private,
-authenticated channel. On a Linux or macOS reader, mount it into an existing
-empty directory:
+authenticated channel. The portable default is a local read-only WebDAV server:
+
+```sh
+s3disk serve webdav \
+  --handoff /secure/workspace-a.handoff \
+  --state-dir /var/lib/s3disk/reader
+```
+
+It prints a URL such as `http://127.0.0.1:53142/`. On macOS, open Finder,
+choose **Go → Connect to Server**, and enter that URL. Each reader runs this
+loopback service locally; it is deliberately not a remote/public WebDAV server.
+See [WebDAV access](docs/WEBDAV.md).
+
+For an optional native FUSE mount on Linux—or on macOS after the user installs
+macFUSE—run:
 
 ```sh
 s3disk mount \
@@ -92,22 +105,21 @@ s3disk mount \
   --state-dir /var/lib/s3disk/reader
 ```
 
-macOS requires macFUSE to be installed and enabled separately. The current
-go-fuse adapter uses macFUSE's VFS/kernel backend; macFUSE's newer FSKit message
-transport is not supported yet.
+The macOS FUSE path uses macFUSE's VFS/kernel backend. Its newer FSKit message
+transport is not supported by the current go-fuse adapter.
 
-For multiple workspaces, publish each source independently and use either one
-`s3disk mount` process per handoff or the bounded
-[`mount-set`](docs/MOUNT_SET.md) supervisor. It does not create a union mount;
-each workspace keeps its own mountpoint and trust boundary.
+For multiple workspaces, publish each source independently. Run one WebDAV
+process/loopback port per handoff, or use the bounded
+[`mount-set`](docs/MOUNT_SET.md) supervisor for FUSE. These views are not union
+mounts; each workspace keeps its own trust and expiry boundary.
 
 ## Platform support
 
 | Platform | Current status |
 | --- | --- |
-| Linux | Primary target. Native tests plus real MinIO/FUSE mount tests. |
-| macOS | Release target with a real macFUSE VFS test gate covering read-only access, refresh, pinned handles, multi-mount, and clean unmount. The gate still needs a successful run on an enabled macFUSE host before macOS can be advertised as supported. |
-| Windows | Core packages and native tests work, but filesystem mounting is not implemented. `mount` returns `ErrUnsupportedPlatform`; publisher recovery-state confidentiality also fails closed until Windows ACL handling is complete. |
+| Linux | WebDAV server plus primary native FUSE target. Native tests and real MinIO/FUSE mount tests pass. |
+| macOS | Built-in WebDAV mount passes without third-party software. macFUSE VFS remains an optional path whose release evidence is pending. |
+| Windows | WebDAV server and core packages compile and run native tests, but Explorer integration is not yet certified. FUSE-style `mount` is not implemented; publisher recovery state also fails closed pending Windows ACL work. |
 | FreeBSD | FUSE adapter compiles, but has no dedicated native production test baseline. |
 
 Windows support needs a WinFsp-style filesystem adapter, Windows path/reparse
@@ -125,6 +137,8 @@ See the full [compatibility matrix](docs/COMPATIBILITY.md).
 - Immutable S3 objects do not yet have garbage collection.
 - Published scale evidence is a regression baseline, not a capacity claim for
   large, high-churn, long-running mounts.
+- WebDAV intentionally omits symbolic links because the protocol has no
+  portable POSIX symlink representation, and the CLI is loopback-only.
 - The mount inode-identity table is bounded; reaching the configured limit
   requires a remount or a different sharding strategy.
 - `mount-set` supervises independent mounts; it is not a union filesystem or a
@@ -143,6 +157,7 @@ in the [technical reference](docs/REFERENCE.md).
 - `presignedshare`: expiring credential-free read capabilities.
 - `publisherstate`: protected publisher recovery envelopes.
 - `mount`: read-only filesystem adapter.
+- `webdav`: portable read-only WebDAV adapter.
 - `tests/blackbox`: public-API and end-to-end behavior tests.
 - `docs`: operational and protocol documentation.
 

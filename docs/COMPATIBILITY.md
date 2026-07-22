@@ -35,8 +35,10 @@ upgrade/rollback product matrix.
 | Component | Target | Current status | Additional production consideration |
 | --- | --- | --- | --- |
 | Core and `s3store` | Go-supported OS/architecture | Core protocols are portable Go; protected publication-journal, watermark, and cache paths are enabled on Linux, Windows, and Darwin with cgo, while the confidentiality-bearing `FileSealedStateStore` is limited to Linux and Darwin with cgo and deliberately fails closed on Windows; other targets fail closed where their ACL semantics are not certified; the checked-in CI workflow runs native tests on Ubuntu, macOS, and Windows | Review CI evidence for the exact release and test every additionally advertised target; do not advertise sealed recovery-WAL support on Windows |
+| `serve webdav` | macOS | The loopback-only read-only server and Apple's built-in `/sbin/mount_webdav` pass an actual mount/read/write-rejection/unmount test on macOS 26.5.2 ARM64; the same required test is wired into macOS CI and release jobs | Finder/WebDAV is the zero-driver macOS path. Re-run the required native test for each shipped macOS release and architecture |
+| `serve webdav` | Linux and other Go targets | Portable handler, CLI lifecycle, read-only method surface, Range reads, refresh, and pinned-handle tests pass; no kernel driver is required to run the server | Client-side mounting is environment-specific. Certify each advertised file manager or WebDAV mount client separately |
 | `mount` | Linux | FUSE implementation and actual `/dev/fuse` E2E tests are present; the MinIO-backed flow passed on Ubuntu 24.04 ARM64, kernel 6.8, on 2026-07-22 | Re-run on each kernel/distribution used by the embedding product and before important rollouts |
-| `mount` | macOS | Darwin implementation and a real macFUSE VFS E2E gate cover read-only access, refresh, snapshot-pinned handles, inode reclamation, two concurrent mounts, and clean unmount; successful release evidence is still pending | Requires a separately installed and enabled macFUSE VFS/kernel runtime. The macFUSE 5.2+ FSKit `MFMount.framework` message transport is not implemented by the current go-fuse adapter |
+| `mount` | macOS | Optional Darwin implementation and a real macFUSE VFS E2E gate cover read-only access, refresh, snapshot-pinned handles, inode reclamation, two concurrent mounts, and clean unmount; successful release evidence is still pending | Requires a separately installed and enabled macFUSE VFS/kernel runtime. The macFUSE 5.2+ FSKit `MFMount.framework` message transport is not implemented by the current go-fuse adapter |
 | `mount` | FreeBSD | Build-tagged implementation present | Compile-only status; no production support until dedicated kernel/runtime E2E coverage exists |
 | `mount` | Windows | Returns `ErrUnsupportedPlatform` | Requires a native adapter and separate driver/licensing/security review |
 
@@ -174,6 +176,16 @@ evidence.
   the kernel applies the published owner permission bits to that per-user
   mount. Run separate mounts under separate service identities when isolation
   between local users is required.
+- `s3disk serve webdav` is a local presentation adapter over the same Consumer,
+  not a new publisher-to-reader network path. The CLI accepts only literal
+  loopback listeners and advertises WebDAV Class 1 with `OPTIONS`, `PROPFIND`
+  Depth 0/1, `GET`, and `HEAD`. All mutation and locking methods return 405.
+  Requests are serialized against refresh and opened files keep their original
+  snapshot. The adapter omits symbolic links because WebDAV cannot faithfully
+  represent POSIX link semantics. It deliberately has no password or TLS at
+  loopback, so its isolation boundary is the reader host rather than one OS
+  account; remote serving is outside this compatibility claim. See
+  [`WEBDAV.md`](WEBDAV.md).
 - `s3disk mount-set` can supervise up to 128 independent reader mounts in one
   process after strict private-config, handoff, resolved-path, and duplicate
   share preflight. A terminal child error cancels and waits for all peers;

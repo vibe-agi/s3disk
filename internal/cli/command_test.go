@@ -21,13 +21,76 @@ func TestCommandTreeHasProductEntryPoints(t *testing.T) {
 		MountSet: func(context.Context, MountSetOptions) error {
 			return nil
 		},
-		Doctor: func(context.Context, DoctorOptions, io.Writer) error { return nil },
+		ServeWebDAV: func(context.Context, WebDAVOptions) error { return nil },
+		Doctor:      func(context.Context, DoctorOptions, io.Writer) error { return nil },
 	})
-	for _, path := range [][]string{{"share", "publish"}, {"share", "resume"}, {"mount"}, {"mount-set"}, {"s3", "doctor"}} {
+	for _, path := range [][]string{{"share", "publish"}, {"share", "resume"}, {"mount"}, {"mount-set"}, {"serve", "webdav"}, {"s3", "doctor"}} {
 		command, _, err := root.Find(path)
 		if err != nil || command == nil || command.CommandPath() != "s3disk "+strings.Join(path, " ") {
 			t.Fatalf("missing command %q: command=%v err=%v", strings.Join(path, " "), command, err)
 		}
+	}
+}
+
+func TestWebDAVCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
+	wantErr := errors.New("stop")
+	var observed WebDAVOptions
+	root := NewRootCommand(Dependencies{ServeWebDAV: func(_ context.Context, options WebDAVOptions) error {
+		observed = options
+		return wantErr
+	}})
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{
+		"serve", "webdav", "--handoff", "/private/share.json", "--listen", "[::1]:9876",
+		"--state-dir", "/state", "--cache-dir", "/cache", "--poll-interval", "750ms", "--poll-timeout", "45s",
+	})
+	err := root.ExecuteContext(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v", err)
+	}
+	if observed.HandoffPath != "/private/share.json" || observed.Listen != "[::1]:9876" ||
+		observed.StateDir != "/state" || observed.CacheDir != "/cache" ||
+		observed.PollInterval != 750*time.Millisecond || observed.PollTimeout != 45*time.Second ||
+		observed.StatusWriter != &stdout || observed.ErrorWriter != &stderr {
+		t.Fatalf("unexpected WebDAV options: %#v", observed)
+	}
+}
+
+func TestWebDAVCommandRejectsNonLoopbackListener(t *testing.T) {
+	called := false
+	root := NewRootCommand(Dependencies{ServeWebDAV: func(context.Context, WebDAVOptions) error {
+		called = true
+		return nil
+	}})
+	root.SetArgs([]string{
+		"serve", "webdav", "--handoff", "/private/share.json", "--listen", "0.0.0.0:9867", "--state-dir", "/state",
+	})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("error = %v", err)
+	}
+	if called {
+		t.Fatal("WebDAV runner called with a non-loopback listener")
+	}
+}
+
+func TestWebDAVCommandDefaultsToFreeLoopbackPort(t *testing.T) {
+	wantErr := errors.New("stop")
+	var observed WebDAVOptions
+	root := NewRootCommand(Dependencies{ServeWebDAV: func(_ context.Context, options WebDAVOptions) error {
+		observed = options
+		return wantErr
+	}})
+	root.SetArgs([]string{
+		"serve", "webdav", "--handoff", "/private/share.json", "--state-dir", "/state",
+	})
+	if err := root.ExecuteContext(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v", err)
+	}
+	if observed.Listen != "127.0.0.1:0" {
+		t.Fatalf("default listen address = %q", observed.Listen)
 	}
 }
 
