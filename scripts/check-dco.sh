@@ -22,9 +22,23 @@ missing=0
 for commit in $commits; do
   author=$(git show -s --format='%an <%ae>' "$commit") ||
     fail "could not read commit $commit"
+  committer=$(git show -s --format='%cn <%ce>' "$commit") ||
+    fail "could not read committer for $commit"
   trailers=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly,unfold=true)' "$commit") ||
     fail "could not read trailers from commit $commit"
-  if ! printf '%s\n' "$trailers" | grep -Fqx -- "$author"; then
+  signed_off=false
+  if printf '%s\n' "$trailers" | grep -Fqx -- "$author"; then
+    signed_off=true
+  # GitHub-created Dependabot commits use the bot account's noreply address
+  # as author and its support address in the DCO trailer. Treat only this exact
+  # author/committer/trailer triple as one bot identity; near matches still fail.
+  elif [ "$author" = 'dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>' ] &&
+    [ "$committer" = 'GitHub <noreply@github.com>' ] &&
+    printf '%s\n' "$trailers" | grep -Fqx -- 'dependabot[bot] <support@github.com>'
+  then
+    signed_off=true
+  fi
+  if [ "$signed_off" != true ]; then
     short=$(git rev-parse --short=12 "$commit") || short=$commit
     echo "DCO audit: commit $short lacks a Signed-off-by trailer matching its author" >&2
     missing=$((missing + 1))

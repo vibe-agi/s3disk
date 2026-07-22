@@ -35,9 +35,10 @@ updates:
     commit-message:
       prefix: "deps(actions)"
     groups:
-      actions-minor-and-patch:
+      actions-updates:
         patterns:
           - "*"
         update-types:
+          - "major"
           - "minor"
           - "patch"

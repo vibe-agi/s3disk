@@ -82,4 +82,32 @@ if (
   fail "invalid revision passed"
 fi
 
+printf '%s\n' dependabot >>"$test_repository/tracked.txt"
+git -C "$test_repository" add tracked.txt
+GIT_AUTHOR_NAME='dependabot[bot]' \
+GIT_AUTHOR_EMAIL='49699333+dependabot[bot]@users.noreply.github.com' \
+GIT_COMMITTER_NAME='GitHub' \
+GIT_COMMITTER_EMAIL='noreply@github.com' \
+  git -C "$test_repository" commit -q -m "Verified Dependabot alias" \
+    -m "Signed-off-by: dependabot[bot] <support@github.com>"
+(
+  cd "$test_repository"
+  "$checker" 'HEAD^!' >/dev/null
+)
+
+printf '%s\n' impostor >>"$test_repository/tracked.txt"
+git -C "$test_repository" add tracked.txt
+GIT_AUTHOR_NAME='dependabot[bot]' \
+GIT_AUTHOR_EMAIL='49699333+dependabot[bot]@users.noreply.github.com' \
+GIT_COMMITTER_NAME='Untrusted Committer' \
+GIT_COMMITTER_EMAIL='untrusted@example.invalid' \
+  git -C "$test_repository" commit -q -m "Spoofed Dependabot alias" \
+    -m "Signed-off-by: dependabot[bot] <support@github.com>"
+if (
+  cd "$test_repository"
+  "$checker" 'HEAD^!' >/dev/null 2>&1
+); then
+  fail "Dependabot alias with an untrusted committer passed"
+fi
+
 echo "DCO audit self-test: pass"
