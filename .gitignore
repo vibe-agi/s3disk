@@ -11,6 +11,7 @@
 .DS_Store
 .idea/
 .vscode/
+/.codegraph/
 
 # Local credentials and developer-specific environment files.
 .env

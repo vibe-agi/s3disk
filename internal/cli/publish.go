@@ -376,9 +376,6 @@ func canonicalPublisherSelection(paths []string) ([][]byte, []string) {
 	for index := range unique {
 		encoded[index] = []byte(unique[index])
 	}
-	if encoded == nil {
-		encoded = make([][]byte, 0)
-	}
 	return encoded, append([]string(nil), unique...)
 }
 

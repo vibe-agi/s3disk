@@ -672,14 +672,6 @@ func validateCommitManifest(commit *commitManifest, generation uint64) error {
 	return nil
 }
 
-func cloneWatermark(value *Watermark) *Watermark {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	return &cloned
-}
-
 func (publisher *Publisher) validatePublicationCheckpoint(ctx context.Context, channel string, watermark, checkpoint Watermark) error {
 	anchor := checkpoint
 	if validated, ok := publisher.checkpointValidated[channel]; ok {
@@ -878,13 +870,9 @@ type pathSelection struct {
 	children   map[string]*pathSelection
 }
 
-// newPathSelection validates the complete selection before source or object
-// store I/O. Besides the per-path protocol limits, aggregate limits keep an
-// adversarial caller from constructing an unbounded in-memory trie.
-func newPathSelection(values []string) (*pathSelection, error) {
-	return newPathSelectionContext(context.Background(), values)
-}
-
+// newPathSelectionContext validates the complete selection before source or
+// object store I/O. Besides the per-path protocol limits, aggregate limits keep
+// an adversarial caller from constructing an unbounded in-memory trie.
 func newPathSelectionContext(ctx context.Context, values []string) (*pathSelection, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("s3disk: path-selection context is required")

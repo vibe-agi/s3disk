@@ -88,8 +88,8 @@ func TestRepositoryDescriptorAPIsRejectNilContextBeforeIO(t *testing.T) {
 		{
 			name: "initialize",
 			call: func(store *repositoryDescriptorBoundaryStore) error {
-				_, _, err := InitializeRepository(
-					nil, store, "tenant/nil-context", config,
+				//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
+				_, _, err := InitializeRepository(nil, store, "tenant/nil-context", config,
 					RepositoryInitializationOptions{ConfirmEmptyPrefix: true},
 				)
 				return err
@@ -98,6 +98,7 @@ func TestRepositoryDescriptorAPIsRejectNilContextBeforeIO(t *testing.T) {
 		{
 			name: "open writable",
 			call: func(store *repositoryDescriptorBoundaryStore) error {
+				//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
 				_, _, err := OpenRepository(nil, store, "tenant/nil-context", config)
 				return err
 			},
@@ -105,6 +106,7 @@ func TestRepositoryDescriptorAPIsRejectNilContextBeforeIO(t *testing.T) {
 		{
 			name: "open read-only",
 			call: func(store *repositoryDescriptorBoundaryStore) error {
+				//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
 				_, _, err := OpenReadOnlyRepository(nil, store, "tenant/nil-context", config)
 				return err
 			},

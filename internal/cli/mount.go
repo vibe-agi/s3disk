@@ -39,6 +39,10 @@ func runMount(ctx context.Context, options MountOptions) error {
 	if err != nil {
 		return err
 	}
+	return runPreparedMount(ctx, options, localPaths, share)
+}
+
+func runPreparedMount(ctx context.Context, options MountOptions, localPaths mountLocalPaths, share decodedHandoff) error {
 	if share.wire.DangerouslyUseSystemTrust {
 		return fmt.Errorf("s3disk mount: system TLS trust is incompatible with the S3-only CLI profile")
 	}
@@ -99,7 +103,9 @@ func runMount(ctx context.Context, options MountOptions) error {
 	}
 	healthEvents, reportHealthError := newMountHealthEvents()
 	mounted, err := mount.ReadOnly(ctx, consumer, localPaths.mountpoint, mount.Options{
-		Poll: s3disk.PollOptions{Interval: options.PollInterval, OnError: reportHealthError},
+		Poll: s3disk.PollOptions{
+			Interval: options.PollInterval, AttemptTimeout: options.PollTimeout, OnError: reportHealthError,
+		},
 	})
 	if err != nil {
 		return err

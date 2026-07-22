@@ -76,18 +76,21 @@ type MountStatus struct {
 	AuthorizationExpiresAt time.Time
 	// AutomaticUnmountReason is populated when the ReadOnly context or the
 	// authorization deadline starts automatic unmount.
-	AutomaticUnmountReason  AutomaticUnmountReason
-	ObservedSnapshot        SnapshotIdentity
-	NotifiedSnapshot        SnapshotIdentity
-	InvalidationMode        InvalidationMode
-	Invalidation            ComponentStatus
-	Refresh                 ComponentStatus
-	Unmount                 ComponentStatus
-	Polling                 bool
-	InodeIdentitiesUsed     int
-	InodeIdentitiesLimit    int
-	InodeIdentityBytesUsed  int64
-	InodeIdentityBytesLimit int64
+	AutomaticUnmountReason AutomaticUnmountReason
+	ObservedSnapshot       SnapshotIdentity
+	NotifiedSnapshot       SnapshotIdentity
+	InvalidationMode       InvalidationMode
+	Invalidation           ComponentStatus
+	Refresh                ComponentStatus
+	Unmount                ComponentStatus
+	Polling                bool
+	InodeIdentitiesUsed    int
+	InodeIdentitiesLimit   int
+	// InodeIdentitiesReclaimed counts exact identity mappings released after
+	// kernel FORGET events. Inode numbers remain monotonic and are not reused.
+	InodeIdentitiesReclaimed uint64
+	InodeIdentityBytesUsed   int64
+	InodeIdentityBytesLimit  int64
 }
 
 // Healthy reports whether polling is active, the latest observed snapshot has
@@ -110,8 +113,9 @@ func (status MountStatus) Healthy() bool {
 // boundary is inclusive: a success exactly maximumRefreshAge old remains
 // healthy.
 //
-// HealthyAt is a passive health decision. It does not cancel or distinguish an
-// in-flight refresh from a poller waiting for its next attempt.
+// HealthyAt is a passive health decision. Consumer.Poll separately bounds each
+// refresh with PollOptions.AttemptTimeout, while the mount records OnAttempt so
+// LastAttempt distinguishes a started refresh from the interval before it.
 func (status MountStatus) HealthyAt(now time.Time, maximumRefreshAge time.Duration) bool {
 	if !status.Healthy() || maximumRefreshAge <= 0 || status.Refresh.LastSuccess.IsZero() {
 		return false

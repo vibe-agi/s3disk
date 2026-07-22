@@ -183,6 +183,7 @@ func (publisher *Publisher) watch(
 		snapshot  Snapshot
 		err       error
 		reconcile bool
+		fatal     bool
 	}
 	requests := make(chan struct{}, 1)
 	results := make(chan publishResult, 1)
@@ -254,6 +255,10 @@ func (publisher *Publisher) watch(
 				// have been coalesced or consumed while exact generation N was
 				// waiting for its hook retry.
 				reconcile = true
+			} else if isFatalPublicationError(err) {
+				// A permanent, non-self-healing root fault: terminate the worker
+				// with this error instead of scheduling another futile retry.
+				return sendResult(publishResult{snapshot: snapshot, err: err, fatal: true})
 			} else {
 				scheduleAfterPublishedRetry()
 			}
@@ -302,6 +307,11 @@ func (publisher *Publisher) watch(
 					if err == nil {
 						lastAcknowledged = snapshot.Generation
 						resetRetryBackoff()
+					} else if isFatalPublicationError(err) {
+						// A permanent, non-self-healing root fault: terminate the
+						// worker with this error instead of retrying it forever.
+						_ = sendResult(publishResult{snapshot: snapshot, err: err, fatal: true})
+						return
 					} else {
 						pending := snapshot
 						pendingAfterPublished = &pending
@@ -441,6 +451,12 @@ func (publisher *Publisher) watch(
 			}
 			if result.err != nil {
 				reportWatchError(ctx, options, result.err)
+				if result.fatal {
+					// A permanent root-publication fault. Surface it as the
+					// terminal Watch error rather than freezing the pipeline on
+					// an endless retry that can never succeed.
+					return result.err
+				}
 				continue
 			}
 			if result.snapshot.Generation > lastPublished {
@@ -452,6 +468,20 @@ func (publisher *Publisher) watch(
 			}
 		}
 	}
+}
+
+// isFatalPublicationError reports whether a root-publication error is a
+// permanent, non-self-healing fault that must terminate Watch instead of being
+// retried indefinitely. These conditions -- the share root disappeared under a
+// committed anchor, the root forked into different commits, or the generation
+// space is exhausted -- can never be resolved by retrying, and silently
+// retrying them freezes the publication pipeline at the current generation
+// while hiding a trust event that requires operator intervention. Transient
+// faults keep their bounded exponential backoff retry.
+func isFatalPublicationError(err error) bool {
+	return errors.Is(err, ErrRollbackDetected) ||
+		errors.Is(err, ErrSplitBrain) ||
+		errors.Is(err, ErrGenerationExhausted)
 }
 
 type boundedWatchTree struct {
@@ -731,12 +761,31 @@ func invokeWatchPublished(ctx context.Context, options WatchOptions, snapshot Sn
 	options.OnPublished(snapshot)
 }
 
+const (
+	// DefaultPollAttemptTimeout bounds one complete Consumer.Refresh attempt,
+	// including reference, ancestry, manifest, and durable-watermark work.
+	DefaultPollAttemptTimeout = 2 * time.Minute
+	// MaximumPollAttemptTimeout prevents a configuration mistake from turning a
+	// health-checked poller into a practically unbounded background operation.
+	MaximumPollAttemptTimeout = 30 * time.Minute
+)
+
 // PollOptions controls Consumer.Poll.
 type PollOptions struct {
 	Interval       time.Duration
 	MaxInterval    time.Duration
 	BackoffFactor  float64
 	JitterFraction float64
+	// AttemptTimeout bounds each complete Refresh. Zero selects
+	// DefaultPollAttemptTimeout. The parent Poll context can impose an earlier
+	// deadline; an attempt timeout is reported to OnError and retried with the
+	// normal bounded backoff.
+	AttemptTimeout time.Duration
+	// OnAttempt runs immediately before every Refresh and lets health reporters
+	// distinguish a poller waiting for its next interval from an in-flight
+	// attempt. Like the other callbacks, it must return promptly. A panic is
+	// contained and reported to OnError.
+	OnAttempt func()
 	// OnResult is called after every successful Refresh, including unchanged,
 	// stale-ignored, and no-snapshot results. This lets independent pollers
 	// observe a snapshot which another poller or external Refresh adopted.
@@ -766,6 +815,13 @@ func (options PollOptions) Validate() error {
 	if maximum < interval {
 		return fmt.Errorf("s3disk: maximum poll interval must be at least the base interval")
 	}
+	attemptTimeout := options.AttemptTimeout
+	if attemptTimeout == 0 {
+		attemptTimeout = DefaultPollAttemptTimeout
+	}
+	if attemptTimeout < 0 || attemptTimeout > MaximumPollAttemptTimeout {
+		return fmt.Errorf("s3disk: poll attempt timeout must be positive and at most %s", MaximumPollAttemptTimeout)
+	}
 	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 1 || factor > 10 {
 		return fmt.Errorf("s3disk: backoff factor must be finite and between 1 and 10")
 	}
@@ -790,6 +846,9 @@ func (consumer *Consumer) Poll(ctx context.Context, options PollOptions) error {
 	if options.BackoffFactor == 0 {
 		options.BackoffFactor = 2
 	}
+	if options.AttemptTimeout == 0 {
+		options.AttemptTimeout = DefaultPollAttemptTimeout
+	}
 	if options.JitterFraction == 0 {
 		options.JitterFraction = 0.10
 	}
@@ -798,7 +857,10 @@ func (consumer *Consumer) Poll(ctx context.Context, options PollOptions) error {
 	}
 	delayBase := options.Interval
 	for {
-		result, err := consumer.Refresh(ctx)
+		invokePollAttempt(options)
+		attemptContext, cancelAttempt := context.WithTimeout(ctx, options.AttemptTimeout)
+		result, err := consumer.Refresh(attemptContext)
+		cancelAttempt()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -827,6 +889,18 @@ func (consumer *Consumer) Poll(ctx context.Context, options PollOptions) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func invokePollAttempt(options PollOptions) {
+	if options.OnAttempt == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			invokePollError(options, fmt.Errorf("s3disk: OnAttempt callback panic: %v", recovered))
+		}
+	}()
+	options.OnAttempt()
 }
 
 func invokePollResult(options PollOptions, result RefreshResult) {

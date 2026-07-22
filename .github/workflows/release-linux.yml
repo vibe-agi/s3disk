@@ -1,4 +1,7 @@
-name: Commercial Linux release gate
+# Optional governance for a maintainer who chooses to certify a supported
+# production offering. Ordinary Apache-2.0 open-source tags use release.yml and
+# do not require this workflow.
+name: Optional supported-production certification
 
 on:
   workflow_dispatch:
@@ -11,10 +14,6 @@ on:
         description: "Full lowercase commit SHA; must equal the selected branch head"
         required: true
         type: string
-  push:
-    tags:
-      - "v*"
-
 permissions:
   contents: read
 
@@ -290,6 +289,10 @@ jobs:
             done
             go list -m all
             govulncheck -version
+            staticcheck_path=$(command -v staticcheck)
+            staticcheck -version
+            go version -m "$staticcheck_path"
+            sha256sum "$staticcheck_path"
             docker version
             docker compose version
             java -version

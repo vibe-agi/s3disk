@@ -1531,8 +1531,13 @@ func TestPresignedGetCompatibilityHelpersAreBoundedAndAuthless(t *testing.T) {
 		t.Fatalf("cloned transport = %T", client.Transport)
 	}
 	transport, ok := guard.delegate.(*http.Transport)
-	if !ok || transport.Proxy != nil || transport.DialContext == nil || transport.Dial != nil ||
-		transport.DialTLSContext != nil || transport.DialTLS != nil || transport.TLSNextProto != nil ||
+	if !ok {
+		t.Fatalf("guard transport = %T, want *http.Transport", guard.delegate)
+	}
+	//lint:ignore SA1019 Deprecated dialer fields must remain empty on the constructed transport.
+	legacyDialerConfigured := transport.Dial != nil || transport.DialTLS != nil
+	if transport.Proxy != nil || transport.DialContext == nil || transport.DialTLSContext != nil ||
+		legacyDialerConfigured || transport.TLSNextProto != nil ||
 		transport.ProxyConnectHeader != nil || transport.GetProxyConnectHeader != nil || transport.Protocols != nil ||
 		client.Jar != nil || client.CheckRedirect == nil {
 		t.Fatal("anonymous client retained routing, protocol, cookie, or redirect authority")

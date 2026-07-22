@@ -48,8 +48,10 @@ type Options struct {
 	KernelCache    bool
 	FilesystemName string
 	// MaxInodeIdentities bounds the number of distinct (snapshot, path, type)
-	// identities remembered for this mount. Remembering them makes concurrent
-	// LOOKUP calls converge on one stable inode without probabilistic hashes.
+	// identities currently remembered for this mount. Remembering them makes
+	// concurrent LOOKUP calls converge on one stable inode without probabilistic
+	// hashes. Kernel FORGET events release identities which are no longer
+	// reachable; inode numbers themselves remain monotonic and are never reused.
 	// Zero selects DefaultMaxInodeIdentities.
 	MaxInodeIdentities int
 	// MaxInodeIdentityBytes bounds a conservative retained-memory charge for
@@ -189,7 +191,10 @@ func readOnlyWithMounter(
 	if err != nil {
 		return nil, err
 	}
-	if result, err := consumer.Refresh(ctx); err != nil {
+	initialRefreshContext, cancelInitialRefresh := context.WithTimeout(ctx, options.Poll.AttemptTimeout)
+	result, err := consumer.Refresh(initialRefreshContext)
+	cancelInitialRefresh()
+	if err != nil {
 		return nil, fmt.Errorf("s3disk mount: initial refresh: %w", err)
 	} else if result.Status == s3disk.RefreshNoSnapshot {
 		return nil, s3disk.ErrNoSnapshot
@@ -253,9 +258,16 @@ func readOnlyWithMounter(
 		snapshot, ok := consumer.CurrentSnapshot()
 		return identityOfSnapshot(snapshot), ok
 	}
+	userAttempt := options.Poll.OnAttempt
 	userResult := options.Poll.OnResult
 	userUpdated := options.Poll.OnUpdated
 	mounted.userError = options.Poll.OnError
+	options.Poll.OnAttempt = func() {
+		mounted.recordRefreshAttempt()
+		if userAttempt != nil {
+			userAttempt()
+		}
+	}
 	options.Poll.OnResult = func(result s3disk.RefreshResult) {
 		mounted.recordRefreshSuccess()
 		mounted.observeCurrentSnapshot(true)
@@ -367,6 +379,7 @@ type inodeIdentityRegistry struct {
 	limit         int
 	byteLimit     int64
 	retainedBytes int64
+	reclaimed     uint64
 	next          uint64
 	identities    map[inodeIdentityKey]uint64
 }
@@ -439,13 +452,55 @@ func (registry *inodeIdentityRegistry) stableAttr(identity snapshotIdentity, val
 	return fs.StableAttr{Mode: typeMode(entryType), Ino: inodeNumber, Gen: identity.generation}, nil
 }
 
+// release forgets one exact identity only while it still names inodeNumber.
+// The conditional value check prevents a late or duplicate OnForget from
+// deleting a newer allocation for the same snapshot/path/type tuple. Inode
+// numbers are deliberately not recycled: an old open file handle may outlive
+// the kernel's namespace lookup reference even after FORGET.
+func (registry *inodeIdentityRegistry) release(
+	identity snapshotIdentity,
+	value string,
+	entryType s3disk.EntryType,
+	inodeNumber uint64,
+) bool {
+	if registry == nil || !identity.valid() || inodeNumber == 0 {
+		return false
+	}
+	key := inodeIdentityKey{snapshot: identity, path: value, entryType: entryType}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	current, ok := registry.identities[key]
+	if !ok || current != inodeNumber {
+		return false
+	}
+	delete(registry.identities, key)
+	if len(registry.identities) == 0 {
+		// Let the map buckets become collectible after complete churn instead of
+		// retaining their historical high-water allocation for the whole mount.
+		registry.identities = nil
+	}
+	charged := inodeIdentityRetainedBytes(key.path, key.entryType)
+	if charged >= registry.retainedBytes {
+		registry.retainedBytes = 0
+	} else {
+		registry.retainedBytes -= charged
+	}
+	registry.reclaimed++
+	return true
+}
+
 func (registry *inodeIdentityRegistry) usage() (int, int64) {
+	used, retainedBytes, _ := registry.stats()
+	return used, retainedBytes
+}
+
+func (registry *inodeIdentityRegistry) stats() (int, int64, uint64) {
 	if registry == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	return len(registry.identities), registry.retainedBytes
+	return len(registry.identities), registry.retainedBytes, registry.reclaimed
 }
 
 func (registry *inodeIdentityRegistry) used() int {
@@ -475,7 +530,8 @@ func (mounted *Mount) Status() MountStatus {
 	status := mounted.status
 	mounted.statusMu.RUnlock()
 	if mounted.inodeIDs != nil {
-		status.InodeIdentitiesUsed, status.InodeIdentityBytesUsed = mounted.inodeIDs.usage()
+		status.InodeIdentitiesUsed, status.InodeIdentityBytesUsed,
+			status.InodeIdentitiesReclaimed = mounted.inodeIDs.stats()
 	}
 	return status
 }
@@ -770,11 +826,17 @@ func (mounted *Mount) finishWhenStopped() {
 func (mounted *Mount) recordRefreshSuccess() {
 	now := time.Now()
 	mounted.statusMu.Lock()
-	mounted.status.Refresh.LastAttempt = now
 	mounted.status.Refresh.LastSuccess = now
 	mounted.status.Refresh.NextRetry = time.Time{}
 	mounted.status.Refresh.ConsecutiveFailures = 0
 	mounted.status.Refresh.LastError = ""
+	mounted.statusMu.Unlock()
+}
+
+func (mounted *Mount) recordRefreshAttempt() {
+	mounted.statusMu.Lock()
+	mounted.status.Refresh.LastAttempt = time.Now()
+	mounted.status.Refresh.NextRetry = time.Time{}
 	mounted.statusMu.Unlock()
 }
 
@@ -800,7 +862,6 @@ func (mounted *Mount) recordRefreshFailure(err error) {
 		return
 	}
 	mounted.statusMu.Lock()
-	mounted.status.Refresh.LastAttempt = time.Now()
 	mounted.status.Refresh.ConsecutiveFailures++
 	mounted.status.Refresh.LastError = err.Error()
 	mounted.statusMu.Unlock()
@@ -1096,6 +1157,7 @@ type node struct {
 	snapshot      snapshotIdentity
 	snapshotEntry s3disk.Entry
 	inodeIDs      *inodeIdentityRegistry
+	inodeNumber   uint64
 }
 
 func (node *node) entry(ctx context.Context) (s3disk.Entry, error) {
@@ -1137,9 +1199,21 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	if stableErr != nil {
 		return nil, errno(stableErr)
 	}
+	child.inodeNumber = stable.Ino
 	out.Attr.Ino = stable.Ino
 	inode := n.NewInode(ctx, child, stable)
 	return inode, 0
+}
+
+// OnForget releases only the registry entry owned by this exact inode. The
+// allocation counter remains monotonic, so a file handle pinned to an older
+// snapshot can safely outlive namespace reclamation without its inode number
+// ever being assigned to different content.
+func (node *node) OnForget() {
+	if node == nil || !node.snapshotBound {
+		return
+	}
+	node.inodeIDs.release(node.snapshot, node.path, node.entryType, node.inodeNumber)
 }
 
 func (node *node) Getattr(ctx context.Context, rawHandle fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -1504,8 +1578,16 @@ func errno(err error) syscall.Errno {
 	switch {
 	case err == nil:
 		return 0
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.Canceled):
 		return syscall.EINTR
+	case errors.Is(err, context.DeadlineExceeded):
+		// A backend attempt timeout (for example an S3 HTTP request deadline)
+		// surfaces here while the mount context is still live; the FUSE op
+		// context itself only ever reports Canceled. This is a retryable I/O
+		// failure, not a signal interruption, so map it to EIO. EINTR would
+		// surface as a spurious hard failure to applications that do not restart
+		// interrupted regular-file reads.
+		return syscall.EIO
 	case errors.Is(err, s3disk.ErrPathNotFound):
 		return syscall.ENOENT
 	case errors.Is(err, s3disk.ErrObjectNotFound):
@@ -1546,6 +1628,7 @@ var (
 	_ fs.NodeWriter         = (*node)(nil)
 	_ fs.NodeAllocater      = (*node)(nil)
 	_ fs.NodeCopyFileRanger = (*node)(nil)
+	_ fs.NodeOnForgetter    = (*node)(nil)
 	_ fs.FileReader         = (*fileHandle)(nil)
 	_ fs.FileGetattrer      = (*fileHandle)(nil)
 )

@@ -1,11 +1,26 @@
 #!/bin/sh
 set -eu
 
-jar_path="${TLA2TOOLS_JAR:-${TMPDIR:-/tmp}/s3disk-tla2tools-1.8.0.jar}"
-expected_sha256="58d44845a37a8d776deaf8cf3a623213b59d311bc0ec287bcdfbe148dd11bb3d"
+tla2tools_version="1.7.4"
+jar_path="${TLA2TOOLS_JAR:-${TMPDIR:-/tmp}/s3disk-tla2tools-${tla2tools_version}.jar}"
+expected_sha256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
 if [ ! -f "$jar_path" ]; then
-  curl -fsSL https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar -o "$jar_path"
+  # v1.8.0 is an upstream rolling prerelease whose asset is replaced on every
+  # master commit. Use the versioned stable release and require the reviewed
+  # digest below so a fresh runner admits only the same bytes.
+  download_path="$(mktemp "${jar_path}.download.XXXXXX")"
+  trap 'rm -f -- "$download_path"' EXIT HUP INT TERM
+  curl -fsSL \
+    "https://github.com/tlaplus/tlaplus/releases/download/v${tla2tools_version}/tla2tools.jar" \
+    -o "$download_path"
+  downloaded_sha256="$(shasum -a 256 "$download_path" | awk '{print $1}')"
+  if [ "$downloaded_sha256" != "$expected_sha256" ]; then
+    echo "unexpected downloaded tla2tools.jar checksum" >&2
+    exit 1
+  fi
+  mv -- "$download_path" "$jar_path"
+  trap - EXIT HUP INT TERM
 fi
 
 actual_sha256="$(shasum -a 256 "$jar_path" | awk '{print $1}')"

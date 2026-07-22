@@ -59,6 +59,93 @@ func TestInodeIdentityRepeatedTupleDoesNotConsumeBytesAgain(t *testing.T) {
 	}
 }
 
+func TestInodeIdentityReleaseReclaimsBudgetWithoutReusingNumber(t *testing.T) {
+	t.Parallel()
+	identity := testInodeSnapshotIdentity(1, 1)
+	value := "directory/item"
+	requested := inodeIdentityRetainedBytes(value, s3disk.EntryFile)
+	registry := newInodeIdentityRegistry(1, requested)
+
+	first, err := registry.stableAttr(identity, value, s3disk.EntryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !registry.release(identity, value, s3disk.EntryFile, first.Ino) {
+		t.Fatal("release did not remove the exact first identity")
+	}
+	if used, bytes, reclaimed := registry.stats(); used != 0 || bytes != 0 || reclaimed != 1 {
+		t.Fatalf("released identity stats = (%d, %d, %d), want (0, 0, 1)", used, bytes, reclaimed)
+	}
+	if registry.identities != nil {
+		t.Fatal("empty identity registry retained its map allocation")
+	}
+
+	second, err := registry.stableAttr(identity, value, s3disk.EntryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Ino <= first.Ino {
+		t.Fatalf("reallocated inode = %d, want greater than forgotten inode %d", second.Ino, first.Ino)
+	}
+	if registry.release(identity, value, s3disk.EntryFile, first.Ino) {
+		t.Fatal("late first OnForget removed the second allocation")
+	}
+	repeated, err := registry.stableAttr(identity, value, s3disk.EntryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated != second {
+		t.Fatalf("identity after late release = %+v, want %+v", repeated, second)
+	}
+}
+
+func TestInodeIdentityForgetChurnStaysWithinOneEntryBudget(t *testing.T) {
+	t.Parallel()
+	identity := testInodeSnapshotIdentity(1, 1)
+	const cycles = 10_000
+	value := "churned-item"
+	requested := inodeIdentityRetainedBytes(value, s3disk.EntryFile)
+	registry := newInodeIdentityRegistry(1, requested)
+
+	var previous uint64
+	for range cycles {
+		attr, err := registry.stableAttr(identity, value, s3disk.EntryFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attr.Ino <= previous {
+			t.Fatalf("inode sequence advanced from %d to %d", previous, attr.Ino)
+		}
+		previous = attr.Ino
+		if !registry.release(identity, value, s3disk.EntryFile, attr.Ino) {
+			t.Fatalf("release inode %d", attr.Ino)
+		}
+	}
+	if used, bytes, reclaimed := registry.stats(); used != 0 || bytes != 0 || reclaimed != cycles {
+		t.Fatalf("churn stats = (%d, %d, %d), want (0, 0, %d)", used, bytes, reclaimed, cycles)
+	}
+}
+
+func TestNodeOnForgetReleasesOwnedInodeIdentity(t *testing.T) {
+	t.Parallel()
+	identity := testInodeSnapshotIdentity(2, 2)
+	registry := newInodeIdentityRegistry(1, DefaultMaxInodeIdentityBytes)
+	attr, err := registry.stableAttr(identity, "forgotten", s3disk.EntryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgotten := &node{
+		path: "forgotten", entryType: s3disk.EntryFile,
+		snapshotBound: true, snapshot: identity,
+		inodeIDs: registry, inodeNumber: attr.Ino,
+	}
+	forgotten.OnForget()
+	forgotten.OnForget()
+	if used, bytes, reclaimed := registry.stats(); used != 0 || bytes != 0 || reclaimed != 1 {
+		t.Fatalf("OnForget stats = (%d, %d, %d), want (0, 0, 1)", used, bytes, reclaimed)
+	}
+}
+
 func TestInodeIdentityCountBudgetIsDiagnosticAndDoesNotAdvance(t *testing.T) {
 	t.Parallel()
 	identity := testInodeSnapshotIdentity(1, 1)
@@ -187,6 +274,13 @@ func TestMountStatusReportsInodeIdentityByteUsage(t *testing.T) {
 	value := "status-item"
 	requested := inodeIdentityRetainedBytes(value, s3disk.EntryFile)
 	registry := newInodeIdentityRegistry(9, requested+1)
+	first, err := registry.stableAttr(identity, value, s3disk.EntryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !registry.release(identity, value, s3disk.EntryFile, first.Ino) {
+		t.Fatal("release first status identity")
+	}
 	if _, err := registry.stableAttr(identity, value, s3disk.EntryFile); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +293,8 @@ func TestMountStatusReportsInodeIdentityByteUsage(t *testing.T) {
 	}
 	status := mounted.Status()
 	if status.InodeIdentitiesUsed != 1 || status.InodeIdentitiesLimit != 9 ||
-		status.InodeIdentityBytesUsed != requested || status.InodeIdentityBytesLimit != requested+1 {
+		status.InodeIdentitiesReclaimed != 1 || status.InodeIdentityBytesUsed != requested ||
+		status.InodeIdentityBytesLimit != requested+1 {
 		t.Fatalf("Mount.Status inode budget = %+v", status)
 	}
 }

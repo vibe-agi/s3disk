@@ -7,15 +7,15 @@ validated production support. A build tag is not a support commitment.
 
 The module currently declares Go 1.25 as its source-compatibility floor. Go
 supports a major release only until two newer major releases exist, so Go 1.25
-and 1.26 are supported upstream as of July 2026. Commercial artifacts must be
-built with a fully patched supported toolchain. The release gate currently
+and 1.26 are supported upstream as of July 2026. Release artifacts are built
+with a fully patched supported toolchain. The release workflow currently
 requires Go 1.26.5 and must be updated when Go ships a later security patch.
 See the official [Go release policy and
 history](https://go.dev/doc/devel/release).
 
 The `go 1.25.0` directive is a language/module parsing floor, not a security
-support promise. Commercial support applies only when the embedding application
-uses a Go branch still supported upstream at its latest patch level.
+support promise. Embedding applications should use a Go branch still supported
+upstream at its latest patch level.
 
 There is no stable `v1` API tag yet. Before `v1.0.0`, minor releases may change
 public APIs. After `v1`, incompatible Go APIs require a semantic import version
@@ -32,10 +32,10 @@ upgrade/rollback product matrix.
 
 ## Platform matrix
 
-| Component | Target | Current status | Commercial requirement |
+| Component | Target | Current status | Additional production consideration |
 | --- | --- | --- | --- |
 | Core and `s3store` | Go-supported OS/architecture | Core protocols are portable Go; protected publication-journal, watermark, and cache paths are enabled on Linux, Windows, and Darwin with cgo, while the confidentiality-bearing `FileSealedStateStore` is limited to Linux and Darwin with cgo and deliberately fails closed on Windows; other targets fail closed where their ACL semantics are not certified; the checked-in CI workflow runs native tests on Ubuntu, macOS, and Windows | Review CI evidence for the exact release and test every additionally advertised target; do not advertise sealed recovery-WAL support on Windows |
-| `mount` | Linux | FUSE implementation and an actual `/dev/fuse` E2E test are present; the commercial gate requires both | Run the gate on Linux for every release and certify each advertised distribution/kernel; the current macOS development host has not executed this test |
+| `mount` | Linux | FUSE implementation and actual `/dev/fuse` E2E tests are present; the MinIO-backed flow passed on Ubuntu 24.04 ARM64, kernel 6.8, on 2026-07-22 | Re-run on each kernel/distribution used by the embedding product and before important rollouts |
 | `mount` | macOS | Builds through go-fuse; requires a separately installed macFUSE runtime | Do not bundle, download, or automate macFUSE installation in commercial software without written permission; a native FSKit/File Provider adapter is preferred for a packaged product |
 | `mount` | FreeBSD | Build-tagged implementation present | Compile-only status; no production support until dedicated kernel/runtime E2E coverage exists |
 | `mount` | Windows | Returns `ErrUnsupportedPlatform` | Requires a native adapter and separate driver/licensing/security review |
@@ -173,6 +173,16 @@ evidence.
   the kernel applies the published owner permission bits to that per-user
   mount. Run separate mounts under separate service identities when isolation
   between local users is required.
+- `s3disk mount-set` can supervise up to 128 independent reader mounts in one
+  process after strict private-config, handoff, resolved-path, and duplicate
+  share preflight. A terminal child error cancels and waits for all peers;
+  normal expiry of one workspace does not terminate later-expiring mounts.
+  This is operational grouping, not a union mount or a security boundary.
+  Configuration hot reload, publisher supervision, automatic child restart,
+  and multi-workspace soak evidence remain outside the current compatibility
+  claim. The required Linux `/dev/fuse` gate does exercise two simultaneous
+  independent mounts and coordinated supervisor cancellation; see
+  [`MOUNT_SET.md`](MOUNT_SET.md).
 - An open file is snapshot-pinned, including its bytes, size, mode, and mtime.
   Non-root inodes are generation-bound, and stale namespace, open, readlink,
   and directory-open operations return `ESTALE` instead of combining
@@ -206,12 +216,16 @@ evidence.
   map bucket/growth allowance. Both limits are checked under the allocation
   lock; a new lookup fails with `ErrInodeIdentityLimit` and a used/limit/request
   diagnostic instead of reusing a live identity or exceeding either budget.
-  `Mount.Status` exposes both identity count and byte usage/limits.
-  Identities are deliberately monotonic for collision-free safety. The adapter
-  does not yet consume kernel `FORGET` lifetime evidence to reclaim them, so a
-  long-running high-churn mount can reach a limit and must then be remounted or
-  sharded. Safe `FORGET`-driven reclamation remains a commercial scalability
-  blocker rather than being approximated with unsafe eviction.
+  `Mount.Status` exposes both identity count and byte usage/limits plus the
+  cumulative reclaimed count. The adapter consumes go-fuse `OnForget`
+  lifetime evidence to conditionally release an exact mapping only if it still
+  names the forgotten inode. Late and duplicate events cannot remove a newer
+  allocation for the same tuple. Inode numbers themselves stay monotonic and
+  are never reused, so an old file handle can safely outlive namespace
+  reclamation. The Linux `/dev/fuse` gate deliberately sets a four-identity
+  limit while materializing more than four cross-generation identities and
+  requires observable reclamation. Kernels may delay `FORGET`, so simultaneous
+  live identities still need a measured count/byte budget and sharding policy.
 - `Mount.Status` separately records refresh, advisory reverse invalidation and
   unmount health. `AuthorizationExpiresAt` is the fixed locally known boundary;
   `AutomaticUnmountReason` reports whether context termination or authorization
@@ -225,9 +239,12 @@ evidence.
   remains an age-independent structural check. Production monitors should call
   `HealthyAt(now, maxRefreshAge)` with a positive freshness SLA; it also
   requires a nonzero successful refresh no older than the inclusive bound and
-  treats a future timestamp after clock skew as fresh. This check is passive:
-  an attempt-start hook and per-attempt child-context deadline are still needed
-  in the core poller to distinguish and actively cancel a hung refresh.
+  treats a future timestamp after clock skew as fresh. This check is passive,
+  while the core poller separately calls `PollOptions.OnAttempt` immediately
+  before every refresh and bounds the complete operation with
+  `AttemptTimeout` (two minutes by default, at most 30 minutes). A timeout is a
+  refresh failure: it reaches `OnError`, degrades mount health, and retries with
+  the normal bounded backoff. The mount's initial refresh uses the same bound.
 - `Mount.Unmount` cancels its poller only after success and concurrent callers
   join one lock-free physical attempt. A failed attempt leaves polling active
   and may be retried with `UnmountContext`. Context- and authorization-triggered

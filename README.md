@@ -14,15 +14,16 @@ only when a caller reads them. An open file remains pinned to the snapshot in
 which it was opened.
 
 > **Release status:** pre-1.0 engineering preview. The consistency protocol is
-> tested and model-checked, but the product limitations and release blockers in
-> [Commercial release](docs/COMMERCIAL_RELEASE.md) still apply. Do not market
-> the current tree as generally available production software. The model does
-> not prove the client-encryption primitives or confidentiality.
+> tested, model-checked, and exercised through a real Linux FUSE/S3 integration
+> test. Before `v1.0.0`, APIs and operational procedures may still change. The
+> model does not prove the client-encryption primitives or confidentiality.
 
 s3disk is an Apache-2.0 open-source project. The license permits commercial
-use, modification, and redistribution subject to its terms; that permission is
-separate from this repository's pre-release status, support policy, and the
-commercial certification gates documented below.
+use, modification, and redistribution subject to its terms. Releases are
+provided without an SLA or an obligation for the maintainers to deploy,
+operate, or support downstream installations; see [`SUPPORT.md`](SUPPORT.md).
+The optional [supported-production certification](docs/COMMERCIAL_RELEASE.md)
+is separate from ordinary open-source tags and is not required for internal use.
 
 ## Packages
 
@@ -208,7 +209,8 @@ s3disk mount \
   --handoff /secure/share.json \
   --mountpoint /mnt/share \
   --state-dir /var/lib/s3disk/reader \
-  --poll-interval 1s
+  --poll-interval 1s \
+  --poll-timeout 2m
 ```
 
 The handoff output and destination parent directories must already be trusted
@@ -230,6 +232,65 @@ It does not solve coordinated rollback of both local sealed state and matching
 S3 state, recovery-key rotation, disaster-recovery backup policy, or early
 revocation of the cloud credential that signed the original root URL; those
 remain commercial release blockers.
+
+### One or multiple workspaces
+
+One publish session is one independently encrypted and expiring workspace. To
+share several unrelated workspaces, run one `share publish` process per source,
+with a distinct S3 prefix, handoff path, and preferably a distinct recovery key.
+The processes may share a private `--state-dir`; share-ID subdirectories isolate
+their durable state. Publisher sessions remain independent processes and should
+be managed by the host service manager.
+
+On a reader, either run one `s3disk mount` process per handoff or use the
+declarative same-process supervisor:
+
+```json
+{
+  "version": 1,
+  "mounts": [
+    {
+      "name": "project-a",
+      "handoff": "/secure/project-a.handoff",
+      "mountpoint": "/mnt/project-a",
+      "state_dir": "/var/lib/s3disk/reader"
+    },
+    {
+      "name": "project-b",
+      "handoff": "/secure/project-b.handoff",
+      "mountpoint": "/mnt/project-b",
+      "state_dir": "/var/lib/s3disk/reader",
+      "cache_dir": "/var/cache/s3disk",
+      "poll_interval": "1s",
+      "poll_timeout": "2m"
+    }
+  ]
+}
+```
+
+Install that file as a current-owner `0600` file below a trusted private
+directory, create the distinct empty mountpoints, then run:
+
+```sh
+s3disk mount-set --config /secure/s3disk-mounts.json
+```
+
+The supervisor strictly rejects unknown or duplicate JSON members, relative
+paths, duplicate names/shares, overlapping mountpoints, and a mountpoint which
+collides with any workspace's state, cache, handoff, or configuration before
+starting FUSE. Reader state and cache base directories may be shared because
+the CLI appends authenticated repository/share namespaces. Output is prefixed
+with the workspace name. A terminal error in any mount cancels the set and asks
+every peer to unmount; normal authorization expiry removes that workspace while
+later-expiring mounts continue. The configuration is read once at startup and
+is bounded to 128 mounts and 1 MiB. See [Mount sets](docs/MOUNT_SET.md).
+
+A single publish can instead expose selected paths under one common source by
+repeating `--path`; those paths form one workspace, one trust/expiry domain, and
+one mount. `mount-set` does not provide a union mount, merge namespaces, restart
+failed mounts, or supervise publishers. Production deployments should still run
+it below systemd, launchd, or another service manager and alert on terminal
+process exit and mount health.
 
 ## Publisher
 
@@ -556,6 +617,11 @@ n, err := file.ReadAtContext(ctx, buf, 0)
 `Stat`, `ListDir`, and `Open` do not download file data. A range read downloads
 only intersecting chunks. `Consumer.Poll` advances to newer generations while
 retaining the last verified snapshot across transient failures.
+Each complete refresh attempt has a two-minute default deadline; set
+`PollOptions.AttemptTimeout` to tune it. `PollOptions.OnAttempt` runs immediately
+before each refresh so health integrations can distinguish an in-flight request
+from the interval between requests. Attempt deadline failures reach `OnError`
+and use the same bounded retry backoff as other transient failures.
 `PollOptions.OnResult` runs after every successful check, including unchanged
 results, so independent mounts sharing one concurrent-safe `Consumer` still
 notice a generation adopted by another poller or an external `Refresh`.
@@ -721,8 +787,10 @@ additionally requires a nonzero successful refresh
 no older than the inclusive positive bound; a future timestamp after local
 clock skew is treated as fresh. Notification failures retry independently of
 later polls with bounded backoff, while the status retains the last error.
-`HealthyAt` is passive: distinguishing and canceling a hung in-flight refresh
-still requires a core poll attempt hook and per-attempt child-context deadline.
+`HealthyAt` remains a passive decision, but the poller records the start of each
+attempt and actively cancels the complete refresh at `AttemptTimeout` (two
+minutes by default). The CLI exposes this as `--poll-timeout`; a timeout degrades
+refresh health, reaches `OnError`, and is retried with bounded backoff.
 `Done`/`WaitContext` wait for the FUSE server and background workers.
 `UnmountContext` joins concurrent physical attempts and retries transient
 failures; context- or authorization-triggered automatic unmount is bounded by
@@ -739,11 +807,16 @@ Stable inode identities also have independent count and retained-byte budgets.
 hard charged limit for exact snapshot/path/type registry entries, including
 private string copies and map/allocation allowance. `Mount.Status` reports
 `InodeIdentitiesUsed`/`InodeIdentitiesLimit` and
-`InodeIdentityBytesUsed`/`InodeIdentityBytesLimit`. Exceeding either limit
-fails the new lookup with `ErrInodeIdentityLimit` and never aliases an existing
-inode. The registry is monotonic for safety: kernel `FORGET`-based reclamation
-is not implemented yet, so plan remounts or mount sharding for high-churn,
-long-lived deployments.
+`InodeIdentityBytesUsed`/`InodeIdentityBytesLimit`, plus the cumulative
+`InodeIdentitiesReclaimed` count. Exceeding either limit fails the new lookup
+with `ErrInodeIdentityLimit` and never aliases an existing inode. Kernel
+`FORGET` events conditionally release unreachable exact mappings and their
+budget; late or duplicate events cannot delete a newer mapping. Allocated inode
+numbers remain monotonic and are never reused, so old open handles remain safe.
+The limits therefore bound identities which the kernel still keeps live, not
+all historical churn. A kernel which delays `FORGET` can still temporarily hit
+a limit; monitor the status fields and size or shard mounts for the certified
+concurrent working set.
 
 ## Consistency contract
 
@@ -983,41 +1056,44 @@ requires `/dev/fuse` and `fusermount3`.
 go test ./...
 go test -race ./...
 go vet ./...
+./scripts/check-staticcheck.sh
 ./scripts/test-minio.sh
 ./scripts/check-model.sh
 ./scripts/check-project-license.sh
 ./scripts/check-third-party.sh
 ./scripts/check-fuzz-wiring.sh
 ./scripts/test-release-ref.sh
+./scripts/test-scale.sh
 # On a Linux release runner with /dev/fuse:
 ./scripts/test-mount-linux.sh
 ```
+
+The scale smoke emits structured per-run evidence and accepts bounded workload
+overrides documented in [`docs/SCALE.md`](docs/SCALE.md). It is a regression
+profile, not a universal capacity claim.
 
 MinIO is pulled only as an external AGPL-3.0 test fixture. It is not linked into
 the Go module and must not be included in a redistributed product image without
 a separate licensing review.
 
-The regular CI workflow is configured to run native tests on Ubuntu, macOS, and
-Windows, plus Linux quality/race/vet/compliance checks, the pinned MinIO
-integration, and TLA+ model checking. The MinIO fixture binds an OS-selected
-loopback port so parallel jobs do not depend on a fixed host port. The separate
-commercial workflow has an unpublished-candidate mode and a post-publication
-tag mode. It runs the fail-closed gate only on a disposable, isolated Linux
-runner with `/dev/fuse`, emits a hashed success artifact, and places candidate
-promotion behind a post-gate protected environment. A workflow loaded from the
-candidate checkout is not an independent authorization root; commercial
-promotion still requires the separately controlled release process described
-in the release document.
+The regular CI workflow runs native tests on Ubuntu, macOS, and Windows, plus
+Linux quality/race/vet/compliance checks, the pinned MinIO integration, and TLA+
+model checking. The MinIO fixture binds an OS-selected loopback port so parallel
+jobs do not depend on a fixed host port.
 
-Before publishing a commercial tag, follow [Commercial
-release](docs/COMMERCIAL_RELEASE.md). Run the protected workflow against the
-untagged branch-head digest, approve and archive that evidence, then create an
-OpenPGP-signed annotated tag explicitly at the approved commit in an isolated
-release checkout. Release mode requires the authorized primary fingerprint in
-a root-owned protected allowlist, pins a root-owned verifier executable, and
-revalidates the signed tag name and target after the full gate. Push that exact
-ref only after it passes; the tag-triggered workflow is post-publication
-verification.
+Pushing a canonical `v0.x.y` or `v1.x.y` tag runs the open-source release
+workflow. It revalidates source hygiene, tests, static analysis, known
+vulnerabilities, MinIO behavior, and the formal models; then it publishes
+versioned Linux and native-cgo macOS archives with SHA-256 checksums. The Linux
+archive is the primary implementation target for read-only FUSE mounting;
+macOS also requires a separately installed macFUSE runtime. Windows remains a
+source-build target and does not support `mount`.
+
+The separate supported-production workflow is manual and optional. It retains
+the stricter signer, evidence-retention, isolated-runner, and support-policy
+checks for a maintainer who deliberately makes those additional promises. Its
+`RELEASE-BLOCKER` markers do not block ordinary Apache-2.0 open-source releases
+or an embedding application's own internal deployment decision.
 
 ## Contributing
 
@@ -1031,7 +1107,7 @@ process in [`SECURITY.md`](SECURITY.md), not through a public issue.
 s3disk is open-source software licensed under the [Apache License
 2.0](LICENSE), including for commercial use subject to that license. This is a
 license, not a warranty, support commitment, or statement that the current
-preview has passed the commercial release gate. Third-party terms and required
-attributions are listed
+preview has passed the optional supported-production certification. Third-party
+terms and required attributions are listed
 separately in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
 [`NOTICE`](NOTICE).

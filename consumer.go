@@ -99,7 +99,10 @@ type Consumer struct {
 	downloadSlots        chan struct{}
 	downloadBytes        *weightedSemaphore
 
-	refreshMu       sync.Mutex
+	// refreshGate serializes Refresh while allowing a caller's context to cancel
+	// before it reaches the object store. A plain mutex would make a timed poller
+	// wait indefinitely behind another stuck refresh on the same Consumer.
+	refreshGate     chan struct{}
 	stateMu         sync.RWMutex
 	state           *adoptedSnapshot
 	watermark       Watermark
@@ -196,6 +199,7 @@ func NewConsumer(repository *Repository, channel string, options ConsumerOptions
 		symlinkPolicy:        options.Symlinks,
 		strictCacheErrors:    options.StrictCacheErrors,
 		onCacheError:         options.OnCacheError,
+		refreshGate:          make(chan struct{}, 1),
 		downloadSlots:        make(chan struct{}, options.MaxConcurrentDownloads),
 		downloadBytes:        newWeightedSemaphore(options.MaxConcurrentDownloadBytes),
 		metadata:             newMetadataCache(options.MetadataCacheEntries, options.MetadataCacheBytes),
@@ -206,8 +210,18 @@ func NewConsumer(repository *Repository, channel string, options ConsumerOptions
 // commit and root directory, then atomically adopts a newer generation. Older
 // generations are ignored even if a weak S3-compatible backend returns one.
 func (consumer *Consumer) Refresh(ctx context.Context) (RefreshResult, error) {
-	consumer.refreshMu.Lock()
-	defer consumer.refreshMu.Unlock()
+	if consumer == nil || consumer.refreshGate == nil {
+		return RefreshResult{}, fmt.Errorf("s3disk: consumer is not initialized")
+	}
+	if ctx == nil {
+		return RefreshResult{}, fmt.Errorf("s3disk: refresh context is required")
+	}
+	select {
+	case consumer.refreshGate <- struct{}{}:
+		defer func() { <-consumer.refreshGate }()
+	case <-ctx.Done():
+		return RefreshResult{}, ctx.Err()
+	}
 	// A different process may have advanced a shared durable watermark since the
 	// previous refresh. Reload before issuing a conditional reference GET so an
 	// old ETag cannot hide that stronger local freshness requirement.
@@ -1118,108 +1132,9 @@ func (consumer *Consumer) reportCacheError(err error) {
 	}()
 }
 
-type flightCall struct {
-	done    chan struct{}
-	data    []byte
-	err     error
-	cancel  context.CancelFunc
-	waiters int
-}
-
 type chunkFlightKey struct {
 	digest       Digest
 	expectedSize int64
-}
-
-type flightGroup struct {
-	mu    sync.Mutex
-	calls map[chunkFlightKey]*flightCall
-}
-
-func (group *flightGroup) Do(ctx context.Context, digest Digest, load func(context.Context) ([]byte, error)) ([]byte, error) {
-	return group.do(ctx, chunkFlightKey{digest: digest}, load, nil)
-}
-
-// DoAfter runs after only for the caller that starts the shared load. The load
-// has returned, its call has been detached from the group, and its context has
-// been canceled before after runs. Completion is not published to waiters until
-// after returns, preserving synchronous notification without making reentrant
-// calls join the load that is invoking them.
-func (group *flightGroup) DoAfter(ctx context.Context, digest Digest, load func(context.Context) ([]byte, error), after func()) ([]byte, error) {
-	return group.do(ctx, chunkFlightKey{digest: digest}, load, after)
-}
-
-func (group *flightGroup) DoAfterSized(ctx context.Context, digest Digest, expectedSize int64, load func(context.Context) ([]byte, error), after func()) ([]byte, error) {
-	return group.do(ctx, chunkFlightKey{digest: digest, expectedSize: expectedSize}, load, after)
-}
-
-func (group *flightGroup) do(ctx context.Context, key chunkFlightKey, load func(context.Context) ([]byte, error), after func()) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	group.mu.Lock()
-	if group.calls == nil {
-		group.calls = make(map[chunkFlightKey]*flightCall)
-	}
-	if existing := group.calls[key]; existing != nil {
-		if existing.waiters > 0 {
-			existing.waiters++
-			group.mu.Unlock()
-			return group.wait(ctx, key, existing)
-		}
-		// Every caller abandoned this loader and canceled its context. Do not
-		// make a later caller inherit that canceled request while it winds down.
-		delete(group.calls, key)
-	}
-	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	call := &flightCall{done: make(chan struct{}), cancel: cancel, waiters: 1}
-	group.calls[key] = call
-	group.mu.Unlock()
-	go group.run(key, call, loadCtx, load, after)
-	return group.wait(ctx, key, call)
-}
-
-func (group *flightGroup) run(key chunkFlightKey, call *flightCall, ctx context.Context, load func(context.Context) ([]byte, error), after func()) {
-	func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				call.err = fmt.Errorf("s3disk: chunk loader panic: %v", recovered)
-			}
-		}()
-		call.data, call.err = load(ctx)
-	}()
-	group.mu.Lock()
-	if group.calls[key] == call {
-		delete(group.calls, key)
-	}
-	group.mu.Unlock()
-	call.cancel()
-	if after != nil {
-		// Completion hooks are internal best-effort notifications. Never let an
-		// unexpected hook panic strand every waiter on this flight.
-		func() {
-			defer func() { _ = recover() }()
-			after()
-		}()
-	}
-	close(call.done)
-}
-
-func (group *flightGroup) wait(ctx context.Context, key chunkFlightKey, call *flightCall) ([]byte, error) {
-	select {
-	case <-call.done:
-		return call.data, call.err
-	case <-ctx.Done():
-		group.mu.Lock()
-		if group.calls[key] == call && call.waiters > 0 {
-			call.waiters--
-			if call.waiters == 0 {
-				call.cancel()
-			}
-		}
-		group.mu.Unlock()
-		return nil, ctx.Err()
-	}
 }
 
 var _ io.ReaderAt = (*File)(nil)

@@ -18,6 +18,7 @@ env:
   MINIMUM_GO_VERSION: "1.25.12"
   GOVULNCHECK_VERSION: "v1.6.0"
   ACTIONLINT_VERSION: "v1.7.7"
+  STATICCHECK_VERSION: "v0.7.0"
   GOWORK: "off"
   GOFLAGS: "-mod=readonly"
 
@@ -280,6 +281,20 @@ jobs:
         run: |
           set -o pipefail
           go vet ./... 2>&1 | tee artifacts/vet.log
+      - name: Static analysis
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/s3disk-ci-staticcheck"
+          {
+            mkdir -p "$tool_dir"
+            (
+              cd "$RUNNER_TEMP"
+              GOFLAGS="" GOWORK=off GOTOOLCHAIN=local GOBIN="$tool_dir" go install \
+                "honnef.co/go/tools/cmd/staticcheck@$STATICCHECK_VERSION"
+            )
+            PATH="$tool_dir:$PATH" ./scripts/check-staticcheck.sh
+            git diff --exit-code -- go.mod go.sum
+          } 2>&1 | tee artifacts/staticcheck.log
       - name: Scan modules for known vulnerabilities
         run: |
           set -euo pipefail
@@ -403,6 +418,40 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  scale:
+    name: Deterministic workspace scale smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Run scale smoke profile
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          {
+            go version
+            go env GOOS GOARCH GOVERSION
+            uname -a
+          } 2>&1 | tee artifacts/scale-environment.log
+          ./scripts/test-scale.sh 2>&1 | tee artifacts/scale-profile.jsonl
+      - name: Archive scale evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: scale-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
   required-gate:
     name: Required CI gate
     if: always()
@@ -414,6 +463,7 @@ jobs:
       - quality
       - minio
       - model
+      - scale
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
@@ -427,6 +477,7 @@ jobs:
           QUALITY_RESULT: ${{ needs.quality.result }}
           MINIO_RESULT: ${{ needs.minio.result }}
           MODEL_RESULT: ${{ needs.model.result }}
+          SCALE_RESULT: ${{ needs.scale.result }}
         run: |
           set -euo pipefail
           require_success() {
@@ -444,3 +495,4 @@ jobs:
           require_success quality "$QUALITY_RESULT"
           require_success minio "$MINIO_RESULT"
           require_success model "$MODEL_RESULT"
+          require_success scale "$SCALE_RESULT"

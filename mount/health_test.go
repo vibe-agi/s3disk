@@ -326,12 +326,17 @@ func TestRefreshContextErrorIsFailureWhileMountContextIsLive(t *testing.T) {
 				userError: func(err error) { reported <- err },
 			}
 			operationErr := fmt.Errorf("store request failed: %w", sentinel)
+			mounted.recordRefreshAttempt()
+			attemptStarted := mounted.Status().Refresh.LastAttempt
 			mounted.handleRefreshFailure(pollContext, operationErr)
 
 			status := mounted.Status()
 			if status.Refresh.ConsecutiveFailures != 1 || status.Refresh.LastAttempt.IsZero() ||
 				!strings.Contains(status.Refresh.LastError, "store request failed") {
 				t.Fatalf("refresh failure status = %+v", status.Refresh)
+			}
+			if status.Refresh.LastAttempt != attemptStarted {
+				t.Fatalf("refresh completion replaced attempt-start timestamp: started=%v status=%+v", attemptStarted, status.Refresh)
 			}
 			if status.Healthy() {
 				t.Fatal("mount remained healthy after an operation-level context failure")
@@ -439,6 +444,9 @@ func TestNormalizeOptionsBoundsAutomaticUnmountTimeout(t *testing.T) {
 	}
 	if normalized.AutoUnmountTimeout != DefaultAutoUnmountTimeout {
 		t.Fatalf("default automatic unmount timeout = %v, want %v", normalized.AutoUnmountTimeout, DefaultAutoUnmountTimeout)
+	}
+	if normalized.Poll.AttemptTimeout != s3disk.DefaultPollAttemptTimeout {
+		t.Fatalf("default poll attempt timeout = %v, want %v", normalized.Poll.AttemptTimeout, s3disk.DefaultPollAttemptTimeout)
 	}
 }
 

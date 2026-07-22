@@ -4,8 +4,9 @@ import "errors"
 
 const (
 	// DefaultMaxInodeIdentities bounds the exact, collision-free stable inode
-	// registry. One identity is consumed for each snapshot/path/type tuple ever
-	// materialized during a mount lifetime.
+	// registry. One identity is consumed for each currently reachable
+	// snapshot/path/type tuple; kernel FORGET events reclaim unreachable tuples
+	// without reusing their inode numbers.
 	DefaultMaxInodeIdentities = 1_000_000
 	// MaxInodeIdentitiesLimit prevents a configuration typo from authorizing an
 	// effectively unbounded map. Products needing a larger namespace should
@@ -13,7 +14,7 @@ const (
 	MaxInodeIdentitiesLimit = 10_000_000
 	// DefaultMaxInodeIdentityBytes is the finite retained-memory budget for the
 	// exact inode identity registry. The registry charges a conservative
-	// estimate for every unique snapshot/path/type tuple.
+	// estimate for every currently remembered snapshot/path/type tuple.
 	DefaultMaxInodeIdentityBytes int64 = 256 << 20
 	// MaxInodeIdentityBytesLimit prevents a configuration typo from authorizing
 	// an effectively unbounded registry. Larger products should shard mounts
@@ -58,8 +59,9 @@ var ErrSymlinkPreserveUnsafe = errors.New("s3disk mount: SymlinkPreserve is unsa
 var ErrAuthorizationExpired = errors.New("s3disk mount: read authorization expired")
 
 // ErrInodeIdentityLimit reports that a mount has exceeded either the count or
-// conservative retained-byte bound for distinct (snapshot, path, type)
-// identities. The mount fails the new lookup instead of allocating an
+// conservative retained-byte bound for currently remembered (snapshot, path,
+// type) identities. The mount fails the new lookup instead of allocating an
 // unbounded identity map or reusing an inode number while an older snapshot
-// inode may still be live.
+// inode may still be live. Kernel FORGET events can release the retained map
+// entry and budget, but never make its inode number reusable.
 var ErrInodeIdentityLimit = errors.New("s3disk mount: inode identity limit reached")

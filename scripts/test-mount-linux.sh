@@ -16,3 +16,6 @@ cd "$project_dir"
 
 S3DISK_REQUIRE_FUSE=1 ./scripts/run-required-go-test.sh \
   ./mount TestLinuxMountRefreshAndSnapshotPinning 45s integration
+
+S3DISK_REQUIRE_FUSE=1 ./scripts/run-required-go-test.sh \
+  ./internal/cli TestLinuxMountSetSupervisesTwoRealFUSEMounts 45s integration

@@ -789,5 +789,27 @@ func (publisher *Publisher) commitSignedPublication(ctx context.Context, staged 
 	if recovery.Outcome == PublicationRecoveryApplied && recovery.IntentID == intent.IntentID {
 		return staged.snapshot, nil
 	}
+	if recovery.Outcome == PublicationRecoveryNone {
+		// A cooperating publisher sharing the durable journal drove this exact
+		// pending intent to the remote and cleared pending before recovery ran,
+		// so RecoverPublication reported None (it has no intent to classify
+		// against). Resolve the current committed reference against our intent
+		// the same way the begin-CAS-conflict branch does, so an already-applied
+		// publication is not misreported as a conflict. A genuinely competing
+		// winner classifies as Superseded and still returns ErrPublishConflict.
+		loaded, _, found, loadErr := publisher.loadPublicationJournal(ctx, staged.channel)
+		if loadErr != nil {
+			return Snapshot{}, loadErr
+		}
+		if found {
+			resolved, resolveErr := publisher.classifyResolvedPublication(ctx, staged.channel, intent, loaded.Committed)
+			if resolveErr != nil {
+				return Snapshot{}, resolveErr
+			}
+			if resolved.Outcome == PublicationRecoveryApplied {
+				return staged.snapshot, nil
+			}
+		}
+	}
 	return Snapshot{}, ErrPublishConflict
 }

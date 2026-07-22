@@ -86,6 +86,9 @@ func (store *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (s
 	if err := ctx.Err(); err != nil {
 		return s3disk.Version{}, err
 	}
+	if err := checkObjectSize(data); err != nil {
+		return s3disk.Version{}, err
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if _, exists := store.objects[key]; exists {
@@ -96,6 +99,9 @@ func (store *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (s
 
 func (store *Store) CompareAndSwap(ctx context.Context, key string, expected *s3disk.Version, data []byte) (s3disk.Version, error) {
 	if err := ctx.Err(); err != nil {
+		return s3disk.Version{}, err
+	}
+	if err := checkObjectSize(data); err != nil {
 		return s3disk.Version{}, err
 	}
 	store.mu.Lock()
@@ -123,6 +129,18 @@ func (store *Store) Delete(ctx context.Context, key string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	delete(store.objects, key)
+	return nil
+}
+
+// maxObjectBytes mirrors the s3store adapter's protocolMaxObjectBytes so this
+// in-memory double rejects oversized writes with the same ErrResourceLimit the
+// real Store returns. ForcePut intentionally bypasses this for fault injection.
+const maxObjectBytes = s3disk.ClientEncryptionMaxPlaintextBytes + s3disk.ClientEncryptionCiphertextOverhead
+
+func checkObjectSize(data []byte) error {
+	if int64(len(data)) > maxObjectBytes {
+		return fmt.Errorf("%w: memstore object exceeds %d bytes", s3disk.ErrResourceLimit, maxObjectBytes)
+	}
 	return nil
 }
 

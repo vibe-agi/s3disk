@@ -3,6 +3,8 @@ package mount
 import (
 	"fmt"
 	"time"
+
+	"github.com/vibe-agi/s3disk"
 )
 
 // normalizeOptions is shared by native and unsupported platforms so invalid
@@ -13,6 +15,9 @@ func normalizeOptions(options Options) (Options, error) {
 	}
 	if err := options.Poll.Validate(); err != nil {
 		return Options{}, fmt.Errorf("s3disk mount: invalid poll options: %w", err)
+	}
+	if options.Poll.AttemptTimeout == 0 {
+		options.Poll.AttemptTimeout = s3disk.DefaultPollAttemptTimeout
 	}
 	for _, ttl := range []struct {
 		name  string

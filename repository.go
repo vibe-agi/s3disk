@@ -304,10 +304,6 @@ func (repository *Repository) getManifest(ctx context.Context, kind string, dige
 	return decodeJSON(data, value)
 }
 
-func (repository *Repository) getReference(ctx context.Context, channel string, ifNoneMatch string) (snapshotReference, Object, error) {
-	return repository.getReferenceWithVerifier(ctx, channel, ifNoneMatch, nil)
-}
-
 func (repository *Repository) getReferenceWithVerifier(ctx context.Context, channel string, ifNoneMatch string, verifier ReferenceVerifier) (snapshotReference, Object, error) {
 	if verifier != nil && !interfaceDependencyConfigured(verifier) {
 		return snapshotReference{}, Object{}, fmt.Errorf("s3disk: reference verifier must not be a typed nil")

@@ -14,17 +14,53 @@ import (
 	"github.com/spf13/pflag"
 )
 
-func TestCommandTreeHasCommercialEntryPoints(t *testing.T) {
+func TestCommandTreeHasProductEntryPoints(t *testing.T) {
 	root := NewRootCommand(Dependencies{
 		Publish: func(context.Context, PublishOptions) error { return nil },
 		Mount:   func(context.Context, MountOptions) error { return nil },
-		Doctor:  func(context.Context, DoctorOptions, io.Writer) error { return nil },
+		MountSet: func(context.Context, MountSetOptions) error {
+			return nil
+		},
+		Doctor: func(context.Context, DoctorOptions, io.Writer) error { return nil },
 	})
-	for _, path := range [][]string{{"share", "publish"}, {"share", "resume"}, {"mount"}, {"s3", "doctor"}} {
+	for _, path := range [][]string{{"share", "publish"}, {"share", "resume"}, {"mount"}, {"mount-set"}, {"s3", "doctor"}} {
 		command, _, err := root.Find(path)
 		if err != nil || command == nil || command.CommandPath() != "s3disk "+strings.Join(path, " ") {
 			t.Fatalf("missing command %q: command=%v err=%v", strings.Join(path, " "), command, err)
 		}
+	}
+}
+
+func TestMountSetCommandPassesOnlyPrivateConfigAndOutput(t *testing.T) {
+	wantErr := errors.New("stop")
+	var observed MountSetOptions
+	root := NewRootCommand(Dependencies{MountSet: func(_ context.Context, options MountSetOptions) error {
+		observed = options
+		return wantErr
+	}})
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"mount-set", "--config", "/private/mounts.json"})
+	if err := root.ExecuteContext(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v", err)
+	}
+	if observed.ConfigPath != "/private/mounts.json" ||
+		observed.StatusWriter != &stdout || observed.ErrorWriter != &stderr {
+		t.Fatalf("unexpected mount-set options: %#v", observed)
+	}
+}
+
+func TestRootCommandReportsBuildVersion(t *testing.T) {
+	root := NewRootCommand(Dependencies{Version: "v0.1.0-test"})
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetArgs([]string{"--version"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "s3disk version v0.1.0-test\n"; got != want {
+		t.Fatalf("version output = %q, want %q", got, want)
 	}
 }
 
@@ -128,7 +164,7 @@ func TestMountCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
 	root.SetErr(&stderr)
 	root.SetArgs([]string{
 		"mount", "--handoff", "/private/share.json", "--mountpoint", "/mnt/share", "--state-dir", "/state",
-		"--cache-dir", "/cache", "--poll-interval", "750ms",
+		"--cache-dir", "/cache", "--poll-interval", "750ms", "--poll-timeout", "45s",
 	})
 	err := root.ExecuteContext(context.Background())
 	if !errors.Is(err, wantErr) {
@@ -136,6 +172,7 @@ func TestMountCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
 	}
 	if observed.HandoffPath != "/private/share.json" || observed.Mountpoint != "/mnt/share" ||
 		observed.StateDir != "/state" || observed.CacheDir != "/cache" || observed.PollInterval != 750*time.Millisecond ||
+		observed.PollTimeout != 45*time.Second ||
 		observed.ErrorWriter != &stderr {
 		t.Fatalf("unexpected mount options: %#v", observed)
 	}

@@ -668,15 +668,11 @@ func publicationJournalStateFromFile(disk publicationJournalFile) PublicationJou
 }
 
 func publicationJournalWatermarkToFile(watermark Watermark) publicationJournalWatermark {
-	return publicationJournalWatermark{
-		RepositoryID: watermark.RepositoryID, Generation: watermark.Generation, Commit: watermark.Commit,
-	}
+	return publicationJournalWatermark(watermark)
 }
 
 func publicationJournalWatermarkFromFile(watermark publicationJournalWatermark) Watermark {
-	return Watermark{
-		RepositoryID: watermark.RepositoryID, Generation: watermark.Generation, Commit: watermark.Commit,
-	}
+	return Watermark(watermark)
 }
 
 func publicationJournalWatermarkPointerToFile(watermark *Watermark) *publicationJournalWatermark {

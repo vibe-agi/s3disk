@@ -361,9 +361,11 @@ func TestReaderBuildsDirectLockedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Reader transport = %T, want *http.Transport", reader.client.Transport)
 	}
+	//lint:ignore SA1019 Deprecated dialer fields must remain empty on the constructed transport.
+	legacyDialerConfigured := transport.Dial != nil || transport.DialTLS != nil
 	if transport.Proxy != nil || transport.OnProxyConnectResponse != nil ||
-		transport.DialContext == nil || transport.Dial != nil ||
-		transport.DialTLSContext != nil || transport.DialTLS != nil ||
+		transport.DialContext == nil || transport.DialTLSContext != nil ||
+		legacyDialerConfigured ||
 		transport.TLSNextProto != nil || transport.ProxyConnectHeader != nil ||
 		transport.GetProxyConnectHeader != nil || transport.Protocols != nil {
 		t.Fatal("Reader retained a caller-controlled routing or alternate-protocol extension")

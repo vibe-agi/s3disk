@@ -468,9 +468,11 @@ func TestFileSealedStateStoreLimitsCancellationAndDiagnostics(t *testing.T) {
 	if _, err := store.CompareAndSwap(canceled, nil, []byte("secret-state")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled CAS error = %v", err)
 	}
+	//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
 	if _, _, _, err := store.Load(nil); err == nil {
 		t.Fatal("Load accepted nil context")
 	}
+	//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
 	if _, err := store.CompareAndSwap(nil, nil, nil); err == nil {
 		t.Fatal("CompareAndSwap accepted nil context")
 	}

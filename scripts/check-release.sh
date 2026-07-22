@@ -62,10 +62,11 @@ require_clean_tree() {
 }
 
 for required_file in \
-  LICENSE NOTICE README.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md \
+  LICENSE NOTICE README.md SUPPORT.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md \
   docs/COMPATIBILITY.md docs/COMMERCIAL_RELEASE.md .github/CODEOWNERS \
   .github/workflows/ci.yml .github/workflows/dco.yml \
-  scripts/check-dco.sh scripts/test-dco.sh
+  scripts/check-dco.sh scripts/check-staticcheck.sh scripts/test-dco.sh \
+  scripts/test-scale.sh
 do
   [ -s "$required_file" ] || fail "missing or empty $required_file"
 done
@@ -200,9 +201,12 @@ printf '%s\n' "$actionlint_version" | rg --quiet '(^|[[:space:]@])1\.7\.7($|[[:s
   fail "use reviewed actionlint v1.7.7"
 actionlint -color=false
 
+./scripts/check-staticcheck.sh
+
 go test ./... -count=1 -timeout=90s
 go test -race ./... -count=1 -timeout=180s
 go vet ./...
+./scripts/test-scale.sh
 
 [ "$(go env GOOS)" = linux ] || fail "the commercial release gate must run on Linux for the FUSE E2E test"
 ./scripts/test-mount-linux.sh

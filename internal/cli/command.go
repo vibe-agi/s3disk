@@ -23,15 +23,18 @@ const (
 	defaultRegion       = "us-east-1"
 	defaultShareExpiry  = 2 * time.Hour
 	defaultPollInterval = time.Second
+	defaultPollTimeout  = 2 * time.Minute
 )
 
 // Dependencies makes every command path testable without network or FUSE I/O.
 // A nil function selects the production implementation.
 type Dependencies struct {
+	Version             string
 	Publish             func(context.Context, PublishOptions) error
 	Resume              func(context.Context, ResumeOptions) error
 	GenerateRecoveryKey func(context.Context, RecoveryKeyGenerateOptions) error
 	Mount               func(context.Context, MountOptions) error
+	MountSet            func(context.Context, MountSetOptions) error
 	Doctor              func(context.Context, DoctorOptions, io.Writer) error
 }
 
@@ -71,6 +74,13 @@ type MountOptions struct {
 	StateDir     string
 	CacheDir     string
 	PollInterval time.Duration
+	PollTimeout  time.Duration
+	StatusWriter io.Writer
+	ErrorWriter  io.Writer
+}
+
+type MountSetOptions struct {
+	ConfigPath   string
 	StatusWriter io.Writer
 	ErrorWriter  io.Writer
 }
@@ -108,6 +118,9 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	if dependencies.Mount == nil {
 		dependencies.Mount = runMount
 	}
+	if dependencies.MountSet == nil {
+		dependencies.MountSet = runMountSet
+	}
 	if dependencies.Doctor == nil {
 		dependencies.Doctor = runDoctor
 	}
@@ -115,6 +128,7 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:           "s3disk",
 		Short:         "Share a directory through S3 as a lazy read-only mount",
+		Version:       strings.TrimSpace(dependencies.Version),
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
@@ -123,7 +137,12 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	command.SetFlagErrorFunc(func(command *cobra.Command, err error) error {
 		return fmt.Errorf("%s: %w", command.CommandPath(), err)
 	})
-	command.AddCommand(newShareCommand(dependencies), newMountCommand(dependencies), newS3Command(dependencies))
+	command.AddCommand(
+		newShareCommand(dependencies),
+		newMountCommand(dependencies),
+		newMountSetCommand(dependencies),
+		newS3Command(dependencies),
+	)
 	return command
 }
 
@@ -243,6 +262,26 @@ func newMountCommand(dependencies Dependencies) *cobra.Command {
 	flags.StringVar(&options.StateDir, "state-dir", "", "private durable anti-rollback state directory on B")
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "private lazy block cache base (defaults below state-dir)")
 	flags.DurationVar(&options.PollInterval, "poll-interval", defaultPollInterval, "S3 root refresh interval")
+	flags.DurationVar(&options.PollTimeout, "poll-timeout", defaultPollTimeout, "maximum time for one complete S3 refresh")
+	return command
+}
+
+func newMountSetCommand(dependencies Dependencies) *cobra.Command {
+	options := MountSetOptions{}
+	command := &cobra.Command{
+		Use:   "mount-set",
+		Short: "Supervise several independent read-only workspace mounts",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if strings.TrimSpace(options.ConfigPath) == "" {
+				return errors.New("s3disk mount-set: --config is required")
+			}
+			options.StatusWriter = command.OutOrStdout()
+			options.ErrorWriter = command.ErrOrStderr()
+			return dependencies.MountSet(command.Context(), options)
+		},
+	}
+	command.Flags().StringVar(&options.ConfigPath, "config", "", "private 0600 JSON mount-set configuration")
 	return command
 }
 
@@ -391,6 +430,12 @@ func validateMountOptions(options *MountOptions) error {
 	if options.PollInterval < 100*time.Millisecond || options.PollInterval > 5*time.Minute {
 		return errors.New("s3disk mount: --poll-interval must be between 100ms and 5m")
 	}
+	if options.PollTimeout == 0 {
+		options.PollTimeout = defaultPollTimeout
+	}
+	if options.PollTimeout < time.Second || options.PollTimeout > presignedshare.MaximumOperationTimeout {
+		return fmt.Errorf("s3disk mount: --poll-timeout must be between 1s and %s", presignedshare.MaximumOperationTimeout)
+	}
 	if pathsOverlap(options.StateDir, options.Mountpoint) {
 		return errors.New("s3disk mount: --state-dir and --mountpoint must not contain one another")
 	}
@@ -505,7 +550,13 @@ func pathWithin(candidate, directory string) bool {
 }
 
 func ExecuteContext(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
-	command := NewRootCommand(Dependencies{})
+	return ExecuteContextWithVersion(ctx, arguments, stdout, stderr, "development")
+}
+
+// ExecuteContextWithVersion runs the CLI with the build version exposed through
+// Cobra's standard --version flag. Release builds inject the tag at link time.
+func ExecuteContextWithVersion(ctx context.Context, arguments []string, stdout, stderr io.Writer, version string) error {
+	command := NewRootCommand(Dependencies{Version: version})
 	command.SetArgs(arguments)
 	command.SetOut(stdout)
 	command.SetErr(stderr)

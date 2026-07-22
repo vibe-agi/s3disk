@@ -267,7 +267,6 @@ func TestExpectedBucketOwnerValidation(t *testing.T) {
 }
 
 type ownerCapturingAPI struct {
-	api
 	getOwner    string
 	headOwner   string
 	putOwner    string

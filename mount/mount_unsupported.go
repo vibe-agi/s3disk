@@ -28,8 +28,8 @@ type Options struct {
 	// reject it because it cannot preserve snapshot-pinned handle semantics.
 	KernelCache    bool
 	FilesystemName string
-	// MaxInodeIdentities bounds generation-specific inode identities on native
-	// adapters. Zero selects DefaultMaxInodeIdentities.
+	// MaxInodeIdentities bounds currently remembered generation-specific inode
+	// identities on native adapters. Zero selects DefaultMaxInodeIdentities.
 	MaxInodeIdentities int
 	// MaxInodeIdentityBytes bounds the conservative retained-memory charge for
 	// native adapters. Zero selects DefaultMaxInodeIdentityBytes.

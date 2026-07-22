@@ -777,8 +777,8 @@ func lockedDirectTransport(source *http.Transport, tlsRootCAPEM []byte) (*http.T
 	var configuredTLS *tls.Config
 	if source != nil {
 		if source.Proxy != nil || source.OnProxyConnectResponse != nil ||
-			source.DialContext != nil || source.Dial != nil ||
-			source.DialTLSContext != nil || source.DialTLS != nil ||
+			source.DialContext != nil || source.DialTLSContext != nil ||
+			legacyTransportDialersConfigured(source) ||
 			source.TLSNextProto != nil || source.ProxyConnectHeader != nil ||
 			source.GetProxyConnectHeader != nil || source.Protocols != nil {
 			return nil, fmt.Errorf("presignedshare: HTTP transport routing and protocol extensions are forbidden")
@@ -838,16 +838,16 @@ func lockedTLSClientConfig(source *tls.Config, tlsRootCAPEM []byte) (*tls.Config
 	result := &tls.Config{MinVersion: tls.VersionTLS12}
 	if source != nil && (source.InsecureSkipVerify || source.ServerName != "" ||
 		source.Rand != nil || source.Time != nil ||
-		len(source.Certificates) != 0 || source.NameToCertificate != nil ||
+		len(source.Certificates) != 0 ||
 		source.GetCertificate != nil || source.GetClientCertificate != nil || source.GetConfigForClient != nil ||
 		source.VerifyPeerCertificate != nil || source.VerifyConnection != nil ||
 		!standardLibraryALPN(source.NextProtos) || source.ClientAuth != tls.NoClientCert || source.ClientCAs != nil || source.RootCAs != nil ||
 		source.ClientSessionCache != nil || source.UnwrapSession != nil || source.WrapSession != nil ||
 		source.Renegotiation != tls.RenegotiateNever || source.KeyLogWriter != nil ||
-		len(source.CipherSuites) != 0 || source.PreferServerCipherSuites || len(source.CurvePreferences) != 0 ||
+		len(source.CipherSuites) != 0 || len(source.CurvePreferences) != 0 ||
 		len(source.EncryptedClientHelloConfigList) != 0 || source.EncryptedClientHelloRejectionVerify != nil ||
 		source.GetEncryptedClientHelloKeys != nil || len(source.EncryptedClientHelloKeys) != 0 ||
-		source.SessionTicketKey != [32]byte{}) {
+		legacyTLSClientSettingsConfigured(source)) {
 		return nil, fmt.Errorf("presignedshare: custom TLS identity, algorithms, callbacks, or secret logging are forbidden")
 	}
 	if source != nil && source.MinVersion != 0 {
@@ -872,6 +872,16 @@ func lockedTLSClientConfig(source *tls.Config, tlsRootCAPEM []byte) (*tls.Config
 		result.DynamicRecordSizingDisabled = source.DynamicRecordSizingDisabled
 	}
 	return result, nil
+}
+
+func legacyTransportDialersConfigured(source *http.Transport) bool {
+	//lint:ignore SA1019 Deprecated dialer fields remain security-relevant inputs and must be rejected.
+	return source.Dial != nil || source.DialTLS != nil
+}
+
+func legacyTLSClientSettingsConfigured(source *tls.Config) bool {
+	//lint:ignore SA1019 Deprecated TLS fields remain security-relevant inputs and must be rejected.
+	return source.NameToCertificate != nil || source.PreferServerCipherSuites || source.SessionTicketKey != [32]byte{}
 }
 
 func standardLibraryALPN(nextProtos []string) bool {

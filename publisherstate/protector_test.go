@@ -177,9 +177,11 @@ func TestAESGCMProtectorBoundsInputsAndHonorsCancellation(t *testing.T) {
 	if _, err := protector.Open(canceled, binding, valid); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Open error = %v", err)
 	}
+	//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
 	if _, err := protector.Seal(nil, binding, []byte("secret")); err == nil {
 		t.Fatal("Seal accepted a nil context")
 	}
+	//lint:ignore SA1012 This deliberately verifies the public nil-context guard.
 	if _, err := protector.Open(nil, binding, valid); err == nil {
 		t.Fatal("Open accepted a nil context")
 	}

@@ -32,7 +32,7 @@ func TestLinuxMinIOFUSEEndToEnd(t *testing.T) {
 	endpoint := os.Getenv("S3DISK_TEST_S3_ENDPOINT")
 	if endpoint == "" {
 		if os.Getenv("S3DISK_REQUIRE_FUSE") == "1" {
-			t.Fatal("S3DISK_TEST_S3_ENDPOINT is required for the commercial MinIO/FUSE gate")
+			t.Fatal("S3DISK_TEST_S3_ENDPOINT is required for the Linux MinIO/FUSE gate")
 		}
 		t.Skip("S3DISK_TEST_S3_ENDPOINT is not set")
 	}
@@ -270,6 +270,9 @@ func TestLinuxMountRefreshAndSnapshotPinning(t *testing.T) {
 	mounted, err := mount.ReadOnly(ctx, consumer, mountpoint, mount.Options{
 		Debug:   os.Getenv("S3DISK_TEST_FUSE_DEBUG") == "1",
 		AttrTTL: 50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
+		// The test materializes more than four generation/path identities. It can
+		// finish only if kernel FORGET events reclaim obsolete registry entries.
+		MaxInodeIdentities: 4,
 		// Missing names are deliberately not cached. Linux reverse invalidation
 		// is only an optimization; correctness must survive kernels which answer
 		// a negative-dentry notification with ENOENT without evicting it.
@@ -370,6 +373,9 @@ func TestLinuxMountRefreshAndSnapshotPinning(t *testing.T) {
 	waitForMissing(t, ctx, mountedPath)
 	waitForFile(t, ctx, renamedPath, "final")
 	assertSamePinnedFileInfo(t, oldHandle, pinnedInfo, "after path deletion")
+	waitFor(t, ctx, func() bool {
+		return mounted.Status().InodeIdentitiesReclaimed >= 2
+	}, "mount to reclaim obsolete inode identities")
 }
 
 func assertSamePinnedFileInfo(t *testing.T, file *os.File, want os.FileInfo, phase string) {
@@ -563,7 +569,7 @@ func requireFUSE(t *testing.T) {
 		err = fmt.Errorf("/dev/fuse is not a character device")
 	}
 	if os.Getenv("S3DISK_REQUIRE_FUSE") == "1" {
-		t.Fatalf("/dev/fuse is required for the commercial mount gate: %v", err)
+		t.Fatalf("/dev/fuse is required for the Linux mount gate: %v", err)
 	}
 	t.Skipf("/dev/fuse unavailable: %v", err)
 }

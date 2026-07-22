@@ -1,13 +1,18 @@
-# Commercial release gate
+# Optional supported-production certification
 
-This checklist is deliberately fail-closed. “The tests pass” is not sufficient
-for a storage component that handles customer source data.
+This checklist is deliberately fail-closed for a maintainer who chooses to
+represent a build as commercially supported or independently production
+certified. It is not required for an ordinary Apache-2.0 open-source tag, for a
+downstream user's deployment, or for the maintainer's own internal commercial
+product. Publishing source or binaries does not create an SLA or an obligation
+to deploy, operate, or support downstream installations.
 
-The project is open source under Apache-2.0, which permits commercial use under
-the license terms. This gate does not narrow that copyright permission; it
-defines the additional engineering, operational, support, and evidence bar for
-maintainers who represent a build as commercially supported or production
-ready.
+The Apache-2.0 license permits commercial use under its terms, but license
+permission is not production certification. Its warranty and liability
+disclaimer also does not replace engineering, operational, contractual, export,
+privacy, or product-counsel review chosen for a specific product. The
+`RELEASE-BLOCKER` markers below therefore block only this optional certification
+workflow; they do not block the open-source release workflow.
 
 ## Current blockers
 
@@ -204,7 +209,17 @@ ready.
   termination/restart have not been certified at those limits. Each adopted
   generation currently invalidates every materialized inode, including
   unchanged content, so large-tree inode churn and notification rate remain an
-  explicit scale-certification item.
+  explicit scale-certification item. Kernel `FORGET` now conditionally reclaims
+  obsolete exact identity mappings without reusing inode numbers, and the real
+  Linux FUSE gate exercises more cross-generation identities than its
+  deliberately tiny registry limit. This removes permanent historical-map
+  accumulation but does not establish how quickly each supported kernel emits
+  `FORGET` under large concurrent working sets. The deterministic checked-in
+  scale profile and bounded `mount-set` supervisor provide repeatable core
+  evidence and same-process orchestration, but neither is a multi-workspace
+  S3/FUSE soak result. Certification still requires the actual backend, kernel,
+  directory shape, churn, expiry, partial-failure, and service-manager restart
+  matrix.
 
 <!-- RELEASE-BLOCKER: disaster-recovery-operations -->
 
@@ -242,7 +257,7 @@ accept or resolve each one explicitly.
 
 - Use a fresh disposable VM/JIT runner from a reviewed release-runner image
   containing Go, POSIX shell tools, coreutils, `jq`, ripgrep, `govulncheck`,
-  rootless Docker with Compose v2, Java, curl, and `shasum`.
+  `staticcheck`, rootless Docker with Compose v2, Java, curl, and `shasum`.
   Pin and inventory that image; do not install unpinned tools during a release.
   Never reuse the worker or give candidate code a host/shared Docker socket.
   Start the fixture with an isolated rootless daemon or an external trusted
@@ -250,6 +265,15 @@ accept or resolve each one explicitly.
 - The checked-in scanner baseline is `govulncheck v1.6.0`. Its vulnerability
   database is retrieved at scan time; archive the scanner and database metadata
   printed by the gate with the release evidence.
+- The checked-in static-analysis baseline is `staticcheck 2026.1 (v0.7.0)`.
+  The gate verifies the command version plus its Go package path, module
+  version, and module checksum before analyzing every package. Evidence also
+  records the complete Go build information and the executable's SHA-256, so
+  the release archive binds the scan to the exact runner binary.
+- The formal-model baseline is stable `tla2tools.jar` v1.7.4 with its checked-in
+  SHA-256. Do not point the gate at the upstream v1.8.0 rolling prerelease: that
+  release asset is replaced on master builds and is not a reproducible tool
+  input. Archive the verified JAR with release evidence.
 - Pin a currently supported Go toolchain at its latest security patch. The
   current baseline is `go1.26.5`; update the checked-in gate after every Go
   security release rather than overriding it in the environment. Release jobs
