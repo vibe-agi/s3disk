@@ -189,7 +189,8 @@ func TestUnsafeSymlinkRequiresExplicitPreservePolicy(t *testing.T) {
 	ctx := context.Background()
 	source := privateTestDirectory(t)
 	link := filepath.Join(source, "escape")
-	if err := os.Symlink("../../outside", link); err != nil {
+	unsafeTarget := filepath.Join("..", "..", "outside")
+	if err := os.Symlink(unsafeTarget, link); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 	store := memstore.New()
@@ -230,7 +231,7 @@ func TestUnsafeSymlinkRequiresExplicitPreservePolicy(t *testing.T) {
 	if _, err := preserveConsumer.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if target, err := preserveConsumer.Readlink(ctx, "escape"); err != nil || target != "../../outside" {
+	if target, err := preserveConsumer.Readlink(ctx, "escape"); err != nil || target != unsafeTarget {
 		t.Fatalf("preserved Readlink = %q, %v", target, err)
 	}
 }

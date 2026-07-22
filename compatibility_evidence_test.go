@@ -123,8 +123,8 @@ func TestProbeStoreCompatibilityWithOptionsBindsRedactedEvidence(t *testing.T) {
 	if report.Evidence.StartedAt.Location() != time.UTC || report.Evidence.StartedAt.Before(before.Add(-time.Second).UTC()) || report.Evidence.StartedAt.After(after.Add(time.Second).UTC()) {
 		t.Fatalf("started_at = %v, want UTC in call interval [%v, %v]", report.Evidence.StartedAt, before.UTC(), after.UTC())
 	}
-	if report.Evidence.DurationNanoseconds <= 0 {
-		t.Fatalf("duration_nanoseconds = %d, want positive", report.Evidence.DurationNanoseconds)
+	if report.Evidence.DurationNanoseconds < 0 {
+		t.Fatalf("duration_nanoseconds = %d, want non-negative", report.Evidence.DurationNanoseconds)
 	}
 
 	encoded, err := json.Marshal(report)

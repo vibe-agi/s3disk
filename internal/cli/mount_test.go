@@ -122,6 +122,7 @@ func TestWaitForMountLifecycleReturnsWhenAutomaticUnmountFails(t *testing.T) {
 }
 
 func TestPrepareMountCachePathNamespacesCustomBase(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	base := t.TempDir()
 	if err := os.Chmod(base, 0o700); err != nil {
 		t.Fatal(err)

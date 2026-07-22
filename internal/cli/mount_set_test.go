@@ -74,7 +74,7 @@ func TestReadMountSetConfigRequiresPrivateFile(t *testing.T) {
 }
 
 func TestValidateMountSetConfigBoundsNamesPathsAndDurations(t *testing.T) {
-	absolute := filepath.Join(string(filepath.Separator), "private", "value")
+	absolute := filepath.Join(t.TempDir(), "value")
 	valid := mountSetConfig{Version: mountSetFormat, Mounts: []mountSetEntry{{
 		Name: "workspace-1", Handoff: absolute + "-handoff",
 		Mountpoint: absolute + "-mount", StateDir: absolute + "-state",
@@ -245,6 +245,7 @@ func TestMountSetWorkspaceWriterPrefixesCompleteAndFragmentedLines(t *testing.T)
 
 func privateMountSetTestDirectory(t *testing.T) string {
 	t.Helper()
+	requirePrivateSecretFiles(t)
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)

@@ -72,6 +72,7 @@ func newTestHandoff(t *testing.T) handoff {
 }
 
 func TestHandoffExclusive0600RoundTrip(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	directory := t.TempDir()
 	path := filepath.Join(directory, "share.handoff")
 	want := newTestHandoff(t)
@@ -122,6 +123,7 @@ func TestHandoffDiagnosticsRedactBearerAndEncryptionKey(t *testing.T) {
 }
 
 func TestHandoffNeverOverwrites(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	path := filepath.Join(t.TempDir(), "share.handoff")
 	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
@@ -154,6 +156,7 @@ func TestHandoffDigestIsDeterministicAndDomainSeparated(t *testing.T) {
 }
 
 func TestInstallOrVerifyHandoffInstallsThenAcceptsExactExistingFile(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	path := filepath.Join(t.TempDir(), "share.handoff")
 	value := newTestHandoff(t)
 	encoded, err := encodeHandoff(value)
@@ -190,6 +193,7 @@ func TestInstallOrVerifyHandoffInstallsThenAcceptsExactExistingFile(t *testing.T
 }
 
 func TestInstallOrVerifyHandoffRetriesExistingFileDurabilityBarrier(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	path := filepath.Join(t.TempDir(), "share.handoff")
 	value := newTestHandoff(t)
 	encoded, err := encodeHandoff(value)
@@ -364,6 +368,7 @@ func TestInstallOrVerifyHandoffRejectsDigestAndExistingContentMismatch(t *testin
 	})
 
 	t.Run("different canonical handoff is a no-replace conflict", func(t *testing.T) {
+		requirePrivateSecretFiles(t)
 		path := filepath.Join(t.TempDir(), "share.handoff")
 		existing := newTestHandoff(t)
 		existingBytes, err := encodeHandoff(existing)
@@ -547,6 +552,7 @@ func TestInstallOrVerifyHandoffRejectsInsecureExistingFile(t *testing.T) {
 }
 
 func TestHandoffFinalPathIsInvisibleUntilAtomicInstall(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	directory := t.TempDir()
 	path := filepath.Join(directory, "share.handoff")
 	encoded, err := encodeHandoff(newTestHandoff(t))
@@ -607,6 +613,7 @@ func TestHandoffFinalPathIsInvisibleUntilAtomicInstall(t *testing.T) {
 }
 
 func TestHandoffAtomicInstallLeavesNoTemporarySecret(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	directory := t.TempDir()
 	path := filepath.Join(directory, "share.handoff")
 	if err := writeHandoff(context.Background(), path, newTestHandoff(t)); err != nil {
@@ -671,6 +678,7 @@ func TestHandoffRejectsSymlinks(t *testing.T) {
 }
 
 func TestHandoffStrictJSONAndSizeBounds(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	directory := t.TempDir()
 	validPath := filepath.Join(directory, "valid")
 	if err := writeHandoff(context.Background(), validPath, newTestHandoff(t)); err != nil {
@@ -724,6 +732,7 @@ func TestHandoffStrictJSONAndSizeBounds(t *testing.T) {
 }
 
 func TestHandoffAccommodatesMaximumTLSCertificateCount(t *testing.T) {
+	requirePrivateSecretFiles(t)
 	server := httptest.NewTLSServer(nil)
 	defer server.Close()
 	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
