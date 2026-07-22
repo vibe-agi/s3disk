@@ -164,7 +164,7 @@ func TestMountCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
 	root.SetErr(&stderr)
 	root.SetArgs([]string{
 		"mount", "--handoff", "/private/share.json", "--mountpoint", "/mnt/share", "--state-dir", "/state",
-		"--cache-dir", "/cache", "--poll-interval", "750ms", "--poll-timeout", "45s",
+		"--cache-dir", "/cache", "--macos-backend", "fskit", "--poll-interval", "750ms", "--poll-timeout", "45s",
 	})
 	err := root.ExecuteContext(context.Background())
 	if !errors.Is(err, wantErr) {
@@ -172,6 +172,7 @@ func TestMountCommandPassesOnlyHandoffAndLocalOptions(t *testing.T) {
 	}
 	if observed.HandoffPath != "/private/share.json" || observed.Mountpoint != "/mnt/share" ||
 		observed.StateDir != "/state" || observed.CacheDir != "/cache" || observed.PollInterval != 750*time.Millisecond ||
+		observed.MacOSBackend != "fskit" ||
 		observed.PollTimeout != 45*time.Second ||
 		observed.ErrorWriter != &stderr {
 		t.Fatalf("unexpected mount options: %#v", observed)

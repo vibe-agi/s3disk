@@ -1,4 +1,4 @@
-//go:build integration && linux
+//go:build integration && (linux || darwin)
 
 package cli
 
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -15,10 +16,10 @@ import (
 	"github.com/vibe-agi/s3disk/mount"
 )
 
-// TestLinuxMountSetSupervisesTwoRealFUSEMounts proves that the same-process
+// TestMountSetSupervisesTwoRealFUSEMounts proves that the same-process
 // supervisor can keep two independent kernel mounts live concurrently and
 // waits for both automatic unmount lifecycles after graceful cancellation.
-func TestLinuxMountSetSupervisesTwoRealFUSEMounts(t *testing.T) {
+func TestMountSetSupervisesTwoRealFUSEMounts(t *testing.T) {
 	requireCLIFUSE(t)
 	testContext, stopTest := context.WithTimeout(context.Background(), 30*time.Second)
 	defer stopTest()
@@ -56,12 +57,13 @@ func TestLinuxMountSetSupervisesTwoRealFUSEMounts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		mountpoint := t.TempDir()
+		mountpoint := cliIntegrationMountpoint(t)
 		mountedFiles = append(mountedFiles, filepath.Join(mountpoint, "item"))
 		name := fmt.Sprintf("workspace-%d", index)
 		tasks = append(tasks, mountSetTask{name: name, run: func(ctx context.Context) error {
 			mounted, err := mount.ReadOnly(ctx, consumer, mountpoint, mount.Options{
-				AttrTTL: 50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
+				MacOSBackend: cliIntegrationMacOSBackend(t),
+				AttrTTL:      50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
 				Poll: s3disk.PollOptions{
 					Interval: 20 * time.Millisecond, MaxInterval: 200 * time.Millisecond,
 					JitterFraction: -1,
@@ -98,15 +100,78 @@ func TestLinuxMountSetSupervisesTwoRealFUSEMounts(t *testing.T) {
 
 func requireCLIFUSE(t *testing.T) {
 	t.Helper()
-	device, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
+	err := cliFUSERuntimeAvailable()
 	if err == nil {
-		_ = device.Close()
 		return
 	}
 	if os.Getenv("S3DISK_REQUIRE_FUSE") == "1" {
-		t.Fatalf("/dev/fuse is required for the Linux mount-set gate: %v", err)
+		t.Fatalf("FUSE runtime is required for the %s mount-set gate: %v", runtime.GOOS, err)
 	}
-	t.Skipf("/dev/fuse unavailable: %v", err)
+	t.Skipf("FUSE runtime unavailable on %s: %v", runtime.GOOS, err)
+}
+
+func cliIntegrationMacOSBackend(t *testing.T) mount.MacOSBackend {
+	t.Helper()
+	switch value := os.Getenv("S3DISK_TEST_MACOS_BACKEND"); value {
+	case "", "auto":
+		return mount.MacOSBackendAuto
+	case "vfs":
+		return mount.MacOSBackendVFS
+	case "fskit":
+		return mount.MacOSBackendFSKit
+	default:
+		t.Fatalf("invalid S3DISK_TEST_MACOS_BACKEND %q", value)
+		return mount.MacOSBackendAuto
+	}
+}
+
+func cliIntegrationMountpoint(t *testing.T) string {
+	t.Helper()
+	root := os.Getenv("S3DISK_TEST_MOUNT_ROOT")
+	if root == "" {
+		return t.TempDir()
+	}
+	if !filepath.IsAbs(root) {
+		t.Fatalf("S3DISK_TEST_MOUNT_ROOT must be absolute: %q", root)
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("S3DISK_TEST_MOUNT_ROOT is not an existing directory: %q: %v", root, err)
+	}
+	mountpoint, err := os.MkdirTemp(root, "s3disk-mount-set-")
+	if err != nil {
+		t.Fatalf("create integration mountpoint below %q: %v", root, err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(mountpoint); err != nil {
+			t.Errorf("remove integration mountpoint %q: %v", mountpoint, err)
+		}
+	})
+	return mountpoint
+}
+
+func cliFUSERuntimeAvailable() error {
+	switch runtime.GOOS {
+	case "linux":
+		device, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		return device.Close()
+	case "darwin":
+		for _, helper := range []string{
+			"/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
+			"/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
+		} {
+			info, err := os.Stat(helper)
+			if err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+				return nil
+			}
+		}
+		return fmt.Errorf("no executable macFUSE mount helper found below /Library/Filesystems")
+	default:
+		return fmt.Errorf("unsupported test platform %s", runtime.GOOS)
+	}
 }
 
 func waitForCLIFile(t *testing.T, ctx context.Context, supervisor <-chan error, path, want string) {

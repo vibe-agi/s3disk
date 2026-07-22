@@ -93,6 +93,7 @@ func TestValidateMountSetConfigBoundsNamesPathsAndDurations(t *testing.T) {
 		{name: "unsafe name", mutate: func(config *mountSetConfig) { config.Mounts[0].Name = "../workspace" }, want: "name is invalid"},
 		{name: "relative path", mutate: func(config *mountSetConfig) { config.Mounts[0].Handoff = "handoff.json" }, want: "must be absolute"},
 		{name: "short polling", mutate: func(config *mountSetConfig) { config.Mounts[0].PollInterval = "1ms" }, want: "poll-interval"},
+		{name: "macOS backend", mutate: func(config *mountSetConfig) { config.Mounts[0].MacOSBackend = "unknown" }, want: "--macos-backend"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := valid

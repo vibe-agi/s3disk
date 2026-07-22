@@ -117,15 +117,17 @@ workflow; they do not block the open-source release workflow.
 
 <!-- RELEASE-BLOCKER: platform-release-evidence -->
 
-- A Linux `/dev/fuse` E2E test is now mandatory in the release gate, but it has
-  not yet produced archived evidence for a release candidate on every supported
-  kernel/distribution/architecture. An ad hoc ARM64 Raspberry Pi 5 run on Linux
+- Linux `/dev/fuse` and macOS macFUSE/FSKit E2E tests are mandatory platform
+  gates, but they have not yet produced archived evidence for a release
+  candidate on every supported kernel/distribution/architecture. An ad hoc
+  ARM64 Raspberry Pi 5 run on Linux
   `7.0.0-1011-raspi` passed core, low-FD traversal, MinIO, actual FUSE refresh,
   old-handle `fstat`, type-change, deletion, and missing-to-present tests on
   2026-07-18; that is useful regression evidence, not per-tag certification.
   The gate also verifies refreshed reads, not guaranteed inotify/VS Code
-  watcher events. macOS and Windows still lack commercially distributable
-  native adapters.
+  watcher events. macOS depends on a separately installed macFUSE runtime and
+  still needs per-product distribution/licensing and release evidence. Windows
+  still lacks a native adapter.
 
 <!-- RELEASE-BLOCKER: backend-fault-certification -->
 
@@ -416,14 +418,16 @@ accept or resolve each one explicitly.
   vulnerability result in CI. The fixture publishes MinIO on an OS-selected
   loopback port; keep that dynamic binding so parallel test jobs do not contend
   for a hard-coded port.
-- Preserve artifacts from the native Ubuntu/macOS/Windows tests, Linux
-  unit/race/vet/compliance job, MinIO integration, and TLA+ jobs configured in
-  `.github/workflows/ci.yml`. Preserve the full gate artifacts produced by
+- Preserve artifacts from the native Ubuntu/macOS/Windows tests, the macOS 26
+  macFUSE/FSKit mount gate, Linux unit/race/vet/compliance job, MinIO
+  integration, and TLA+ jobs configured in `.github/workflows/ci.yml`. Preserve
+  the full gate artifacts produced by
   `.github/workflows/release-linux.yml` on the reviewed owner-controlled
   `/dev/fuse` runner. Workflow presence or a green unrelated revision is not
   release evidence.
 - Preserve the mandatory `scripts/test-mount-linux.sh` result from a Linux
-  runner with `/dev/fuse`. Extend it with concurrent readers, forced
+  runner with `/dev/fuse` and `scripts/test-mount-macos.sh` from each shipped
+  macOS/architecture with the selected macFUSE backend. Extend them with forced
   termination/restart and clean unmount. Test IDE watcher behavior separately:
   FUSE invalidation freshness is not evidence of an inotify or VS Code event.
 - Test both default symlink rejection and any explicitly supported

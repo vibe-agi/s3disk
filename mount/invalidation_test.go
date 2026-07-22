@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,18 @@ func TestNormalizeOptionsRejectsNegativeTTLs(t *testing.T) {
 				t.Fatal("ReadOnly accepted a negative TTL")
 			}
 		})
+	}
+}
+
+func TestNormalizeOptionsRejectsInvalidMacOSBackend(t *testing.T) {
+	t.Parallel()
+	if _, err := normalizeOptions(Options{MacOSBackend: MacOSBackend("unknown")}); err == nil {
+		t.Fatal("normalizeOptions accepted an unknown macOS backend")
+	}
+	if runtime.GOOS != "darwin" {
+		if _, err := normalizeOptions(Options{MacOSBackend: MacOSBackendFSKit}); err == nil {
+			t.Fatal("normalizeOptions accepted a macOS backend on a non-Darwin host")
+		}
 	}
 }
 
@@ -496,8 +509,14 @@ func TestKernelPermissionChecksAreNotBypassed(t *testing.T) {
 	if _, implements := any(&node{}).(fs.NodeAccesser); implements {
 		t.Fatal("node implements Access and bypasses go-fuse's mode-based default")
 	}
-	if got, want := kernelMountOptions(), []string{"ro", "default_permissions"}; !reflect.DeepEqual(got, want) {
+	if got, want := kernelMountOptions(Options{}), []string{"ro", "default_permissions"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("kernel mount options = %v, want %v", got, want)
+	}
+	if runtime.GOOS == "darwin" {
+		if got, want := kernelMountOptions(Options{MacOSBackend: MacOSBackendFSKit}),
+			[]string{"ro", "default_permissions", "backend=fskit"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("FSKit mount options = %v, want %v", got, want)
+		}
 	}
 	options, err := normalizeOptions(Options{})
 	if err != nil {

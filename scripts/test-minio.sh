@@ -140,15 +140,15 @@ S3DISK_TEST_S3_ACCESS_KEY=s3disk \
 S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
 ./scripts/run-required-go-test.sh ./internal/cli TestMinIOCLIOneShotPublishAndResume 90s integration
 
-if [ "$(go env GOOS)" = linux ]; then
+if [ "$(go env GOOS)" = linux ] || [ "$(go env GOOS)" = darwin ]; then
   S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
   S3DISK_TEST_S3_ACCESS_KEY=s3disk \
   S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
-  ./scripts/run-required-go-test.sh ./mount TestLinuxMinIOFUSEEndToEnd 90s integration
+  ./scripts/run-required-go-test.sh ./mount TestMinIOFUSEEndToEnd 90s integration
 else
   if [ "${S3DISK_REQUIRE_FUSE:-0}" = 1 ]; then
-    echo "MinIO/FUSE integration requires a Linux host" >&2
+    echo "MinIO/FUSE integration requires a Linux or macOS host" >&2
     exit 1
   fi
-  echo "MinIO/FUSE integration skipped: Linux is required"
+  echo "MinIO/FUSE integration skipped: Linux or macOS is required"
 fi

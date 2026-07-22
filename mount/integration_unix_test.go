@@ -1,4 +1,4 @@
-//go:build integration && linux
+//go:build integration && (linux || darwin)
 
 package mount_test
 
@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -27,7 +28,7 @@ import (
 	"github.com/vibe-agi/s3disk/s3store"
 )
 
-func TestLinuxMinIOFUSEEndToEnd(t *testing.T) {
+func TestMinIOFUSEEndToEnd(t *testing.T) {
 	requireFUSE(t)
 	endpoint := os.Getenv("S3DISK_TEST_S3_ENDPOINT")
 	if endpoint == "" {
@@ -109,7 +110,7 @@ func TestLinuxMinIOFUSEEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	updates := make(chan s3disk.RefreshResult, 4)
-	mountpoint := t.TempDir()
+	mountpoint := integrationMountpoint(t)
 	mounted, err := mount.ReadOnly(ctx, consumer, mountpoint, minIOFUSEOptions(updates))
 	if err != nil {
 		if os.Getenv("S3DISK_REQUIRE_FUSE") == "1" {
@@ -222,7 +223,7 @@ func TestLinuxMinIOFUSEEndToEnd(t *testing.T) {
 	restartActive = false
 }
 
-func TestLinuxMountRefreshAndSnapshotPinning(t *testing.T) {
+func TestFUSEMountRefreshAndSnapshotPinning(t *testing.T) {
 	requireFUSE(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -266,16 +267,17 @@ func TestLinuxMountRefreshAndSnapshotPinning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mountpoint := t.TempDir()
+	mountpoint := integrationMountpoint(t)
 	mounted, err := mount.ReadOnly(ctx, consumer, mountpoint, mount.Options{
-		Debug:   os.Getenv("S3DISK_TEST_FUSE_DEBUG") == "1",
-		AttrTTL: 50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
+		MacOSBackend: integrationMacOSBackend(t),
+		Debug:        os.Getenv("S3DISK_TEST_FUSE_DEBUG") == "1",
+		AttrTTL:      50 * time.Millisecond, EntryTTL: 50 * time.Millisecond,
 		// The test materializes more than four generation/path identities. It can
 		// finish only if kernel FORGET events reclaim obsolete registry entries.
 		MaxInodeIdentities: 4,
-		// Missing names are deliberately not cached. Linux reverse invalidation
-		// is only an optimization; correctness must survive kernels which answer
-		// a negative-dentry notification with ENOENT without evicting it.
+		// Missing names are deliberately not cached. Reverse invalidation is only
+		// an optimization; correctness must survive unavailable or ineffective
+		// negative-dentry notifications.
 		NegativeTTL: 0,
 		Poll: s3disk.PollOptions{
 			Interval: 20 * time.Millisecond, MaxInterval: 200 * time.Millisecond,
@@ -474,7 +476,8 @@ func createMinIOBucket(t *testing.T, ctx context.Context, httpClient *http.Clien
 
 func minIOFUSEOptions(updates chan<- s3disk.RefreshResult) mount.Options {
 	options := mount.Options{
-		AttrTTL: 30 * time.Millisecond, EntryTTL: 30 * time.Millisecond,
+		MacOSBackend: integrationMacOSBackend(nil),
+		AttrTTL:      30 * time.Millisecond, EntryTTL: 30 * time.Millisecond,
 		NegativeTTL: 0, FilesystemName: "s3disk-minio-test",
 		Poll: s3disk.PollOptions{
 			Interval: 20 * time.Millisecond, MaxInterval: 200 * time.Millisecond,
@@ -555,23 +558,89 @@ func integrationEnv(name, fallback string) string {
 	return fallback
 }
 
+func integrationMacOSBackend(t *testing.T) mount.MacOSBackend {
+	value := os.Getenv("S3DISK_TEST_MACOS_BACKEND")
+	switch value {
+	case "", "auto":
+		return mount.MacOSBackendAuto
+	case "vfs":
+		return mount.MacOSBackendVFS
+	case "fskit":
+		return mount.MacOSBackendFSKit
+	default:
+		if t != nil {
+			t.Fatalf("invalid S3DISK_TEST_MACOS_BACKEND %q", value)
+		}
+		panic("invalid S3DISK_TEST_MACOS_BACKEND " + value)
+	}
+}
+
+func integrationMountpoint(t *testing.T) string {
+	t.Helper()
+	root := os.Getenv("S3DISK_TEST_MOUNT_ROOT")
+	if root == "" {
+		return t.TempDir()
+	}
+	if !filepath.IsAbs(root) {
+		t.Fatalf("S3DISK_TEST_MOUNT_ROOT must be absolute: %q", root)
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("S3DISK_TEST_MOUNT_ROOT is not an existing directory: %q: %v", root, err)
+	}
+	mountpoint, err := os.MkdirTemp(root, "s3disk-mount-")
+	if err != nil {
+		t.Fatalf("create integration mountpoint below %q: %v", root, err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(mountpoint); err != nil {
+			t.Errorf("remove integration mountpoint %q: %v", mountpoint, err)
+		}
+	})
+	return mountpoint
+}
+
 func requireFUSE(t *testing.T) {
 	t.Helper()
-	info, err := os.Stat("/dev/fuse")
-	if err == nil && info.Mode()&os.ModeCharDevice != 0 {
-		device, openErr := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
-		if openErr == nil {
-			_ = device.Close()
-			return
-		}
-		err = openErr
-	} else if err == nil {
-		err = fmt.Errorf("/dev/fuse is not a character device")
+	err := fuseRuntimeAvailable()
+	if err == nil {
+		return
 	}
 	if os.Getenv("S3DISK_REQUIRE_FUSE") == "1" {
-		t.Fatalf("/dev/fuse is required for the Linux mount gate: %v", err)
+		t.Fatalf("FUSE runtime is required for the %s mount gate: %v", runtime.GOOS, err)
 	}
-	t.Skipf("/dev/fuse unavailable: %v", err)
+	t.Skipf("FUSE runtime unavailable on %s: %v", runtime.GOOS, err)
+}
+
+func fuseRuntimeAvailable() error {
+	switch runtime.GOOS {
+	case "linux":
+		info, err := os.Stat("/dev/fuse")
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeCharDevice == 0 {
+			return fmt.Errorf("/dev/fuse is not a character device")
+		}
+		device, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		return device.Close()
+	case "darwin":
+		for _, helper := range []string{
+			"/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
+			"/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
+		} {
+			info, err := os.Stat(helper)
+			if err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+				return nil
+			}
+		}
+		return fmt.Errorf("no executable macFUSE mount helper found below /Library/Filesystems")
+	default:
+		return fmt.Errorf("unsupported test platform %s", runtime.GOOS)
+	}
 }
 
 var (
