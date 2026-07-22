@@ -103,7 +103,6 @@ func runPreparedMount(ctx context.Context, options MountOptions, localPaths moun
 	}
 	healthEvents, reportHealthError := newMountHealthEvents()
 	mounted, err := mount.ReadOnly(ctx, consumer, localPaths.mountpoint, mount.Options{
-		MacOSBackend: parseMacOSBackend(options.MacOSBackend),
 		Poll: s3disk.PollOptions{
 			Interval: options.PollInterval, AttemptTimeout: options.PollTimeout, OnError: reportHealthError,
 		},
@@ -116,17 +115,6 @@ func runPreparedMount(ctx context.Context, options MountOptions, localPaths moun
 			localPaths.mountpoint, share.wire.AuthorizationExpiresAt.Format(time.RFC3339))
 	}
 	return waitForMountLifecycle(mounted, healthEvents, options.ErrorWriter, mountStatusPollInterval)
-}
-
-func parseMacOSBackend(value string) mount.MacOSBackend {
-	switch value {
-	case "fskit":
-		return mount.MacOSBackendFSKit
-	case "vfs":
-		return mount.MacOSBackendVFS
-	default:
-		return mount.MacOSBackendAuto
-	}
 }
 
 func prepareMountCachePath(cacheBase, shareStateDir, repositoryID, shareID string) (string, error) {

@@ -36,7 +36,7 @@ upgrade/rollback product matrix.
 | --- | --- | --- | --- |
 | Core and `s3store` | Go-supported OS/architecture | Core protocols are portable Go; protected publication-journal, watermark, and cache paths are enabled on Linux, Windows, and Darwin with cgo, while the confidentiality-bearing `FileSealedStateStore` is limited to Linux and Darwin with cgo and deliberately fails closed on Windows; other targets fail closed where their ACL semantics are not certified; the checked-in CI workflow runs native tests on Ubuntu, macOS, and Windows | Review CI evidence for the exact release and test every additionally advertised target; do not advertise sealed recovery-WAL support on Windows |
 | `mount` | Linux | FUSE implementation and actual `/dev/fuse` E2E tests are present; the MinIO-backed flow passed on Ubuntu 24.04 ARM64, kernel 6.8, on 2026-07-22 | Re-run on each kernel/distribution used by the embedding product and before important rollouts |
-| `mount` | macOS | Real macOS 26 macFUSE/FSKit E2E gate covers read-only access, refresh, snapshot-pinned handles, inode reclamation, two concurrent mounts, and clean unmount; VFS and `auto` remain selectable | Requires a separately installed macFUSE runtime. Re-run on every shipped macOS/architecture; FSKit requires macOS 15.4+, macFUSE 5+, and a mountpoint below `/Volumes` |
+| `mount` | macOS | Darwin implementation and a real macFUSE VFS E2E gate cover read-only access, refresh, snapshot-pinned handles, inode reclamation, two concurrent mounts, and clean unmount; successful release evidence is still pending | Requires a separately installed and enabled macFUSE VFS/kernel runtime. The macFUSE 5.2+ FSKit `MFMount.framework` message transport is not implemented by the current go-fuse adapter |
 | `mount` | FreeBSD | Build-tagged implementation present | Compile-only status; no production support until dedicated kernel/runtime E2E coverage exists |
 | `mount` | Windows | Returns `ErrUnsupportedPlatform` | Requires a native adapter and separate driver/licensing/security review |
 
@@ -44,8 +44,6 @@ macFUSE states that redistributions bundled with commercial software, including
 automated download or installation, require prior written permission. A user
 installing macFUSE independently does not make this project responsible for
 redistribution, but product counsel must approve the exact onboarding flow.
-The repository's pinned CI installation is test infrastructure, not a bundled
-product installer.
 See macFUSE's [official licensing
 announcement](https://macfuse.github.io/2021/05/16/macfuse-4.1.2.html).
 
@@ -120,9 +118,9 @@ stale-read, lazy-read, corruption, timeout, and recovery test suite.
 
 The MinIO integration fixture is bound to an OS-selected loopback port rather
 than a fixed host port. `.github/workflows/ci.yml` is configured to run that
-fixture separately from the native Ubuntu/macOS/Windows tests, the macOS 26
-macFUSE/FSKit mount gate, Linux unit/race/vet/compliance checks, and TLA+ model
-checking. The commercial Linux workflow is separate and requires an
+fixture separately from the native Ubuntu/macOS/Windows tests, Linux
+unit/race/vet/compliance checks, and TLA+ model checking. The commercial Linux
+workflow is separate and requires an
 owner-controlled runner with `/dev/fuse`;
 only artifacts for the exact release revision constitute compatibility
 evidence.
