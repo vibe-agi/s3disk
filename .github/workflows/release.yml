@@ -41,7 +41,7 @@ jobs:
       - name: Install audit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ripgrep
+          sudo apt-get install --yes lvm2 ripgrep
           rg --version
       - name: Validate tag and source identity
         shell: bash
@@ -115,6 +115,9 @@ jobs:
       - name: Run deterministic workspace scale smoke
         shell: bash
         run: ./scripts/test-scale.sh
+      - name: Require Linux LVM atomic source snapshot
+        shell: bash
+        run: sudo env "PATH=$PATH" ./scripts/test-source-snapshot-linux.sh
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -155,6 +158,10 @@ jobs:
         if: matrix.goos == 'darwin' && matrix.goarch == 'arm64'
         shell: bash
         run: ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 120s integration
+      - name: Require macOS APFS atomic source snapshot
+        if: matrix.goos == 'darwin' && matrix.goarch == 'arm64'
+        shell: bash
+        run: ./scripts/test-source-snapshot-macos.sh
       - name: Build versioned archive
         shell: bash
         env:

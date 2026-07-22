@@ -313,7 +313,7 @@ fixed-expiry, security-flag, and encryption-witness mismatches are refined by Go
 fault tests rather than added as a state-space product. It likewise does not
 model the initial Prepared-file CAS itself.
 
-With the pinned TLC 1.8.0 jar and one worker, the checked bounds produce:
+With the pinned TLC 1.7.4 jar and one worker, the checked bounds produce:
 
 | Configuration | Generated states | Distinct states | Depth |
 | --- | ---: | ---: | ---: |
@@ -407,7 +407,7 @@ replay, a newer activation, and an open handle pinned across that activation
 remain reachable. This removes redundant interleavings of every consumer
 state with every publisher crash boundary without removing a protocol outcome.
 
-With TLC 1.8.0 and one worker, the current bounds produced:
+With TLC 1.7.4 and one worker, the current bounds produced:
 
 | Configuration | Generated states | Distinct states | Depth |
 | --- | ---: | ---: | ---: |

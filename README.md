@@ -133,7 +133,7 @@ See the full [compatibility matrix](docs/COMPATIBILITY.md).
 
 - A publication scan is not an atomic snapshot of a changing workspace. Use an
   APFS/LVM/filesystem snapshot or pause writes when strict point-in-time
-  consistency is required.
+  consistency is required; see the [snapshot and recovery runbook](docs/RECOVERY.md).
 - Immutable S3 objects do not yet have garbage collection.
 - Published scale evidence is a regression baseline, not a capacity claim for
   large, high-churn, long-running mounts.

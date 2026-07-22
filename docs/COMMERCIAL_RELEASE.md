@@ -54,8 +54,13 @@ workflow; they do not block the open-source release workflow.
   inode, size, mode, or mtime changes, but these metadata checks are not a
   transaction. A writer or coarse-timestamp filesystem can change file bytes
   and restore the observed metadata, and the whole directory is likewise not
-  atomic. Strict single-file and cross-file snapshots require a quiesced
-  producer protocol or an OS/filesystem snapshot/version primitive.
+  atomic. The release gate now proves the supported handoff from isolated,
+  read-only point-in-time sources: an APFS base image with a live COW shadow on
+  macOS, and an application-frozen LVM snapshot on Linux. See
+  `docs/RECOVERY.md`. The blocker remains for a commercial deployment until its
+  real producer quiesce protocol, snapshot provider, COW-capacity monitoring,
+  failure handling, and evidence retention are certified; Publisher does not
+  create a snapshot for an arbitrary source path.
 
 <!-- RELEASE-BLOCKER: repository-retention -->
 
@@ -233,7 +238,17 @@ workflow; they do not block the open-source release workflow.
 - A tested backup, restore, versioning, retention, replication, and disaster
   recovery procedure for mutable references, immutable objects, publisher
   journals, sealed root WALs, external monotonic anchors, recovery keys,
-  consumer watermarks, and lost local trust state has not been approved.
+  consumer watermarks, and lost local trust state has not been approved. The
+  MinIO gate now exercises a byte-inventoried full object backup, simulated
+  source/local-state loss, restore into a fresh bucket and local paths,
+  continued publication, reference-signing-key retirement, stale-reference
+  rejection after restart, and missing-object failure. The recovery-key CAS
+  test separately proves new/old overlap, rewrap, new-only recovery, and
+  old-only rejection. `docs/RECOVERY.md` defines the operator sequence. The
+  blocker remains because production-provider versioning/retention/replication,
+  sealed session/root-WAL restore, independently protected monotonic anchors,
+  KMS custody, and an approved real recovery exercise are not certified by a
+  local MinIO mechanism test.
 
 These are product decisions, not documentation defects. A release owner must
 accept or resolve each one explicitly.
@@ -435,6 +450,10 @@ accept or resolve each one explicitly.
   `scripts/test-mount-macos.sh` for the selected backend. Extend them with
   forced termination/restart and clean unmount. Test IDE watcher behavior separately:
   FUSE invalidation freshness is not evidence of an inotify or VS Code event.
+- Preserve `scripts/test-source-snapshot-linux.sh` and
+  `scripts/test-source-snapshot-macos.sh` results. These prove publication from
+  isolated frozen mounts while their live views change; they do not certify an
+  application's quiesce behavior or a production volume's snapshot controls.
 - Test both default symlink rejection and any explicitly supported
   `SymlinkPreserve` workflow. Treat preserve mode as outside the mount sandbox.
 - Exercise publication-journal and persistent-watermark CAS from multiple
@@ -494,7 +513,9 @@ accept or resolve each one explicitly.
   explicit limits and reject inputs beyond them.
 - Back up and restore the mutable references and required immutable objects.
   Validate bucket versioning, retention, lifecycle, replication, and disaster
-  recovery settings without relying on undocumented provider behavior.
+  recovery settings without relying on undocumented provider behavior. Follow
+  `docs/RECOVERY.md`, preserve the provider-independent MinIO drill, and repeat
+  the procedure against every production backend and secret-management system.
 
 ## Security and operations
 
