@@ -1,6 +1,6 @@
 //go:build !darwin && !linux && !windows
 
-package s3disk
+package localstate
 
 import (
 	"fmt"
@@ -9,5 +9,5 @@ import (
 )
 
 func validateUnixWatermarkACL(*os.File) error {
-	return fmt.Errorf("%w: extended ACL inspection is unavailable on %s", ErrTrustStateUnsupported, runtime.GOOS)
+	return fmt.Errorf("%w: extended ACL inspection is unavailable on %s", ErrUnsupported, runtime.GOOS)
 }

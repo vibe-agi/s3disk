@@ -5,9 +5,18 @@ package s3disk
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func addDarwinACLEntry(t *testing.T, path, entry string) {
+	t.Helper()
+	output, err := exec.Command("/bin/chmod", "+a", entry, path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("chmod +a %q: %v: %s", path, err, output)
+	}
+}
 
 func TestFileSealedStateStoreRevalidatesDarwinACLs(t *testing.T) {
 	newStore := func(t *testing.T) (string, *FileSealedStateStore) {

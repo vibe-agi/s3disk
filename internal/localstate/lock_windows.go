@@ -1,6 +1,6 @@
 //go:build windows
 
-package s3disk
+package localstate
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func lockWatermarkFile(ctx context.Context, path string) (func() error, error) {
+func LockFile(ctx context.Context, path string) (func() error, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("s3disk: open watermark lock: %w", err)
@@ -22,7 +22,7 @@ func lockWatermarkFile(ctx context.Context, path string) (func() error, error) {
 		_ = file.Close()
 		return nil, fmt.Errorf("s3disk: inspect watermark lock: %w", err)
 	}
-	if _, err := validateWatermarkOpenedPath(path, linked, file, false); err != nil {
+	if _, err := ValidateOpenedPath(path, linked, file, false); err != nil {
 		_ = file.Close()
 		return nil, err
 	}

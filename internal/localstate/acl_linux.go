@@ -1,6 +1,6 @@
 //go:build linux
 
-package s3disk
+package localstate
 
 import "os"
 

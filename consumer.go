@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vibe-agi/s3disk/internal/syncutil"
 )
 
 // RefreshStatus describes the result of checking a channel reference.
@@ -97,7 +99,7 @@ type Consumer struct {
 	strictCacheErrors    bool
 	onCacheError         func(error)
 	downloadSlots        chan struct{}
-	downloadBytes        *weightedSemaphore
+	downloadBytes        *syncutil.WeightedSemaphore
 
 	// refreshGate serializes Refresh while allowing a caller's context to cancel
 	// before it reaches the object store. A plain mutex would make a timed poller
@@ -113,7 +115,7 @@ type Consumer struct {
 
 	metadata       metadataCache
 	metadataFlight metadataFlightGroup
-	chunkFlight    chunkFlightGroup
+	chunkFlight    syncutil.FlightGroup[chunkFlightKey]
 }
 
 func NewConsumer(repository *Repository, channel string, options ConsumerOptions) (*Consumer, error) {
@@ -201,7 +203,7 @@ func NewConsumer(repository *Repository, channel string, options ConsumerOptions
 		onCacheError:         options.OnCacheError,
 		refreshGate:          make(chan struct{}, 1),
 		downloadSlots:        make(chan struct{}, options.MaxConcurrentDownloads),
-		downloadBytes:        newWeightedSemaphore(options.MaxConcurrentDownloadBytes),
+		downloadBytes:        syncutil.NewWeightedSemaphore(options.MaxConcurrentDownloadBytes, ErrResourceLimit),
 		metadata:             newMetadataCache(options.MetadataCacheEntries, options.MetadataCacheBytes),
 	}, nil
 }
@@ -950,9 +952,10 @@ func (file *File) ReadAtContext(ctx context.Context, destination []byte, offset 
 // intentionally inside this helper so the reservation is released before the
 // caller can request its next chunk, including every future error return added
 // to validation or copying here.
-func copyChunkLease(ctx context.Context, lease *chunkLease, destination []byte, chunk chunkRef, offset, limit int64) (int, error) {
+func copyChunkLease(ctx context.Context, lease *syncutil.BytesLease, destination []byte, chunk chunkRef, offset, limit int64) (int, error) {
 	defer lease.Release()
-	if int64(len(lease.data)) != chunk.Size {
+	data := lease.Data()
+	if int64(len(data)) != chunk.Size {
 		return 0, fmt.Errorf("%w: chunk size mismatch", ErrCorruptObject)
 	}
 	if err := ctx.Err(); err != nil {
@@ -960,7 +963,7 @@ func copyChunkLease(ctx context.Context, lease *chunkLease, destination []byte, 
 	}
 	start := max64(offset, chunk.Offset) - chunk.Offset
 	end := min64(limit, chunk.Offset+chunk.Size) - chunk.Offset
-	return copy(destination, lease.data[start:end]), nil
+	return copy(destination, data[start:end]), nil
 }
 
 func min64(left, right int64) int64 {
@@ -977,7 +980,7 @@ func max64(left, right int64) int64 {
 	return right
 }
 
-func (consumer *Consumer) getChunk(ctx context.Context, digest Digest, expectedSize int64) (*chunkLease, error) {
+func (consumer *Consumer) getChunk(ctx context.Context, digest Digest, expectedSize int64) (*syncutil.BytesLease, error) {
 	if expectedSize < 1 || expectedSize > maxChunkObjectBytes {
 		return nil, fmt.Errorf("%w: invalid expected chunk size %d", ErrCorruptObject, expectedSize)
 	}

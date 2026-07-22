@@ -37,7 +37,7 @@ func TestConsumerCoalescesConcurrentCachedChunkReads(t *testing.T) {
 			<-start
 			lease, err := consumer.getChunk(context.Background(), digest, int64(len(data)))
 			if err == nil {
-				if string(lease.data) != string(data) {
+				if string(lease.Data()) != string(data) {
 					err = ErrCorruptObject
 				}
 				lease.Release()
@@ -50,10 +50,7 @@ func TestConsumerCoalescesConcurrentCachedChunkReads(t *testing.T) {
 	<-cache.entered
 	deadline := time.Now().Add(time.Second)
 	for {
-		consumer.chunkFlight.mu.Lock()
-		call := consumer.chunkFlight.calls[chunkFlightKey{digest: digest, expectedSize: int64(len(data))}]
-		joined := call != nil && call.users == readers
-		consumer.chunkFlight.mu.Unlock()
+		joined := consumer.chunkFlight.Users(chunkFlightKey{digest: digest, expectedSize: int64(len(data))}) == readers
 		if joined {
 			break
 		}

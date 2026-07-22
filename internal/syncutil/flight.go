@@ -1,4 +1,4 @@
-package s3disk
+package syncutil
 
 import (
 	"context"
@@ -6,15 +6,15 @@ import (
 	"sync"
 )
 
-// chunkLease keeps the shared download reservation alive while a caller reads
+// BytesLease keeps the shared download reservation alive while a caller reads
 // data. Every successful flight waiter owns exactly one release acknowledgment.
-type chunkLease struct {
+type BytesLease struct {
 	data    []byte
 	release func()
 	once    sync.Once
 }
 
-func (lease *chunkLease) Release() {
+func (lease *BytesLease) Release() {
 	if lease == nil {
 		return
 	}
@@ -26,9 +26,17 @@ func (lease *chunkLease) Release() {
 	})
 }
 
-type chunkFlightLoad func(context.Context) (data []byte, release func(), err error)
+// Data returns the shared immutable bytes held by the lease.
+func (lease *BytesLease) Data() []byte {
+	if lease == nil {
+		return nil
+	}
+	return lease.data
+}
 
-type chunkFlightCall struct {
+type FlightLoad func(context.Context) (data []byte, release func(), err error)
+
+type flightCall struct {
 	done   chan struct{}
 	data   []byte
 	err    error
@@ -41,20 +49,20 @@ type chunkFlightCall struct {
 	afterRelease    func()
 }
 
-type chunkFlightGroup struct {
+type FlightGroup[K comparable] struct {
 	mu    sync.Mutex
-	calls map[chunkFlightKey]*chunkFlightCall
+	calls map[K]*flightCall
 }
 
 // Do joins one digest+size load. A successful caller must release its lease
 // after it has finished reading the shared byte slice.
-func (group *chunkFlightGroup) Do(ctx context.Context, key chunkFlightKey, load chunkFlightLoad, afterRelease func()) (*chunkLease, error) {
+func (group *FlightGroup[K]) Do(ctx context.Context, key K, load FlightLoad, afterRelease func()) (*BytesLease, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	group.mu.Lock()
 	if group.calls == nil {
-		group.calls = make(map[chunkFlightKey]*chunkFlightCall)
+		group.calls = make(map[K]*flightCall)
 	}
 	if existing := group.calls[key]; existing != nil {
 		if existing.users > 0 {
@@ -67,7 +75,7 @@ func (group *chunkFlightGroup) Do(ctx context.Context, key chunkFlightKey, load 
 		delete(group.calls, key)
 	}
 	loadCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	call := &chunkFlightCall{
+	call := &flightCall{
 		done:         make(chan struct{}),
 		cancel:       cancel,
 		users:        1,
@@ -79,7 +87,7 @@ func (group *chunkFlightGroup) Do(ctx context.Context, key chunkFlightKey, load 
 	return group.wait(ctx, call)
 }
 
-func (group *chunkFlightGroup) run(key chunkFlightKey, call *chunkFlightCall, ctx context.Context, load chunkFlightLoad) {
+func (group *FlightGroup[K]) run(key K, call *flightCall, ctx context.Context, load FlightLoad) {
 	var data []byte
 	var resourceRelease func()
 	var loadErr error
@@ -111,13 +119,13 @@ func (group *chunkFlightGroup) run(key chunkFlightKey, call *chunkFlightCall, ct
 	close(call.done)
 }
 
-func (group *chunkFlightGroup) wait(ctx context.Context, call *chunkFlightCall) (*chunkLease, error) {
+func (group *FlightGroup[K]) wait(ctx context.Context, call *flightCall) (*BytesLease, error) {
 	select {
 	case <-call.done:
 		if call.err != nil {
 			return nil, call.err
 		}
-		return &chunkLease{
+		return &BytesLease{
 			data: call.data,
 			release: func() {
 				group.releaseUser(call)
@@ -129,7 +137,7 @@ func (group *chunkFlightGroup) wait(ctx context.Context, call *chunkFlightCall) 
 	}
 }
 
-func (group *chunkFlightGroup) releaseUser(call *chunkFlightCall) {
+func (group *FlightGroup[K]) releaseUser(call *flightCall) {
 	group.mu.Lock()
 	if call.users <= 0 {
 		group.mu.Unlock()
@@ -146,7 +154,7 @@ func (group *chunkFlightGroup) releaseUser(call *chunkFlightCall) {
 	}
 }
 
-func (group *chunkFlightGroup) abandon(call *chunkFlightCall) {
+func (group *FlightGroup[K]) abandon(call *flightCall) {
 	group.mu.Lock()
 	if call.users <= 0 {
 		group.mu.Unlock()
@@ -170,7 +178,7 @@ func (group *chunkFlightGroup) abandon(call *chunkFlightCall) {
 // takeFinalizerLocked transfers finalization ownership exactly once. Successful
 // data stays reserved until its last user acknowledges consumption. Failed
 // loads never expose data and can be finalized immediately.
-func (group *chunkFlightGroup) takeFinalizerLocked(call *chunkFlightCall) func() {
+func (group *FlightGroup[K]) takeFinalizerLocked(call *flightCall) func() {
 	if call.finalized || !call.completed || (call.err == nil && call.users > 0) {
 		return nil
 	}
@@ -192,4 +200,15 @@ func (group *chunkFlightGroup) takeFinalizerLocked(call *chunkFlightCall) func()
 			}()
 		}
 	}
+}
+
+// Users reports the waiter count for an active load. It returns zero after the
+// loader completes, even while returned leases still retain the result.
+func (group *FlightGroup[K]) Users(key K) int {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if call := group.calls[key]; call != nil {
+		return call.users
+	}
+	return 0
 }

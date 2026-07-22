@@ -1,6 +1,6 @@
 //go:build !windows && !plan9
 
-package s3disk
+package localstate
 
 import (
 	"os"

@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package s3disk
+package localstate
 
 /*
 #include <errno.h>
@@ -35,14 +35,14 @@ import (
 
 func validateUnixWatermarkACL(file *os.File) error {
 	if file == nil {
-		return fmt.Errorf("%w: missing Darwin trust-state handle", ErrTrustStateUnsupported)
+		return fmt.Errorf("%w: missing Darwin trust-state handle", ErrUnsupported)
 	}
 	result := int(C.s3disk_darwin_has_extended_acl(C.int(file.Fd())))
 	switch {
 	case result == 0:
 		return nil
 	case result > 0:
-		return fmt.Errorf("%w: Darwin trust-state path has an extended ACL", ErrCorruptObject)
+		return fmt.Errorf("%w: Darwin trust-state path has an extended ACL", ErrUnsafe)
 	default:
 		return fmt.Errorf("s3disk: inspect Darwin trust-state ACL: %w", syscall.Errno(-result))
 	}

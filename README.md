@@ -131,13 +131,18 @@ in the [technical reference](docs/REFERENCE.md).
 ## Project layout
 
 - `cmd/s3disk`: command-line application.
-- Repository root: public storage-independent Go API.
+- Repository root: stable, storage-independent public Go API and its package-private tests.
+- `internal`: domain-focused implementation packages for CLI workflows, secure
+  local state, platform filesystem operations, and concurrency control.
 - `s3store`: AWS SDK v2 S3 adapter.
 - `presignedshare`: expiring credential-free read capabilities.
 - `publisherstate`: protected publisher recovery envelopes.
 - `mount`: read-only filesystem adapter.
 - `tests/blackbox`: public-API and end-to-end behavior tests.
 - `docs`: operational and protocol documentation.
+
+See the [repository architecture](docs/ARCHITECTURE.md) for dependency direction
+and file-placement rules.
 
 ## Development
 
