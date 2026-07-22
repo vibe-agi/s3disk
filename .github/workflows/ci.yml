@@ -86,6 +86,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
+      - name: Install Linux source-snapshot dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lvm2
       - name: Run native tests
         shell: bash
         env:
@@ -118,6 +124,20 @@ jobs:
           set -o pipefail
           ./scripts/run-required-go-test.sh ./webdav TestMacOSNativeWebDAVMount 120s integration \
             2>&1 | tee artifacts/macos-webdav-mount.json
+      - name: Require Linux LVM atomic source snapshot
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" ./scripts/test-source-snapshot-linux.sh \
+            2>&1 | tee artifacts/linux-lvm-source-snapshot.json
+      - name: Require macOS APFS atomic source snapshot
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/test-source-snapshot-macos.sh \
+            2>&1 | tee artifacts/macos-apfs-source-snapshot.json
       - name: Archive native evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
