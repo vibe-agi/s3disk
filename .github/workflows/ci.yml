@@ -437,7 +437,11 @@ jobs:
           trap - EXIT
           macfuse_cli=/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/MacOS/macfuse
           [[ -x "$macfuse_cli" ]]
-          sudo "$macfuse_cli" install --components file-system-extensions --force
+          if "$macfuse_cli" install --help 2>&1 | grep -q -- '--components'; then
+            sudo "$macfuse_cli" install --components file-system-extensions --force
+          else
+            sudo "$macfuse_cli" install --force
+          fi
       - name: Run real FSKit mount tests
         shell: bash
         run: |
