@@ -405,8 +405,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     env:
-      MACFUSE_VERSION: "5.3.3"
-      MACFUSE_DMG_SHA256: "7a0b7b66c0e7f8932707d1215dc9cf486e178d097ae0a2dcdf17d8530566aa15"
+      MACFUSE_VERSION: "5.1.3"
+      MACFUSE_DMG_SHA256: "e5f80ff8c3df826e997fb786b35125a0c6a672f4bba2770b0def6ba63ca4ef81"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
