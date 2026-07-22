@@ -12,9 +12,9 @@ publisher computer ── encrypted snapshots ──> S3-compatible storage
 reader computer <── private handoff ── read-only lazy mount
 ```
 
-`s3disk` is a pre-1.0 engineering preview. The Linux path has real S3 and FUSE
-end-to-end coverage; review [Platform support](#platform-support) before
-embedding it in a product.
+`s3disk` is a pre-1.0 engineering preview. Linux and macOS have real filesystem
+mount gates; review [Platform support](#platform-support) before embedding it
+in a product.
 
 ## What it provides
 
@@ -81,8 +81,8 @@ one snapshot and exit. If the publisher stops before expiry, use `share resume`
 with its printed share ID instead of creating a new share.
 
 Transfer `/secure/workspace-a.handoff` to the reader once through a private,
-authenticated channel. On a Linux reader, mount it into an existing empty
-directory:
+authenticated channel. On a Linux or macOS reader, mount it into an existing
+empty directory:
 
 ```sh
 s3disk mount \
@@ -90,6 +90,11 @@ s3disk mount \
   --mountpoint /mnt/workspace-a \
   --state-dir /var/lib/s3disk/reader
 ```
+
+macOS requires macFUSE to be installed separately. On macOS 15.4 or later,
+`--macos-backend fskit` avoids the kernel-extension backend but requires the
+mountpoint to be below `/Volumes`. The default `auto` uses macFUSE's default
+backend.
 
 For multiple workspaces, publish each source independently and use either one
 `s3disk mount` process per handoff or the bounded
@@ -101,7 +106,7 @@ each workspace keeps its own mountpoint and trust boundary.
 | Platform | Current status |
 | --- | --- |
 | Linux | Primary target. Native tests plus real MinIO/FUSE mount tests. |
-| macOS | Builds and runs native tests; mounting requires a separately installed macFUSE runtime and still needs product-specific end-to-end qualification. |
+| macOS | Supported mount target. CI runs real macOS 26 macFUSE/FSKit read-only, refresh, pinned-handle, multi-mount, and clean-unmount tests. Users install macFUSE separately; each shipped macOS/architecture still needs product qualification. |
 | Windows | Core packages and native tests work, but filesystem mounting is not implemented. `mount` returns `ErrUnsupportedPlatform`; publisher recovery-state confidentiality also fails closed until Windows ACL handling is complete. |
 | FreeBSD | FUSE adapter compiles, but has no dedicated native production test baseline. |
 

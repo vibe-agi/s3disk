@@ -73,6 +73,7 @@ type MountOptions struct {
 	Mountpoint   string
 	StateDir     string
 	CacheDir     string
+	MacOSBackend string
 	PollInterval time.Duration
 	PollTimeout  time.Duration
 	StatusWriter io.Writer
@@ -261,6 +262,7 @@ func newMountCommand(dependencies Dependencies) *cobra.Command {
 	flags.StringVar(&options.Mountpoint, "mountpoint", "", "existing empty directory to mount")
 	flags.StringVar(&options.StateDir, "state-dir", "", "private durable anti-rollback state directory on B")
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "private lazy block cache base (defaults below state-dir)")
+	flags.StringVar(&options.MacOSBackend, "macos-backend", "auto", "macOS macFUSE backend: auto, vfs, or fskit")
 	flags.DurationVar(&options.PollInterval, "poll-interval", defaultPollInterval, "S3 root refresh interval")
 	flags.DurationVar(&options.PollTimeout, "poll-timeout", defaultPollTimeout, "maximum time for one complete S3 refresh")
 	return command
@@ -429,6 +431,11 @@ func validateMountOptions(options *MountOptions) error {
 	}
 	if options.PollInterval < 100*time.Millisecond || options.PollInterval > 5*time.Minute {
 		return errors.New("s3disk mount: --poll-interval must be between 100ms and 5m")
+	}
+	switch options.MacOSBackend {
+	case "", "auto", "vfs", "fskit":
+	default:
+		return errors.New("s3disk mount: --macos-backend must be auto, vfs, or fskit")
 	}
 	if options.PollTimeout == 0 {
 		options.PollTimeout = defaultPollTimeout

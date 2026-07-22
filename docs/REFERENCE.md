@@ -1054,7 +1054,8 @@ checks and limitations.
 ## Development checks
 
 The MinIO suite requires Docker Compose v2 and `jq`; Linux FUSE coverage also
-requires `/dev/fuse` and `fusermount3`.
+requires `/dev/fuse` and `fusermount3`, while macOS coverage requires a
+separately installed macFUSE runtime.
 
 ```sh
 go test ./...
@@ -1070,6 +1071,8 @@ go vet ./...
 ./scripts/test-scale.sh
 # On a Linux release runner with /dev/fuse:
 ./scripts/test-mount-linux.sh
+# On a macOS runner with macFUSE:
+./scripts/test-mount-macos.sh
 ```
 
 The scale smoke emits structured per-run evidence and accepts bounded workload
@@ -1080,17 +1083,17 @@ MinIO is pulled only as an external AGPL-3.0 test fixture. It is not linked into
 the Go module and must not be included in a redistributed product image without
 a separate licensing review.
 
-The regular CI workflow runs native tests on Ubuntu, macOS, and Windows, plus
-Linux quality/race/vet/compliance checks, the pinned MinIO integration, and TLA+
-model checking. The MinIO fixture binds an OS-selected loopback port so parallel
-jobs do not depend on a fixed host port.
+The regular CI workflow runs native tests on Ubuntu, macOS, and Windows, a real
+macOS 26 macFUSE/FSKit mount gate, Linux quality/race/vet/compliance checks, the
+pinned MinIO integration, and TLA+ model checking. The MinIO fixture binds an
+OS-selected loopback port so parallel jobs do not depend on a fixed host port.
 
 Pushing a canonical `v0.x.y` or `v1.x.y` tag runs the open-source release
 workflow. It revalidates source hygiene, tests, static analysis, known
 vulnerabilities, MinIO behavior, and the formal models; then it publishes
-versioned Linux and native-cgo macOS archives with SHA-256 checksums. The Linux
-archive is the primary implementation target for read-only FUSE mounting;
-macOS also requires a separately installed macFUSE runtime. Windows remains a
+versioned Linux and native-cgo macOS archives with SHA-256 checksums. Linux and
+macOS are read-only FUSE mount targets; macOS requires a separately installed
+macFUSE runtime. Windows remains a
 source-build target and does not support `mount`.
 
 The separate supported-production workflow is manual and optional. It retains

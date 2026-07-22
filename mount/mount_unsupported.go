@@ -28,6 +28,9 @@ type Options struct {
 	// reject it because it cannot preserve snapshot-pinned handle semantics.
 	KernelCache    bool
 	FilesystemName string
+	// MacOSBackend is retained for source compatibility with native adapters.
+	// Non-default values are rejected on non-macOS platforms.
+	MacOSBackend MacOSBackend
 	// MaxInodeIdentities bounds currently remembered generation-specific inode
 	// identities on native adapters. Zero selects DefaultMaxInodeIdentities.
 	MaxInodeIdentities int

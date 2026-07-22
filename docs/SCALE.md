@@ -34,7 +34,8 @@ The checked-in profile uses the deterministic in-memory Store so it isolates
 core scan, protocol, and consumer behavior. It does not measure S3 request cost,
 gateway consistency, network latency, FUSE notification latency, IDE watcher
 delivery, or disk-cache cold-start behavior. Use `scripts/test-minio.sh` for the
-pinned S3 adapter path and `scripts/test-mount-linux.sh` for real `/dev/fuse`.
+pinned S3 adapter path, `scripts/test-mount-linux.sh` for real `/dev/fuse`, and
+`scripts/test-mount-macos.sh` for a real macFUSE mount.
 Production adoption still requires a workload-specific matrix covering the
 actual backend, kernels, directory shapes, change rates, process termination,
 restart, and monitoring thresholds.

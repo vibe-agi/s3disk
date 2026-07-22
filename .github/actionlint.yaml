@@ -2,3 +2,5 @@ self-hosted-runner:
   labels:
     - s3disk-release
     - fuse
+    # GitHub-hosted label introduced after the pinned actionlint v1.7.7 data.
+    - macos-26

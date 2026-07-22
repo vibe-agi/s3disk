@@ -36,6 +36,7 @@ type mountSetEntry struct {
 	Mountpoint   string `json:"mountpoint"`
 	StateDir     string `json:"state_dir"`
 	CacheDir     string `json:"cache_dir,omitempty"`
+	MacOSBackend string `json:"macos_backend,omitempty"`
 	PollInterval string `json:"poll_interval,omitempty"`
 	PollTimeout  string `json:"poll_timeout,omitempty"`
 }
@@ -218,6 +219,7 @@ func (entry mountSetEntry) mountOptions() (MountOptions, error) {
 	options := MountOptions{
 		HandoffPath: entry.Handoff, Mountpoint: entry.Mountpoint,
 		StateDir: entry.StateDir, CacheDir: entry.CacheDir,
+		MacOSBackend: entry.MacOSBackend,
 		PollInterval: pollInterval, PollTimeout: pollTimeout,
 	}
 	if err := validateMountOptions(&options); err != nil {
