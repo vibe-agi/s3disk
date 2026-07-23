@@ -27,8 +27,14 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/vibe-agi/s3disk/releases) 下载 Linux 或
-macOS 压缩包，或者使用受支持的 Go 工具链从已审阅的源码构建：
+macOS 或 Linux 已安装 [Homebrew](https://brew.sh/) 时，可以直接执行：
+
+```sh
+brew install vibe-agi/tap/s3disk
+```
+
+也可以从 [GitHub Releases](https://github.com/vibe-agi/s3disk/releases) 下载
+Linux 或 macOS 压缩包，或者使用受支持的 Go 工具链从已审阅的源码构建：
 
 ```sh
 go build -trimpath -o ./s3disk ./cmd/s3disk

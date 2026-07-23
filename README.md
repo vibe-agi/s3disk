@@ -28,9 +28,15 @@ before embedding it in a product.
 
 ## Install
 
-Download a Linux or macOS archive from
-[GitHub Releases](https://github.com/vibe-agi/s3disk/releases), or build from a
-reviewed checkout with a supported Go toolchain:
+On macOS or Linux with [Homebrew](https://brew.sh/):
+
+```sh
+brew install vibe-agi/tap/s3disk
+```
+
+Alternatively, download a Linux or macOS archive from
+[GitHub Releases](https://github.com/vibe-agi/s3disk/releases), or build from
+a reviewed checkout with a supported Go toolchain:
 
 ```sh
 go build -trimpath -o ./s3disk ./cmd/s3disk
