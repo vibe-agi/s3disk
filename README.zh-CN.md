@@ -41,8 +41,33 @@ go build -trimpath -o ./s3disk ./cmd/s3disk
 ./s3disk --help
 ```
 
-发布端通过 AWS SDK 默认凭据链读取 S3 凭据。命令行不接受 access key 或 secret
-key 参数，避免凭据进入 shell 历史。
+## 配置 S3 凭据
+
+Access Key 和 Secret Key 由 S3 服务商的控制台或管理员提供。`s3disk` 通过 AWS
+SDK 默认凭据链读取发布端凭据；它不会创建凭据，也不接受凭据命令行参数。
+
+使用 AWS 时，优先使用 SSO profile 或 EC2/ECS/EKS workload role：
+
+```sh
+aws configure sso --profile s3disk
+aws sso login --profile s3disk
+export AWS_PROFILE=s3disk
+```
+
+如果 AWS 或其他 S3 兼容服务商提供的是固定 Access Key 和 Secret Key：
+
+```sh
+aws configure --profile s3disk
+export AWS_PROFILE=s3disk
+```
+
+`aws configure` 会把 profile 写入 `~/.aws` 下的标准 AWS 配置文件；`s3disk` 不会
+把可重复使用的凭据复制进自己的状态目录。临时凭据也可以通过
+`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 和 `AWS_SESSION_TOKEN` 提供。
+环境变量凭据的优先级高于 profile。项目刻意不提供 `--profile` 参数，请使用
+`AWS_PROFILE` 环境变量。
+
+使用 handoff 文件的读取端不需要任何 S3 凭据。
 
 ## 快速开始
 

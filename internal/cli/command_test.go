@@ -370,6 +370,38 @@ func TestNoCredentialFlagsAnywhere(t *testing.T) {
 	}
 }
 
+func TestPublisherCommandsExplainS3CredentialSetup(t *testing.T) {
+	for _, path := range [][]string{
+		{"s3"},
+		{"s3", "doctor"},
+		{"share", "publish"},
+		{"share", "resume"},
+	} {
+		t.Run(strings.Join(path, "_"), func(t *testing.T) {
+			root := NewRootCommand(Dependencies{})
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetArgs(append(append([]string(nil), path...), "--help"))
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			help := output.String()
+			for _, want := range []string{
+				"AWS SDK",
+				"aws configure --profile s3disk",
+				"AWS_PROFILE=s3disk",
+				"AWS_ACCESS_KEY_ID",
+				"AWS_SECRET_ACCESS_KEY",
+				"has no credential flags",
+			} {
+				if !strings.Contains(help, want) {
+					t.Errorf("%s help does not contain %q:\n%s", strings.Join(path, " "), want, help)
+				}
+			}
+		})
+	}
+}
+
 func flattenCommands(commands []*cobra.Command) []*cobra.Command {
 	var flattened []*cobra.Command
 	for _, command := range commands {

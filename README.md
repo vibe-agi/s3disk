@@ -43,8 +43,36 @@ go build -trimpath -o ./s3disk ./cmd/s3disk
 ./s3disk --help
 ```
 
-The publisher obtains S3 credentials from the AWS SDK default credential
-chain. Credentials are never accepted as command-line flags.
+## Configure S3 credentials
+
+Obtain an access key and secret key from your S3 provider's console or
+administrator. `s3disk` loads publisher credentials through the AWS SDK default
+credential chain; it does not create credentials or accept them as command-line
+flags.
+
+For an AWS account, prefer an SSO profile or an EC2/ECS/EKS workload role:
+
+```sh
+aws configure sso --profile s3disk
+aws sso login --profile s3disk
+export AWS_PROFILE=s3disk
+```
+
+For static keys issued by AWS or another S3-compatible provider:
+
+```sh
+aws configure --profile s3disk
+export AWS_PROFILE=s3disk
+```
+
+`aws configure` writes the profile to the standard AWS configuration files
+under `~/.aws`; `s3disk` does not copy reusable credentials into its own state.
+Temporary credentials can instead be supplied with `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`. Environment credentials take
+precedence over a profile. There is intentionally no `--profile` flag: use the
+`AWS_PROFILE` environment variable.
+
+Readers using a handoff file do not need any S3 credentials.
 
 ## Quick start
 

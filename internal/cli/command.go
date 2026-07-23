@@ -26,6 +26,15 @@ const (
 	defaultPollInterval = time.Second
 	defaultPollTimeout  = 2 * time.Minute
 	defaultWebDAVListen = "127.0.0.1:0"
+
+	s3CredentialHelp = `S3 credentials are supplied by your S3 provider and loaded through the AWS SDK
+default credential chain. Prefer an AWS SSO profile or a cloud workload role.
+For provider-issued keys, run "aws configure --profile s3disk", then select it
+with AWS_PROFILE=s3disk. Temporary credentials may instead use
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN.
+
+s3disk has no credential flags and never persists reusable S3 credentials in
+its own state.`
 )
 
 // Dependencies makes every command path testable without network or FUSE I/O.
@@ -237,7 +246,9 @@ func newPublishCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "publish",
 		Short: "Publish A's directory and write a secret handoff file for B",
-		Args:  cobra.NoArgs,
+		Long: "Publish A's directory and write a secret handoff file for B.\n\n" +
+			s3CredentialHelp,
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			if err := validatePublishOptions(&options); err != nil {
 				return err
@@ -274,7 +285,10 @@ func newResumeCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "resume",
 		Short: "Resume an existing A-side publisher session",
-		Args:  cobra.NoArgs,
+		Long: "Resume an existing A-side publisher session. S3 endpoint and bucket settings are\n" +
+			"restored from the sealed session, while current credentials are loaded again.\n\n" +
+			s3CredentialHelp,
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			if err := validateResumeOptions(&options); err != nil {
 				return err
@@ -338,7 +352,12 @@ func newMountSetCommand(dependencies Dependencies) *cobra.Command {
 }
 
 func newS3Command(dependencies Dependencies) *cobra.Command {
-	command := &cobra.Command{Use: "s3", Short: "Commission an S3-compatible provider", Args: cobra.NoArgs}
+	command := &cobra.Command{
+		Use:   "s3",
+		Short: "Commission an S3-compatible provider",
+		Long:  "Commission an S3-compatible provider.\n\n" + s3CredentialHelp,
+		Args:  cobra.NoArgs,
+	}
 	command.AddCommand(newDoctorCommand(dependencies))
 	return command
 }
@@ -348,7 +367,9 @@ func newDoctorCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "doctor",
 		Short: "Probe writable Store and exact presigned-GET semantics",
-		Args:  cobra.NoArgs,
+		Long: "Probe writable Store and exact presigned-GET semantics.\n\n" +
+			s3CredentialHelp,
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			if err := validateDoctorOptions(&options); err != nil {
 				return err
