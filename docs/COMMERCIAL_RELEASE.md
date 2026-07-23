@@ -443,11 +443,13 @@ accept or resolve each one explicitly.
   `.github/workflows/ci.yml`. Preserve the full gate artifacts produced by
   `.github/workflows/release-linux.yml` on the reviewed owner-controlled
   `/dev/fuse` runner. Workflow presence or a green unrelated revision is not
-  release evidence.
+  release evidence. The required CI and open-source release MinIO jobs set
+  `S3DISK_REQUIRE_FUSE=1`; absence of a usable FUSE runtime must fail those
+  jobs rather than convert the mount result into a successful skip.
 - Preserve the mandatory `scripts/test-mount-linux.sh` result from a Linux
   runner with `/dev/fuse`, plus `TestMacOSNativeWebDAVMount` from each shipped
   macOS/architecture. If macFUSE is advertised, also preserve
-  `scripts/test-mount-macos.sh` for the selected backend. Extend them with
+  `scripts/test-mount-macos.sh` for the VFS backend. Extend them with
   forced termination/restart and clean unmount. Test IDE watcher behavior separately:
   FUSE invalidation freshness is not evidence of an inotify or VS Code event.
 - Preserve `scripts/test-source-snapshot-linux.sh` and

@@ -108,6 +108,8 @@ jobs:
           "$tool_dir/actionlint" -color=false
       - name: Run MinIO integration
         shell: bash
+        env:
+          S3DISK_REQUIRE_FUSE: "1"
         run: ./scripts/test-minio.sh
       - name: Check formal models
         shell: bash

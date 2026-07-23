@@ -139,8 +139,10 @@ s3disk mount \
   --state-dir /var/lib/s3disk/reader
 ```
 
-The macOS FUSE path uses macFUSE's VFS/kernel backend. Its newer FSKit message
-transport is not supported by the current go-fuse adapter.
+The macOS FUSE path deliberately does not request macFUSE's opt-in
+`backend=fskit` mount option, so macFUSE uses its default VFS/kernel backend.
+The newer FSKit message transport is not supported by the current go-fuse
+adapter.
 
 For multiple workspaces, publish each source independently. Run one WebDAV
 process/loopback port per handoff, or use the bounded

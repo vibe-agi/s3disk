@@ -55,7 +55,8 @@ func TestServeWebDAVLifecycleAndRead(t *testing.T) {
 	if response.StatusCode != http.StatusOK || string(contents) != "hello" {
 		t.Fatalf("GET = status %d body %q", response.StatusCode, contents)
 	}
-	if !strings.Contains(status.String(), "loopback_only=true authentication=none") || warnings.String() != "" {
+	if !strings.Contains(status.String(), "max_connections=64") ||
+		!strings.Contains(status.String(), "loopback_only=true authentication=none") || warnings.String() != "" {
 		t.Fatalf("status = %q warnings = %q", status.String(), warnings.String())
 	}
 	cancel()
@@ -66,6 +67,25 @@ func TestServeWebDAVLifecycleAndRead(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("WebDAV server did not stop after context cancellation")
+	}
+}
+
+func TestWebDAVWriteDeadlineConnBoundsStalledWriter(t *testing.T) {
+	t.Parallel()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	connection := &webDAVWriteDeadlineConn{Conn: server, timeout: 25 * time.Millisecond}
+	started := time.Now()
+
+	_, err := connection.Write([]byte("blocked"))
+
+	var networkErr net.Error
+	if !errors.As(err, &networkErr) || !networkErr.Timeout() {
+		t.Fatalf("stalled write error = %v, want timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled write took %s, want at most 1s", elapsed)
 	}
 }
 
