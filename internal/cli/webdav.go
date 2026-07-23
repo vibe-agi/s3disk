@@ -12,13 +12,17 @@ import (
 
 	"github.com/vibe-agi/s3disk"
 	s3webdav "github.com/vibe-agi/s3disk/webdav"
+	"golang.org/x/net/netutil"
 )
 
 const (
-	webDAVReadHeaderTimeout = 10 * time.Second
-	webDAVIdleTimeout       = 2 * time.Minute
-	webDAVShutdownTimeout   = 10 * time.Second
-	webDAVMaximumHeaderSize = 64 << 10
+	webDAVReadHeaderTimeout  = 10 * time.Second
+	webDAVReadTimeout        = 30 * time.Second
+	webDAVWriteIdleTimeout   = 30 * time.Second
+	webDAVIdleTimeout        = 2 * time.Minute
+	webDAVShutdownTimeout    = 10 * time.Second
+	webDAVMaximumHeaderSize  = 64 << 10
+	webDAVMaximumConnections = 64
 )
 
 func runWebDAV(ctx context.Context, options WebDAVOptions) error {
@@ -92,6 +96,7 @@ func serveWebDAV(
 	server := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: webDAVReadHeaderTimeout,
+		ReadTimeout:       webDAVReadTimeout,
 		IdleTimeout:       webDAVIdleTimeout,
 		MaxHeaderBytes:    webDAVMaximumHeaderSize,
 	}
@@ -106,14 +111,19 @@ func serveWebDAV(
 	go func() {
 		pollResult <- pollWebDAV(lifetimeContext, handler, options)
 	}()
+	boundedListener := netutil.LimitListener(
+		webDAVWriteDeadlineListener{Listener: listener, timeout: webDAVWriteIdleTimeout},
+		webDAVMaximumConnections,
+	)
+	defer boundedListener.Close()
 	serveResult := make(chan error, 1)
-	go func() { serveResult <- server.Serve(listener) }()
+	go func() { serveResult <- server.Serve(boundedListener) }()
 	if options.StatusWriter != nil {
 		health := handler.Status()
 		_, _ = fmt.Fprintf(options.StatusWriter,
-			"webdav: url=%q expires_at=%s generation=%d last_refresh_success=%s max_stale=%s read_only=true loopback_only=true authentication=none\n",
+			"webdav: url=%q expires_at=%s generation=%d last_refresh_success=%s max_stale=%s max_connections=%d read_only=true loopback_only=true authentication=none\n",
 			"http://"+listener.Addr().String()+"/", expiresAt.Format(time.RFC3339), health.Generation,
-			health.LastRefreshSuccess.Format(time.RFC3339), options.MaxStale)
+			health.LastRefreshSuccess.Format(time.RFC3339), options.MaxStale, webDAVMaximumConnections)
 	}
 
 	var expiryTimer *time.Timer
@@ -167,6 +177,36 @@ func serveWebDAV(
 		}
 	}
 	return resultErr
+}
+
+// webDAVWriteDeadlineListener applies an idle deadline to each socket write
+// instead of http.Server.WriteTimeout's whole-request deadline. A fixed
+// whole-request deadline would abort legitimate large lazy downloads, whereas
+// refreshing the deadline per write still disconnects a client that stops
+// draining the loopback socket.
+type webDAVWriteDeadlineListener struct {
+	net.Listener
+	timeout time.Duration
+}
+
+func (listener webDAVWriteDeadlineListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &webDAVWriteDeadlineConn{Conn: connection, timeout: listener.timeout}, nil
+}
+
+type webDAVWriteDeadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (connection *webDAVWriteDeadlineConn) Write(data []byte) (int, error) {
+	if err := connection.Conn.SetWriteDeadline(time.Now().Add(connection.timeout)); err != nil {
+		return 0, err
+	}
+	return connection.Conn.Write(data)
 }
 
 func pollWebDAV(ctx context.Context, handler *s3webdav.Handler, options WebDAVOptions) error {

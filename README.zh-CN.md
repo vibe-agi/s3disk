@@ -131,8 +131,8 @@ s3disk mount \
   --state-dir /var/lib/s3disk/reader
 ```
 
-macOS FUSE 路径使用 macFUSE 的 VFS/内核后端；当前 go-fuse 适配器尚未支持其
-FSKit 消息传输。
+macOS FUSE 路径刻意不请求 macFUSE 的可选 `backend=fskit` 参数，因此 macFUSE
+会使用默认的 VFS/内核后端；当前 go-fuse 适配器尚未支持 FSKit 消息传输。
 
 共享多个 workspace 时，每个源目录独立发布。WebDAV 模式为每个 handoff 使用一个
 进程和本机端口；FUSE 模式可以使用有资源上限的

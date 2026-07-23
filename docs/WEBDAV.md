@@ -56,11 +56,15 @@ curl --fail http://127.0.0.1:53142/path/to/file
 
 - The CLI accepts only literal loopback IP addresses (`127.0.0.0/8` or `::1`).
   It has no option to expose the endpoint to a LAN or the internet.
+- Every request must also carry a `Host` authority naming a loopback IP or
+  `localhost`; other authorities receive `421 Misdirected Request` before any
+  decrypted metadata or bytes are read. This closes the browser DNS-rebinding
+  path. CORS behavior is not treated as an access-control boundary.
 - The loopback endpoint has no WebDAV password or TLS. Its security boundary is
   the reader **computer**, not an individual OS account: another local process
-  or user on a multi-user host can connect to it. Browser CORS is not enabled
-  and every mutation method is rejected. Use FUSE or add an authenticated local
-  reverse proxy when per-user isolation is required.
+  or user on a multi-user host can connect to it. Every mutation method is
+  rejected. Use FUSE or add an authenticated local reverse proxy when per-user
+  isolation is required.
 - The endpoint accepts only `OPTIONS`, `PROPFIND` with Depth 0 or 1, `GET`, and
   `HEAD`. `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`,
   `PROPPATCH`, and all other methods return `405 Method Not Allowed`.
@@ -68,6 +72,11 @@ curl --fail http://127.0.0.1:53142/path/to/file
   `HEAD` pin the opened file and release the refresh gate before streaming, so
   a slow reader cannot delay later generations. Range requests are supported;
   ambiguous date-based resume requests fall back to a complete response.
+- Request headers and bodies have finite read deadlines. The listener accepts
+  at most 64 simultaneous connections, and every socket write has a renewable
+  idle deadline so a client that stops reading cannot pin a response forever.
+  The write deadline is renewed for each write rather than limiting the total
+  duration of a legitimate large lazy download.
 - Authorization expiry stops the HTTP server. This cannot revoke bytes already
   read or cached; S3 must independently enforce expiration.
 - WebDAV omits symbolic links. The protocol has no portable POSIX symlink

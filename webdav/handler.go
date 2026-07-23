@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"sync"
@@ -105,6 +107,10 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		http.Error(response, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
+	if !validLoopbackRequestHost(request.Host) {
+		http.Error(response, http.StatusText(http.StatusMisdirectedRequest), http.StatusMisdirectedRequest)
+		return
+	}
 	if request.URL.RawQuery != "" {
 		http.Error(response, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
@@ -154,6 +160,27 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		request = request.WithContext(context.WithValue(request.Context(), snapshotGateHeldKey{}, true))
 	}
 	handler.dav.ServeHTTP(response, request)
+}
+
+// validLoopbackRequestHost rejects DNS-rebinding authorities before any
+// decrypted metadata or file bytes reach the response. The CLI separately
+// constrains the listening socket; both checks are required because browsers
+// preserve an attacker's hostname while resolving it to a loopback address.
+func validLoopbackRequestHost(authority string) bool {
+	if authority == "" {
+		return false
+	}
+	parsed, err := url.Parse("http://" + authority)
+	if err != nil || parsed.Host != authority || parsed.User != nil || parsed.Path != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "localhost" {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
 }
 
 // IsReadOnlyMethod reports the exact HTTP method surface exposed by Handler.

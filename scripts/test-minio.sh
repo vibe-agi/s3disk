@@ -154,7 +154,9 @@ S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
 fuse_available=false
 case "$(go env GOOS)" in
   linux)
-    if [ -r /dev/fuse ] && [ -w /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+    if [ -r /dev/fuse ] && [ -w /dev/fuse ] &&
+      (command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1)
+    then
       fuse_available=true
     fi
     ;;
@@ -181,15 +183,11 @@ case "$(go env GOOS)" in
     ;;
 esac
 
-if [ "$fuse_available" = true ]; then
+if [ "$fuse_available" = true ] || [ "${S3DISK_REQUIRE_FUSE:-0}" = 1 ]; then
   S3DISK_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port" \
   S3DISK_TEST_S3_ACCESS_KEY=s3disk \
   S3DISK_TEST_S3_SECRET_KEY=s3disk-secret \
   ./scripts/run-required-go-test.sh ./mount TestMinIOFUSEEndToEnd 90s integration
 else
-  if [ "${S3DISK_REQUIRE_FUSE:-0}" = 1 ]; then
-    echo "MinIO/FUSE integration requires an available FUSE runtime" >&2
-    exit 1
-  fi
   echo "MinIO/FUSE integration skipped: no usable FUSE runtime"
 fi

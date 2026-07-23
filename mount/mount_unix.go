@@ -344,6 +344,9 @@ func newFUSEOptions(options Options) *fs.Options {
 }
 
 func kernelMountOptions() []string {
+	// macFUSE selects its VFS/kernel backend unless the caller explicitly passes
+	// backend=fskit. Keep this fixed list free of backend=fskit until go-fuse has
+	// an independently qualified FSKit message transport.
 	return []string{"ro", "default_permissions"}
 }
 

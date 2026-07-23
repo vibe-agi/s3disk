@@ -162,6 +162,55 @@ func TestHandlerRejectsEveryMutation(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsDNSRebindingHostBeforeReading(t *testing.T) {
+	t.Parallel()
+	fixture := newHandlerFixture(t)
+	fixture.store.ResetStats()
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/hello.txt", nil)
+	request.Host = "workspace.attacker.invalid:53142"
+	response := httptest.NewRecorder()
+
+	fixture.handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("hostile Host status = %d, want %d", response.Code, http.StatusMisdirectedRequest)
+	}
+	if strings.Contains(response.Body.String(), "hello world") {
+		t.Fatalf("hostile Host disclosed file contents: %q", response.Body.String())
+	}
+	if stats := fixture.store.Stats(); stats.ChunkGets != 0 {
+		t.Fatalf("hostile Host fetched %d chunks before rejection", stats.ChunkGets)
+	}
+}
+
+func TestLoopbackRequestHostValidation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		authority string
+		want      bool
+	}{
+		{authority: "127.0.0.1", want: true},
+		{authority: "127.42.0.9:53142", want: true},
+		{authority: "[::1]:53142", want: true},
+		{authority: "localhost:53142", want: true},
+		{authority: "LOCALHOST.:53142", want: true},
+		{authority: "", want: false},
+		{authority: "workspace.attacker.invalid:53142", want: false},
+		{authority: "127.0.0.1.attacker.invalid:53142", want: false},
+		{authority: "localhost.attacker.invalid", want: false},
+		{authority: "192.168.1.10:53142", want: false},
+		{authority: "user@localhost:53142", want: false},
+		{authority: "localhost:53142/path", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.authority, func(t *testing.T) {
+			if got := validLoopbackRequestHost(test.authority); got != test.want {
+				t.Fatalf("validLoopbackRequestHost(%q) = %t, want %t", test.authority, got, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenFilePinsBytesAcrossRefresh(t *testing.T) {
 	t.Parallel()
 	fixture := newHandlerFixture(t)
